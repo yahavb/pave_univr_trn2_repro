@@ -44,12 +44,13 @@ spec:
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
               GEOM="--height 1728 --width 4096 --tiles 2x4 --halo 128 --bar 3"
 
-              echo "Finding the FEWEST graphs that compile. Coarsest first; stops at the first"
-              echo "mode that runs, so the winner is the minimal split."
+              echo "whole (1 graph) already fails NCC_EBIR033 -- proven over two runs and three"
+              echo "warp implementations, see SINGLE_GRAPH_NCC_EBIR033.md. Not re-run here."
+              echo "Trying halves (2 graphs) then stages (5); stops at the first that compiles."
               echo ""
 
               WINNER=""
-              for MODE in whole halves stages; do
+              for MODE in halves stages; do
                 echo "=== --compile $MODE ==="
                 NEURON_LAUNCH_BLOCKING=1 python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
                     --device neuron --cores 1 --only-tile 1 \
@@ -72,10 +73,9 @@ spec:
 
               echo "=== MINIMAL SPLIT ==="
               if [ -n "$WINNER" ]; then
-                echo "  $WINNER is the coarsest granularity that compiles."
-                echo "  Everything coarser than it failed; finer ones were not tried."
+                echo "  $WINNER is the coarsest granularity that compiles (whole having failed)."
               else
-                echo "  NONE of whole/halves/stages compiled. Eager is the only working path."
+                echo "  NEITHER halves nor stages compiled. Eager is the only working path."
               fi
               echo ""
 
