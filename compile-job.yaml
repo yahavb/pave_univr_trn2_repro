@@ -44,39 +44,50 @@ spec:
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
               GEOM="--height 1728 --width 4096 --tiles 2x4 --halo 128 --bar 3"
 
-              echo "whole (1 graph) already fails NCC_EBIR033 -- proven over two runs and three"
-              echo "warp implementations, see SINGLE_GRAPH_NCC_EBIR033.md. Not re-run here."
-              echo "Trying halves (2 graphs) then stages (5); stops at the first that compiles."
+              echo "PER-MODULE PROBE. The model runs EAGER and exactly one module is compiled,"
+              echo "so a failure names the module rather than leaving it to be inferred."
+              echo "whole (1 graph) and halves (2) both fail NCC_EBIR033 with in=17776640 --"
+              echo "identical, so granularity did not change what the backend fuses."
               echo ""
 
-              WINNER=""
-              for MODE in halves stages; do
-                echo "=== --compile $MODE ==="
+              echo "=== BASELINE: fully eager ==="
+              python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
+                  --device neuron --cores 1 --only-tile 1 \
+                  --warp nki-dyn --dtype fp32 --compile none --iters 0 \
+                  > "$OUT/eager.log" 2>&1 && echo "  RAN" || echo "  FAILED"
+              grep -iE "first call|PSNR|max_diff" "$OUT/eager.log" | head -3 | sed 's/^/    /' || true
+              echo ""
+
+              for MOD in unet contextnet a0 a1 a2 refine pyramid; do
+                echo "=== compile ONLY $MOD (rest eager) ==="
                 NEURON_LAUNCH_BLOCKING=1 python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
                     --device neuron --cores 1 --only-tile 1 \
                     --warp nki-dyn --dtype fp32 \
-                    --compile $MODE --iters 0 \
-                    > "$OUT/$MODE.log" 2>&1 && rc=0 || rc=$?
-                if grep -q "forward complete" "$OUT/$MODE.log"; then
-                  echo "  RAN"
-                  grep -iE "torch.compile:|first call|PSNR|max_diff" "$OUT/$MODE.log" | head -5 | sed 's/^/    /'
-                  WINNER="$MODE"
-                  echo ""
-                  break
+                    --compile one --compile-only $MOD --iters 0 \
+                    > "$OUT/one_$MOD.log" 2>&1 && rc=0 || rc=$?
+                if grep -q "forward complete" "$OUT/one_$MOD.log"; then
+                  echo "  COMPILED OK"
+                  grep -iE "first call|PSNR|max_diff" "$OUT/one_$MOD.log" | head -3 | sed 's/^/    /'
+                else
+                  code=$(grep -oE "NCC_E[A-Z0-9]+" "$OUT/one_$MOD.log" | head -1)
+                  ops=$(grep -oE "in=[0-9]+ and out=[0-9]+" "$OUT/one_$MOD.log" | head -1)
+                  other=$(grep -oE "torch._dynamo.exc.[A-Za-z]+|KeyError: '[^']*'|failed to legalize[^\"]*" "$OUT/one_$MOD.log" | head -1)
+                  echo "  FAILED  ${code:-${other:-unknown}}  ${ops:-}"
                 fi
-                code=$(grep -oE "NCC_E[A-Z0-9]+" "$OUT/$MODE.log" | head -1)
-                ops=$(grep -oE "in=[0-9]+ and out=[0-9]+" "$OUT/$MODE.log" | head -1)
-                other=$(grep -oE "torch._dynamo.exc.[A-Za-z]+|KeyError: '[^']*'" "$OUT/$MODE.log" | head -1)
-                echo "  FAILED (exit $rc)  ${code:-${other:-unknown}}  ${ops:-}"
                 echo ""
               done
 
-              echo "=== MINIMAL SPLIT ==="
-              if [ -n "$WINNER" ]; then
-                echo "  $WINNER is the coarsest granularity that compiles (whole having failed)."
-              else
-                echo "  NEITHER halves nor stages compiled. Eager is the only working path."
-              fi
+              echo "=== MAP: what can be compiled ==="
+              for MOD in unet contextnet a0 a1 a2 refine pyramid; do
+                f="$OUT/one_$MOD.log"
+                if grep -q "forward complete" "$f" 2>/dev/null; then
+                  echo "  $MOD: OK  $(grep -oE 'max_diff +[0-9.]+ LSB +.[A-Z]+' "$f" | head -1)"
+                else
+                  echo "  $MOD: FAILS  $(grep -oE 'NCC_E[A-Z0-9]+' "$f" | head -1)  $(grep -oE 'in=[0-9]+ and out=[0-9]+' "$f" | head -1)"
+                fi
+              done
+              echo ""
+              echo "  Modules marked OK can ship compiled with the rest eager."
               echo ""
 
               ARCHIVE=/tmp/univr_compile_$(date -u +%Y%m%d_%H%M%S).tar.gz

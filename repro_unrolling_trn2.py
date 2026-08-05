@@ -1154,10 +1154,14 @@ def main():
     ap.add_argument("--warp", default="gather", choices=sorted(WARPS),
                     help="nki = unrolled kernel (best runtime, 80-100 min compile at 4K tiles); "
                          "nki-dyn = device-loop kernel (seconds to compile, ~2x runtime)")
-    ap.add_argument("--compile", default="none", choices=("none", "whole", "halves", "stages"),
-                    help="graph count, coarsest first. none = eager; whole = 1 graph; "
+    ap.add_argument("--compile", default="none", choices=("none", "one", "whole", "halves", "stages"),
+                    help="none = eager; one = compile ONLY --compile-only, rest eager; "
+                         "then coarsest first: whole = 1 graph; "
                          "halves = pyramid + refinement; stages = a0/a1/a2 + ctx + unet. "
                          "All compiled modes use fullgraph=True")
+    ap.add_argument("--compile-only", default="unet",
+                    choices=("a0", "a1", "a2", "contextnet", "unet", "pyramid", "refine"),
+                    help="with --compile one: the single module to compile")
     ap.add_argument("--per-block", action="store_true",
                     help="time each module (a0/a1/a2 conv+warp, ctx, unet) with a device barrier, "
                          "keyed to line up with the repo's C28 per-module table. Barriers serialise, "
@@ -1320,7 +1324,29 @@ def main():
         # bitcast in the warp corrupts which pixels get sampled (55.37 dB / 42.70 LSB against
         # eager's 121.78 dB / 0.00 LSB), which is a compiler defect, not a reason to fragment.
         _CC = dict(backend="neuron", dynamic=False, fullgraph=True)
-        if a.compile == "whole":
+        if a.compile == "one":
+            # PER-MODULE PROBE. The model stays eager and exactly ONE module is compiled, so a
+            # failure names the module that cannot be compiled instead of leaving it to be
+            # inferred from a granularity sweep. Whatever passes here can ship compiled with
+            # the rest eager.
+            tgt = a.compile_only
+            for m, _d in reps:
+                u = m.UVR
+                if tgt in ("a0", "a1", "a2"):
+                    i = {"a0": 0, "a1": 1, "a2": 2}[tgt]
+                    u._stages = list(u._stages)
+                    u._stages[i] = torch.compile(u._stages[i], **_CC)
+                elif tgt in ("contextnet", "unet"):
+                    setattr(u, tgt, torch.compile(getattr(u, tgt), **_CC))
+                elif tgt == "pyramid":
+                    u._pyramid = torch.compile(_Pyramid(u._stages), **_CC)
+                elif tgt == "refine":
+                    u._refine = torch.compile(_Refine(u.contextnet, u.unet), **_CC)
+                else:
+                    raise SystemExit("--compile one needs --compile-only "
+                                     "{a0,a1,a2,contextnet,unet,pyramid,refine}")
+            print("  torch.compile: ONLY %s -- everything else eager" % tgt)
+        elif a.compile == "whole":
             reps = [(torch.compile(m, **_CC), d) for m, d in reps]
             print("  torch.compile: 1 GRAPH -- whole forward")
         elif a.compile == "halves":
