@@ -51,6 +51,13 @@ pattern. `out=128` is not a property of the model: it appears even with stock
 Same code, same operand sizes, all three. This rules out the NKI kernel as the cause and
 rules out the gather formulation generally.
 
+The failing DMA instruction is reported as `I-21406-0_VN_0` in every case, identical across
+both full runs of the sweep and across all three implementations, so the failure is
+deterministic rather than a scheduling or resource artefact.
+
+`NEURON_LAUNCH_BLOCKING=1` does not change the report: the rejection happens during
+compilation, not at dispatch, so there is nothing for blocking mode to serialise.
+
 ## Reproduce
 
 ```bash
