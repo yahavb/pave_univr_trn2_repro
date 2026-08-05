@@ -1,0 +1,168 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: univr-trn2-repro
+  namespace: default
+spec:
+  backoffLimit: 0
+  # Cold cache costs 80-100 min PER DISTINCT TILE SHAPE, and the 8-tile geometry has
+  # two (992x1152 and 992x1280) per timestamp. The nki-dyn functional check runs first
+  # and finishes in minutes; the nki arm behind it is what needs this budget.
+  activeDeadlineSeconds: 28800
+  template:
+    metadata:
+      labels:
+        app: univr-trn2-repro
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neurons
+          resourceClaimTemplateName: s-lnc2
+      containers:
+        - name: repro
+          image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euo pipefail
+
+              # The bundle repo: one script plus its inputs and fp32 reference. Nothing
+              # else is cloned, and nothing is installed -- the reproducer needs only
+              # torch, numpy and PIL, with nki imported on the device path.
+              cd /tmp
+              git clone -b main https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
+              cd REPRO
+
+              echo "┌── PROVENANCE ──"
+              echo "│ commit : $(git rev-parse HEAD)"
+              echo "│ subject: $(git log -1 --pretty=%s)"
+              echo "└────────────────"
+
+              # The inputs and weights are stored directly rather than in LFS, because a
+              # machine without `git lfs install` silently checks out 133-byte pointer
+              # files. Verify real payloads BEFORE spending hours compiling against them.
+              echo "=== INPUT INTEGRITY (sha256 first 16, vs REPRO_README.md) ==="
+              fail=0
+              check() {
+                act=$(sha256sum "$1" | cut -c1-16)
+                if [ "$act" = "$2" ]; then printf "  %-32s %s  OK\n" "$1" "$act"
+                else printf "  %-32s %s  *** EXPECTED %s ***\n" "$1" "$act" "$2"; fail=1; fi
+              }
+              check repro_unrolling_trn2.py      4411e5c147abf157
+              check rs70.png                     d71d165877c25bf9
+              check rs71.png                     4a90f52bbbc3e17d
+              check rs72.png                     e4744b5bb618c40a
+              check pre_net_flow.pth             4242f06cb803ba02
+              check ref_cuda_fp32_1728x4096.npy  399ac258b5c6a262
+              check ref_cuda_fp32_1728x4096.json 4496a153666501b6
+              [ "$fail" = "0" ] || { echo "ABORT: inputs do not match the manifest"; exit 1; }
+              echo ""
+
+              # REPRO_README.md pins torch-neuronx 2.11.3.0.1278+5013c208 and notes it is
+              # a LOCAL BETA WHEEL, not publicly installable. Whether this image supplies
+              # it is therefore a fact to PRINT, not to assume: a mismatch here is the
+              # most likely reason the numbers below diverge from the bundle's.
+              echo "════════════════════ ENVIRONMENT ════════════════════"
+              uname -a
+              echo "nproc            : $(nproc)"
+              echo "neuronx-cc       : $(neuronx-cc --version 2>&1 | tr '\n' ' ' || echo 'NOT ON PATH')"
+              python -c 'import sys, torch; print("python           :", sys.version.split()[0]); print("torch            :", torch.__version__, "(README: 2.11.0+cpu)")'
+              python -c 'import torch_neuronx as t; print("torch-neuronx    :", t.__version__, "(README: 2.11.3.0.1278+5013c208, local beta)")' 2>&1 || echo "torch-neuronx    : IMPORT FAILED"
+              python -c 'import nki; print("nki              :", getattr(nki, "__version__", "import OK"), "(README: 0.4.0+25407465723.g29063adb)")' 2>&1 || echo "nki              : IMPORT FAILED"
+              python -c 'import numpy, PIL; print("numpy / pillow   :", numpy.__version__, "/", PIL.__version__)'
+              echo "NEURON_RT_VISIBLE_CORES: '${NEURON_RT_VISIBLE_CORES:-}'"
+              echo "═════════════════════════════════════════════════════"
+              echo ""
+
+              OUT=/tmp/univr_repro_out; mkdir -p "$OUT"
+              FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
+              REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
+              GEOM="--height 1728 --width 4096 --tiles 2x4 --halo 128 --bar 3"
+
+              # ── [1] FUNCTIONAL CHECK, nki-dyn: compiles in seconds at ~1.1-1.3x
+              #    runtime. This is the README's own advice, and it means a wiring or
+              #    correctness fault surfaces in minutes instead of after 100 minutes
+              #    of compile. Its TIMING is not the headline number.
+              echo "=== [1/2] FUNCTIONAL CHECK — 8 tiles / 8 cores, warp=nki-dyn ==="
+              python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
+                  --device neuron --cores 8 --warp nki-dyn --dtype fp32 --iters 1 \
+                  2>&1 | tee "$OUT/1_functional_nki_dyn.log"
+              echo ""
+
+              # ── [2] THE MEASUREMENT, warp=nki: the bundle's headline arm.
+              #    Bundle reference: median 3673.3 ms, PSNR 98.68 dB, max_diff 0.64 LSB.
+              echo "=== [2/2] MEASUREMENT — 8 tiles / 8 cores, warp=nki, 3 iters ==="
+              echo "    bundle reference: 3673.3 ms median, 98.68 dB, 0.64 LSB PASS"
+              echo "    CUDA L40S for the same frame: eager 351.1 ms, inductor 237.9 ms, TRT 161 ms"
+              python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
+                  --device neuron --cores 8 --warp nki --dtype fp32 --iters 3 \
+                  2>&1 | tee "$OUT/2_measurement_nki.log"
+              echo ""
+
+              echo "=== SUMMARY (grep of both arms) ==="
+              grep -hiE "steady state|median|PSNR|max_diff|PASS|FAIL|per-core|sum/wall" \
+                  "$OUT"/*.log || echo "  no summary lines matched — read the logs above"
+              echo ""
+
+              # PERSIST: tar+gz locally, then ONE file copy. /var/mdl is a slow S3-backed
+              # mount; never write many files straight to it.
+              ARCHIVE=/tmp/univr_repro_$(date -u +%Y%m%d_%H%M%S).tar.gz
+              tar -czf "$ARCHIVE" -C /tmp univr_repro_out
+              mkdir -p /var/mdl/univr_neuron
+              cp "$ARCHIVE" /var/mdl/univr_neuron/
+              echo "Saved: /var/mdl/univr_neuron/$(basename "$ARCHIVE") ($(du -h "$ARCHIVE" | cut -f1))"
+              echo "Done."
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 48
+              memory: 248Gi
+            limits:
+              cpu: 84
+              memory: 248Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            # ─── The env block from REPRO_README.md §2, verbatim ───
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_NUM_CORES
+              value: "8"
+            - name: NEURON_RT_VISIBLE_CORES
+              value: "0-7"
+            - name: NEURON_CC_FLAGS
+              value: "--target trn2 --lnc 1 --model-type unet-inference"
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
