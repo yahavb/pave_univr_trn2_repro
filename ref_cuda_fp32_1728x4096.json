@@ -1,0 +1,30 @@
+{
+  "device": "cuda",
+  "dtype": "fp32",
+  "gamma": 0.98,
+  "generated_by": "repro_unrolling_trn2.py",
+  "gpu": "NVIDIA L40S",
+  "height": 1728,
+  "inputs": [
+    "rs70.png",
+    "rs71.png",
+    "rs72.png"
+  ],
+  "max": 1.0,
+  "min": 0.0,
+  "mode": "triplet",
+  "sha256_fp32": "f593d40b59d0396cd6ac8b5b966524e67209d1ef1d54af55ba6a3ba24432e88f",
+  "shape": [
+    1,
+    3,
+    1728,
+    4096
+  ],
+  "t_bwd": -0.49,
+  "t_fwd": 0.51,
+  "torch": "2.11.0+cu128",
+  "warp": "gridsample",
+  "weights": "pre_net_flow.pth",
+  "weights_sha256": "4242f06cb803ba028a63bb4238a9f0243f2c612cf73c1f4a0aa695b71f8791fb",
+  "width": 4096
+}

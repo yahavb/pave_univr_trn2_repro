@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# reproducer output
+out_*.png
+out_*.npy
+*.log
