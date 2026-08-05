@@ -51,14 +51,17 @@ spec:
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
               GEOM="--height 1728 --width 4096 --tiles 2x4 --halo 128 --bar 3"
 
-              echo "=== [1/3] SERIAL WARMUP — 1 tile, 1 core, warp=nki-dyn ==="
-              python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
-                  --device neuron --cores 1 --only-tile 1 --warp nki-dyn --dtype fp32 --iters 1 \
-                  2>&1 | tee "$OUT/0_warmup_1core.log"
-              echo ""
-
-              echo "NEFFs cached after serial warmup: $(find /tmp/neff_cache/ -name '*.neff' 2>/dev/null | wc -l)"
-              echo ""
+              for WARP in nki-dyn nki; do
+                for T in 0 1; do
+                  echo "=== [1/3] SERIAL WARMUP — tile $T, 1 core, warp=$WARP ==="
+                  python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
+                      --device neuron --cores 1 --only-tile $T --warp $WARP --dtype fp32 --iters 1 \
+                      2>&1 | tee "$OUT/0_warmup_${WARP}_tile${T}.log" \
+                      | grep -iE "padded|first call|steady state|PSNR|max_diff|PASS|FAIL" || true
+                  echo "  NEFFs cached: $(find /tmp/neff_cache/ -name '*.neff' 2>/dev/null | wc -l)"
+                  echo ""
+                done
+              done
 
               echo "=== [2/3] FUNCTIONAL CHECK — 8 tiles / 8 cores, warp=nki-dyn ==="
               python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
