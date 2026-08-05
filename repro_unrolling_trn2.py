@@ -1108,14 +1108,9 @@ def main():
     ap.add_argument("--warp", default="gather", choices=sorted(WARPS),
                     help="nki = unrolled kernel (best runtime, 80-100 min compile at 4K tiles); "
                          "nki-dyn = device-loop kernel (seconds to compile, ~2x runtime)")
-    ap.add_argument("--compile", default="none", choices=("none", "whole", "split", "stages"),
-                    help="graph granularity: none = native path's own boundaries (eager); "
-                         "whole = one torch.compile graph per replica; split = per-submodule "
-                         "(block0/1/2 + contextnet + unet), matching the repo's 'allsplit'; "
-                         "stages = per-PYRAMID-STAGE, a0/a1/a2 each WITH its two warps plus "
-                         "contextnet and unet, matching the repo's NEFF_A0/A1/A2 decomposition. "
-                         "Prefer 'stages': under 'split' the six full-res warps live between the "
-                         "blocks, so they stay eager and ~60% of the frame is never compiled")
+    ap.add_argument("--compile", default="none", choices=("none", "whole"),
+                    help="none = eager, the native path's own boundaries; "
+                         "whole = ONE torch.compile graph per replica, fullgraph=True")
     ap.add_argument("--per-block", action="store_true",
                     help="time each module (a0/a1/a2 conv+warp, ctx, unet) with a device barrier, "
                          "keyed to line up with the repo's C28 per-module table. Barriers serialise, "
@@ -1273,41 +1268,13 @@ def main():
             print("  --only-tile %d: valid %dx%d at (%d,%d), padded %dx%d"
                   % (a.only_tile, T["vy"], T["vx"], T["oy"], T["ox"], T["ph"], T["pw"]))
         reps = build_replicas(model, dt, a.device, ncore)
-        # GRAPH GRANULARITY. The repo's finding is that boundary placement dominates: 284 ms
-        # per-submodule, 128 ms whole-graph, 73.5 ms at a hand-picked 2-way split, all at 256x384.
-        # The native path picks boundaries by its own heuristics, so these modes test it directly.
-        # fullgraph=True is not decoration. Without it dynamo GRAPH-BREAKS silently at anything it
-        # cannot trace and emits a subgraph per break, which is both the fragmentation we are trying
-        # to remove and a plausible source of the 43 dB that `whole` lost: a break around the
-        # `view(torch.uint32)` index bitcast in the warp corrupts which pixels get sampled. With
-        # fullgraph the break becomes an exception that names its own location. The repo compiles
-        # exactly this way: torch.compile(mod, backend="neuron", dynamic=False, fullgraph=True).
+        # ONE graph for the whole model. fullgraph=True so a dynamo break RAISES instead of
+        # silently emitting a subgraph -- an unguarded break around the view(torch.uint32) index
+        # bitcast in the warp corrupts which pixels get sampled (55.37 dB / 42.70 LSB against
+        # eager's 121.78 dB / 0.00 LSB), which is a compiler defect, not a reason to fragment.
         _CC = dict(backend="neuron", dynamic=False, fullgraph=True)
-        if a.compile == "whole":
-            reps = [(torch.compile(m, **_CC), d) for m, d in reps]
-            print("  torch.compile: WHOLE forward, one graph per replica")
-        elif a.compile == "split":
-            # The repo's `allsplit`: the three IFBlocks, both Contextnet calls and the Unet each
-            # become their own graph. Kept for comparison, but see --compile stages: this boundary
-            # placement leaves every full-resolution warp outside the compiled regions.
-            for m, _d in reps:
-                u = m.UVR
-                for nm in ("block0", "block1", "block2", "contextnet", "unet"):
-                    setattr(u, nm, torch.compile(getattr(u, nm), **_CC))
-            print("  torch.compile: SPLIT into block0/1/2 + contextnet + unet (repo 'allsplit')")
-        elif a.compile == "stages":
-            # The repo's real decomposition: NEFF_A0/A1/A2 each hold a conv trunk AND that stage's
-            # two full-resolution warps, so the warp's host-side coordinate math, weight products
-            # and layout transposes fuse into the stage graph instead of each becoming its own NEFF.
-            # Measured motivation: the NKI gather is only ~36% of warp block time (4,571,136
-            # descriptors at the measured 37 M/s = 123.5 ms against 340.7 ms for a0_warp), and one
-            # eager tile forward dumped 134 NEFFs where the repo runs about six.
-            for m, _d in reps:
-                u = m.UVR
-                u._stages = [torch.compile(s, **_CC) for s in u._stages]
-                for nm in ("contextnet", "unet"):
-                    setattr(u, nm, torch.compile(getattr(u, nm), **_CC))
-            print("  torch.compile: STAGES a0/a1/a2 (each WITH its 2 warps) + contextnet + unet")
+        reps = [(torch.compile(m, **_CC), d) for m, d in reps]
+        print("  torch.compile: SINGLE GRAPH per replica, fullgraph=True")
         print("  %d replica(s) built" % len(reps))
 
     def one_frame(m=None, pf=None, pb=None):
