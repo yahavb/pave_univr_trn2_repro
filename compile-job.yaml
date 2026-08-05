@@ -44,14 +44,27 @@ spec:
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
               GEOM="--height 1728 --width 4096 --tiles 2x4 --halo 128 --bar 3"
 
-              echo "=== torch.compile WHOLE: one graph per replica, fullgraph=True ==="
-              python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
-                  --device neuron --cores 1 --only-tile 1 \
-                  --warp nki-dyn --dtype fp32 \
-                  --compile whole --iters 0 \
-                  2>&1 | tee "$OUT/compile_whole.log" || echo "FAILED (exit $?)"
-              echo ""
-              echo "NEFFs in cache: $(find /tmp/neff_cache/ -name '*.neff' 2>/dev/null | wc -l)"
+              for WARP in gather gridsample nki-dyn; do
+                echo "=== SINGLE GRAPH, warp=$WARP ==="
+                NEURON_LAUNCH_BLOCKING=1 python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
+                    --device neuron --cores 1 --only-tile 1 \
+                    --warp $WARP --dtype fp32 \
+                    --compile whole --iters 0 \
+                    > "$OUT/$WARP.log" 2>&1 && echo "  RAN" || echo "  FAILED (exit $?)"
+                grep -iE "first call|PSNR|max_diff|PASS|FAIL|NCC_E|KeyError|RuntimeError|Unsupported|graph break" \
+                    "$OUT/$WARP.log" | head -6 || true
+                echo ""
+              done
+
+              echo "=== VERDICT: which warp survives ONE graph ==="
+              for WARP in gather gridsample nki-dyn; do
+                f="$OUT/$WARP.log"
+                if grep -q "forward complete" "$f" 2>/dev/null; then
+                  echo "  $WARP: RAN   $(grep -oE 'max_diff +[0-9.]+ LSB +\[[A-Z]+' "$f" | head -1)"
+                else
+                  echo "  $WARP: FAILED  $(grep -oE 'NCC_E[A-Z0-9]+|KeyError[^,]*|[A-Za-z]*Error' "$f" | head -1)"
+                fi
+              done
               echo ""
 
               ARCHIVE=/tmp/univr_compile_$(date -u +%Y%m%d_%H%M%S).tar.gz
