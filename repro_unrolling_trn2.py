@@ -1300,12 +1300,54 @@ def main():
               % t_fwd)
         print("  a pair against it is not the shipped comparison -- pass --rs2 for that.")
 
+    # Compiling is INDEPENDENT of tiling. It used to live inside `if tiled:`, so
+    # --tiles 1x1 --cores 1 silently skipped it and ran eager: a whole shape sweep was
+    # reported as compiled that way. One function, applied on both paths.
+    _CC = dict(backend="neuron", dynamic=False, fullgraph=True)
+
+    def apply_compile(m, tag=""):
+        """Compile `m` in place per --compile. fullgraph=True so a dynamo break RAISES
+        rather than silently emitting a subgraph -- an unguarded break around the
+        view(torch.uint32) index bitcast in the warp corrupts which pixels get sampled."""
+        if a.compile == "none":
+            return m
+        print("  torch.compile[%s] mode=%s %s" % (tag or "model", a.compile, _CC))
+        u = m.UVR
+        if a.compile == "one":
+            tgt = a.compile_only
+            if tgt in ("a0", "a1", "a2"):
+                i = {"a0": 0, "a1": 1, "a2": 2}[tgt]
+                u._stages = list(u._stages)
+                u._stages[i] = torch.compile(u._stages[i], **_CC)
+            elif tgt in ("contextnet", "unet"):
+                setattr(u, tgt, torch.compile(getattr(u, tgt), **_CC))
+            elif tgt == "pyramid":
+                u._pyramid = torch.compile(_Pyramid(u._stages), **_CC)
+            elif tgt == "refine":
+                u._refine = torch.compile(_Refine(u.contextnet, u.unet), **_CC)
+            else:
+                raise SystemExit("--compile one needs --compile-only "
+                                 "{a0,a1,a2,contextnet,unet,pyramid,refine}")
+            print("    ONLY %s compiled, everything else eager" % tgt)
+            return m
+        if a.compile == "whole":
+            print("    1 graph over the whole forward")
+            return torch.compile(m, **_CC)
+        if a.compile == "halves":
+            u._pyramid = torch.compile(_Pyramid(u._stages), **_CC)
+            u._refine = torch.compile(_Refine(u.contextnet, u.unet), **_CC)
+            print("    2 graphs: pyramid (3 stages, 6 warps) + refinement")
+            return m
+        if a.compile == "stages":
+            u._stages = [torch.compile(st, **_CC) for st in u._stages]
+            for nm in ("contextnet", "unet"):
+                setattr(u, nm, torch.compile(getattr(u, nm), **_CC))
+            print("    5 graphs: a0/a1/a2 (each with its 2 warps) + contextnet + unet")
+            return m
+        raise SystemExit("unknown --compile %s" % a.compile)
+
     ny, nx = (int(v) for v in a.tiles.lower().split("x"))
-    # `--compile` MUST force this path: the compile dispatch lives under `if tiled:`, so with
-    # --tiles 1x1 --cores 1 the whole block was skipped and the run went EAGER while still
-    # printing nothing about it. A shape sweep was reported as compiled on that basis and was
-    # not compiled at all.
-    tiled = (ny * nx > 1) or a.cores > 1 or a.only_tile is not None or a.compile != "none"
+    tiled = (ny * nx > 1) or a.cores > 1 or a.only_tile is not None
     tiles = plan_tiles(H, W, ny, nx, a.halo)
     reps = None
     if tiled:
@@ -1323,61 +1365,12 @@ def main():
             print("  --only-tile %d: valid %dx%d at (%d,%d), padded %dx%d"
                   % (a.only_tile, T["vy"], T["vx"], T["oy"], T["ox"], T["ph"], T["pw"]))
         reps = build_replicas(model, dt, a.device, ncore)
-        # ONE graph for the whole model. fullgraph=True so a dynamo break RAISES instead of
-        # silently emitting a subgraph -- an unguarded break around the view(torch.uint32) index
-        # bitcast in the warp corrupts which pixels get sampled (55.37 dB / 42.70 LSB against
-        # eager's 121.78 dB / 0.00 LSB), which is a compiler defect, not a reason to fragment.
-        _CC = dict(backend="neuron", dynamic=False, fullgraph=True)
-        if a.compile == "one":
-            # PER-MODULE PROBE. The model stays eager and exactly ONE module is compiled, so a
-            # failure names the module that cannot be compiled instead of leaving it to be
-            # inferred from a granularity sweep. Whatever passes here can ship compiled with
-            # the rest eager.
-            tgt = a.compile_only
-            for m, _d in reps:
-                u = m.UVR
-                if tgt in ("a0", "a1", "a2"):
-                    i = {"a0": 0, "a1": 1, "a2": 2}[tgt]
-                    u._stages = list(u._stages)
-                    u._stages[i] = torch.compile(u._stages[i], **_CC)
-                elif tgt in ("contextnet", "unet"):
-                    setattr(u, tgt, torch.compile(getattr(u, tgt), **_CC))
-                elif tgt == "pyramid":
-                    u._pyramid = torch.compile(_Pyramid(u._stages), **_CC)
-                elif tgt == "refine":
-                    u._refine = torch.compile(_Refine(u.contextnet, u.unet), **_CC)
-                else:
-                    raise SystemExit("--compile one needs --compile-only "
-                                     "{a0,a1,a2,contextnet,unet,pyramid,refine}")
-            print("  torch.compile: ONLY %s -- everything else eager" % tgt)
-        elif a.compile == "whole":
-            out = []
-            for i, (m, d) in enumerate(reps):
-                print("  torch.compile[%d/%d] on %s: %s" % (i + 1, len(reps), d, _CC))
-                out.append((torch.compile(m, **_CC), d))
-            reps = out
-            print("  torch.compile: 1 GRAPH per replica over %d replica(s), %s"
-                  % (len(reps), _CC))
-        elif a.compile == "halves":
-            # 2 graphs: the flow pyramid (all 3 stages, so all 6 full-res warps) and the
-            # refinement (contextnet x2 + unet). The coarsest split that puts a boundary
-            # between the resample-heavy half and the conv-heavy half.
-            for m, _d in reps:
-                u = m.UVR
-                u._pyramid = torch.compile(_Pyramid(u._stages), **_CC)
-                u._refine = torch.compile(_Refine(u.contextnet, u.unet), **_CC)
-            print("  torch.compile: 2 GRAPHS -- pyramid (all 3 stages, 6 warps) + refinement")
-        elif a.compile == "stages":
-            # 5 graphs: a0/a1/a2 each WITH its two warps, plus contextnet and unet. A stage
-            # only helps if it OWNS its warps -- wrapping the bare IFBlocks leaves the six
-            # full-resolution warps outside every compiled region.
-            for m, _d in reps:
-                u = m.UVR
-                u._stages = [torch.compile(s, **_CC) for s in u._stages]
-                for nm in ("contextnet", "unet"):
-                    setattr(u, nm, torch.compile(getattr(u, nm), **_CC))
-            print("  torch.compile: a0/a1/a2 (each with its 2 warps) + contextnet + unet")
+        reps = [(apply_compile(m, "replica %d/%d" % (i + 1, len(reps))), d)
+                for i, (m, d) in enumerate(reps)]
         print("  %d replica(s) built" % len(reps))
+
+    # Non-tiled path gets the same treatment; kept in a list so one_frame closes over it.
+    _solo = [model if tiled else apply_compile(model, "model")]
 
     def one_frame(m=None, pf=None, pb=None):
         if tiled and m is None:
@@ -1386,7 +1379,7 @@ def main():
             one_frame.percore = per
             one_frame.phases = ph
             return fr
-        m = model if m is None else m
+        m = _solo[0] if m is None else m
         pf = pair_f if pf is None else pf
         pb = pair_b if pb is None else pb
         with torch.no_grad():
