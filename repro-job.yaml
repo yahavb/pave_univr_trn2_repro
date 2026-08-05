@@ -14,7 +14,7 @@ spec:
         node-type: trn3-dev1
       resourceClaims:
         - name: neurons
-          resourceClaimTemplateName: s-lnc2
+          resourceClaimTemplateName: s-lnc1
       containers:
         - name: repro
           image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
