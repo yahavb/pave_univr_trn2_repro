@@ -44,33 +44,39 @@ spec:
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
               GEOM="--height 1728 --width 4096 --tiles 2x4 --halo 128 --bar 3"
 
-              for WARP in gather gridsample nki-dyn; do
-                echo "=== SINGLE GRAPH, warp=$WARP ==="
+              echo "Finding the FEWEST graphs that compile. Coarsest first; stops at the first"
+              echo "mode that runs, so the winner is the minimal split."
+              echo ""
+
+              WINNER=""
+              for MODE in whole halves stages; do
+                echo "=== --compile $MODE ==="
                 NEURON_LAUNCH_BLOCKING=1 python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
                     --device neuron --cores 1 --only-tile 1 \
-                    --warp $WARP --dtype fp32 \
-                    --compile whole --iters 0 \
-                    > "$OUT/$WARP.log" 2>&1 && echo "  RAN" || echo "  FAILED (exit $?)"
-                grep -iE "first call|PSNR|max_diff|PASS|FAIL|NCC_E|KeyError|RuntimeError|Unsupported|graph break" \
-                    "$OUT/$WARP.log" | head -6 || true
+                    --warp nki-dyn --dtype fp32 \
+                    --compile $MODE --iters 0 \
+                    > "$OUT/$MODE.log" 2>&1 && rc=0 || rc=$?
+                if grep -q "forward complete" "$OUT/$MODE.log"; then
+                  echo "  RAN"
+                  grep -iE "torch.compile:|first call|PSNR|max_diff" "$OUT/$MODE.log" | head -5 | sed 's/^/    /'
+                  WINNER="$MODE"
+                  echo ""
+                  break
+                fi
+                code=$(grep -oE "NCC_E[A-Z0-9]+" "$OUT/$MODE.log" | head -1)
+                ops=$(grep -oE "in=[0-9]+ and out=[0-9]+" "$OUT/$MODE.log" | head -1)
+                other=$(grep -oE "torch._dynamo.exc.[A-Za-z]+|KeyError: '[^']*'" "$OUT/$MODE.log" | head -1)
+                echo "  FAILED (exit $rc)  ${code:-${other:-unknown}}  ${ops:-}"
                 echo ""
               done
 
-              echo "=== VERDICT: which warp survives ONE graph ==="
-              for WARP in gather gridsample nki-dyn; do
-                f="$OUT/$WARP.log"
-                if grep -q "forward complete" "$f" 2>/dev/null; then
-                  echo "  $WARP: RAN"
-                  grep -oE "max_diff +[0-9.]+ LSB +.(PASS|FAIL)" "$f" | head -1 | sed 's/^/      /'
-                else
-                  code=$(grep -oE "NCC_E[A-Z0-9]+" "$f" | head -1)
-                  ops=$(grep -oE "in=[0-9]+ and out=[0-9]+" "$f" | head -1)
-                  echo "  $WARP: FAILED  ${code:-no-NCC-code}  ${ops:-}"
-                fi
-              done
-              echo ""
-              echo "  Same code AND same operand sizes across all three arms means the fault is"
-              echo "  independent of the resample implementation."
+              echo "=== MINIMAL SPLIT ==="
+              if [ -n "$WINNER" ]; then
+                echo "  $WINNER is the coarsest granularity that compiles."
+                echo "  Everything coarser than it failed; finer ones were not tried."
+              else
+                echo "  NONE of whole/halves/stages compiled. Eager is the only working path."
+              fi
               echo ""
 
               ARCHIVE=/tmp/univr_compile_$(date -u +%Y%m%d_%H%M%S).tar.gz

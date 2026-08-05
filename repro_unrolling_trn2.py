@@ -624,6 +624,40 @@ class _StageNext(nn.Module):
         return flow, mask, nw0, nw1
 
 
+class _Pyramid(nn.Module):
+    """All three pyramid stages in one module, so `--compile halves` gets ONE graph over the
+    whole flow pyramid -- and therefore all six full-resolution warps. Wrapping the stages
+    individually cannot express that: each torch.compile call is its own graph."""
+
+    def __init__(self, stages):
+        super().__init__()
+        self._st = stages
+
+    def forward(self, img0, img1, timestep):
+        s0, s1, s2 = self._st
+        flow, mask, w0, w1 = s0(img0, img1, timestep)
+        outs = [(mask, w0, w1)]
+        for s in (s1, s2):
+            flow, mask, w0, w1 = s(img0, img1, timestep, w0, w1, flow, mask)
+            outs.append((mask, w0, w1))
+        return flow, outs[0][0], outs[0][1], outs[0][2], \
+            outs[1][0], outs[1][1], outs[1][2], outs[2][0], outs[2][1], outs[2][2]
+
+
+class _Refine(nn.Module):
+    """contextnet(img0), contextnet(img1) and unet in ONE module, so the refinement half is a
+    single graph rather than three."""
+
+    def __init__(self, contextnet, unet):
+        super().__init__()
+        self.contextnet, self.unet = contextnet, unet
+
+    def forward(self, img0, img1, w0, w1, mask, flow):
+        c0 = self.contextnet(img0, flow[:, :2])
+        c1 = self.contextnet(img1, flow[:, 2:4])
+        return self.unet(img0, img1, w0, w1, mask, flow, c0, c1)
+
+
 class IFNet_m(nn.Module):
     def __init__(self):
         super().__init__()
@@ -638,6 +672,8 @@ class IFNet_m(nn.Module):
         # state_dict keys stay exactly the checkpoint's. Registering them would expose every IFBlock
         # weight a second time under `_stages.N.blk.*` and load_state_dict would report all of them
         # missing. The wrappers own no parameters of their own, so they need no .to(device/dtype).
+        self._pyramid = None
+        self._refine = None
         self._stages = [_StageFirst(self.block0, 4, "a0"),
                         _StageNext(self.block1, 2, "a1"),
                         _StageNext(self.block2, 1, "a2")]
@@ -649,19 +685,29 @@ class IFNet_m(nn.Module):
         # graph that CONTAINS that stage's two warps. Per-block tags are unchanged (a0_conv/a0_warp
         # and so on), so the C28-keyed table still lines up. scale=(4,2,1) is baked into the wrappers
         # at construction; the argument survives only for signature compatibility with upstream.
-        s0, s1, s2 = self._stages
-        flow, mask, w0, w1 = s0(img0, img1, timestep)
-        mask_list.append(torch.sigmoid(mask))
-        merged.append((w0, w1))
-        for s in (s1, s2):
-            flow, mask, w0, w1 = s(img0, img1, timestep, w0, w1, flow, mask)
+        if getattr(self, "_pyramid", None) is not None:
+            # --compile halves: one graph for the pyramid, one for the refinement.
+            (flow, m0, a0, b0, m1, a1, b1, mask, w0, w1) = self._pyramid(img0, img1, timestep)
+            for mk, (aa, bb) in ((m0, (a0, b0)), (m1, (a1, b1)), (mask, (w0, w1))):
+                mask_list.append(torch.sigmoid(mk))
+                merged.append((aa, bb))
+        else:
+            s0, s1, s2 = self._stages
+            flow, mask, w0, w1 = s0(img0, img1, timestep)
             mask_list.append(torch.sigmoid(mask))
             merged.append((w0, w1))
+            for s in (s1, s2):
+                flow, mask, w0, w1 = s(img0, img1, timestep, w0, w1, flow, mask)
+                mask_list.append(torch.sigmoid(mask))
+                merged.append((w0, w1))
         for i in range(3):
             merged[i] = merged[i][0] * mask_list[i] + merged[i][1] * (1 - mask_list[i])
-        c0 = _tb("ctx", self.contextnet, img0, flow[:, :2])      # 4 levels, each with a warp
-        c1 = _tb("ctx", self.contextnet, img1, flow[:, 2:4])
-        res = _tb("unet", self.unet, img0, img1, w0, w1, mask, flow, c0, c1)[:, :3] * 2 - 1
+        if getattr(self, "_refine", None) is not None:
+            res = self._refine(img0, img1, w0, w1, mask, flow)[:, :3] * 2 - 1
+        else:
+            c0 = _tb("ctx", self.contextnet, img0, flow[:, :2])  # 4 levels, each with a warp
+            c1 = _tb("ctx", self.contextnet, img1, flow[:, 2:4])
+            res = _tb("unet", self.unet, img0, img1, w0, w1, mask, flow, c0, c1)[:, :3] * 2 - 1
         merged[2] = torch.clamp(merged[2] + res, 0, 1)
         return merged[2]
 
@@ -1108,9 +1154,10 @@ def main():
     ap.add_argument("--warp", default="gather", choices=sorted(WARPS),
                     help="nki = unrolled kernel (best runtime, 80-100 min compile at 4K tiles); "
                          "nki-dyn = device-loop kernel (seconds to compile, ~2x runtime)")
-    ap.add_argument("--compile", default="none", choices=("none", "whole"),
-                    help="none = eager, the native path's own boundaries; "
-                         "whole = ONE torch.compile graph per replica, fullgraph=True")
+    ap.add_argument("--compile", default="none", choices=("none", "whole", "halves", "stages"),
+                    help="graph count, coarsest first. none = eager; whole = 1 graph; "
+                         "halves = pyramid + refinement; stages = a0/a1/a2 + ctx + unet. "
+                         "All compiled modes use fullgraph=True")
     ap.add_argument("--per-block", action="store_true",
                     help="time each module (a0/a1/a2 conv+warp, ctx, unet) with a device barrier, "
                          "keyed to line up with the repo's C28 per-module table. Barriers serialise, "
@@ -1273,8 +1320,28 @@ def main():
         # bitcast in the warp corrupts which pixels get sampled (55.37 dB / 42.70 LSB against
         # eager's 121.78 dB / 0.00 LSB), which is a compiler defect, not a reason to fragment.
         _CC = dict(backend="neuron", dynamic=False, fullgraph=True)
-        reps = [(torch.compile(m, **_CC), d) for m, d in reps]
-        print("  torch.compile: SINGLE GRAPH per replica, fullgraph=True")
+        if a.compile == "whole":
+            reps = [(torch.compile(m, **_CC), d) for m, d in reps]
+            print("  torch.compile: 1 GRAPH -- whole forward")
+        elif a.compile == "halves":
+            # 2 graphs: the flow pyramid (all 3 stages, so all 6 full-res warps) and the
+            # refinement (contextnet x2 + unet). The coarsest split that puts a boundary
+            # between the resample-heavy half and the conv-heavy half.
+            for m, _d in reps:
+                u = m.UVR
+                u._pyramid = torch.compile(_Pyramid(u._stages), **_CC)
+                u._refine = torch.compile(_Refine(u.contextnet, u.unet), **_CC)
+            print("  torch.compile: 2 GRAPHS -- pyramid (all 3 stages, 6 warps) + refinement")
+        elif a.compile == "stages":
+            # 5 graphs: a0/a1/a2 each WITH its two warps, plus contextnet and unet. A stage
+            # only helps if it OWNS its warps -- wrapping the bare IFBlocks leaves the six
+            # full-resolution warps outside every compiled region.
+            for m, _d in reps:
+                u = m.UVR
+                u._stages = [torch.compile(s, **_CC) for s in u._stages]
+                for nm in ("contextnet", "unet"):
+                    setattr(u, nm, torch.compile(getattr(u, nm), **_CC))
+            print("  torch.compile: a0/a1/a2 (each with its 2 warps) + contextnet + unet")
         print("  %d replica(s) built" % len(reps))
 
     def one_frame(m=None, pf=None, pb=None):
