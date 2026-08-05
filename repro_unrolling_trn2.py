@@ -1301,7 +1301,11 @@ def main():
         print("  a pair against it is not the shipped comparison -- pass --rs2 for that.")
 
     ny, nx = (int(v) for v in a.tiles.lower().split("x"))
-    tiled = (ny * nx > 1) or a.cores > 1 or a.only_tile is not None
+    # `--compile` MUST force this path: the compile dispatch lives under `if tiled:`, so with
+    # --tiles 1x1 --cores 1 the whole block was skipped and the run went EAGER while still
+    # printing nothing about it. A shape sweep was reported as compiled on that basis and was
+    # not compiled at all.
+    tiled = (ny * nx > 1) or a.cores > 1 or a.only_tile is not None or a.compile != "none"
     tiles = plan_tiles(H, W, ny, nx, a.halo)
     reps = None
     if tiled:
@@ -1347,8 +1351,13 @@ def main():
                                      "{a0,a1,a2,contextnet,unet,pyramid,refine}")
             print("  torch.compile: ONLY %s -- everything else eager" % tgt)
         elif a.compile == "whole":
-            reps = [(torch.compile(m, **_CC), d) for m, d in reps]
-            print("  torch.compile: 1 GRAPH -- whole forward")
+            out = []
+            for i, (m, d) in enumerate(reps):
+                print("  torch.compile[%d/%d] on %s: %s" % (i + 1, len(reps), d, _CC))
+                out.append((torch.compile(m, **_CC), d))
+            reps = out
+            print("  torch.compile: 1 GRAPH per replica over %d replica(s), %s"
+                  % (len(reps), _CC))
         elif a.compile == "halves":
             # 2 graphs: the flow pyramid (all 3 stages, so all 6 full-res warps) and the
             # refinement (contextnet x2 + unet). The coarsest split that puts a boundary

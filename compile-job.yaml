@@ -61,12 +61,15 @@ spec:
                 PX=$(( H * W ))
                 echo "=== --compile whole at ${H}x${W} halo $HALO (${PX} px) ==="
                 PREV=$(nefs)
+                set +e
                 NEURON_LAUNCH_BLOCKING=1 python -u repro_unrolling_trn2.py $FRAMES $REF \
                     --height $H --width $W --tiles 1x1 --halo $HALO \
                     --device neuron --cores 1 \
                     --warp nki-dyn --dtype fp32 \
                     --compile whole --iters 0 \
-                    > "$OUT/whole_${H}x${W}.log" 2>&1 && rc=0 || rc=$?
+                    2>&1 | tee "$OUT/whole_${H}x${W}.log"
+                rc=${PIPESTATUS[0]}
+                set -e
                 if grep -q "forward complete" "$OUT/whole_${H}x${W}.log"; then
                   echo "  OK  $(grep -oE 'first call [0-9]+ ms' "$OUT/whole_${H}x${W}.log" | head -1)  NEFFs +$(( $(nefs) - PREV ))"
                 else
@@ -131,12 +134,6 @@ spec:
           env:
             - name: PYTHONUNBUFFERED
               value: "1"
-            - name: NEURON_LOGICAL_NC_CONFIG
-              value: "1"
-            - name: NEURON_RT_NUM_CORES
-              value: "1"
-            - name: NEURON_RT_VISIBLE_CORES
-              value: "0"
             - name: NEURON_CC_FLAGS
               value: "--target trn2 --lnc 1 --model-type unet-inference"
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
