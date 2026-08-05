@@ -50,6 +50,16 @@ spec:
               echo "total $(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)"
               echo ""
 
+              echo "=== wait for the bench to release the core ==="
+              for i in $(seq 1 60); do
+                pgrep -f microbench.py >/dev/null || break
+                sleep 2
+              done
+              sleep 10
+              pgrep -af microbench.py || echo "  no bench process"
+              neuron-ls 2>&1 | head -12 || true
+              echo ""
+
               echo "=== capture top 5 ==="
               POUT=/tmp/perneff; rm -rf "$POUT"; mkdir -p "$POUT"
               PAIRS="$OUT/pairs"; mkdir -p "$PAIRS"
@@ -123,7 +133,7 @@ spec:
             - name: NEURON_RT_VISIBLE_CORES
               value: "0"
             - name: NEURON_CC_FLAGS
-              value: "--target trn2 --lnc 1 --model-type unet-inference"
+              value: "--target trn3 --lnc 1 --model-type unet-inference"
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
               value: "/tmp/neff_cache"
             - name: OMP_NUM_THREADS
