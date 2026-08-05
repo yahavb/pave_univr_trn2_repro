@@ -1,0 +1,113 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: univr-trn-compile
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: univr-trn-compile
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neurons
+          resourceClaimTemplateName: s-lnc1
+      containers:
+        - name: compile
+          image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euo pipefail
+
+              cd /tmp
+              git clone -b main https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
+              cd REPRO
+
+              echo "┌── PROVENANCE ──"
+              echo "│ commit : $(git rev-parse HEAD)"
+              echo "│ subject: $(git log -1 --pretty=%s)"
+              echo "└────────────────"
+
+              echo "neuronx-cc : $(neuronx-cc --version 2>&1 | head -1)"
+              python -c 'import torch, torch_neuronx, nki; print("torch", torch.__version__, "| torch-neuronx", torch_neuronx.__version__, "| nki", getattr(nki,"__version__","?"))' 2>&1 | tail -1
+              echo ""
+
+              OUT=/tmp/prof_out; mkdir -p "$OUT"
+              FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
+              REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
+              GEOM="--height 1728 --width 4096 --tiles 2x4 --halo 128 --bar 3"
+
+              echo "=== torch.compile WHOLE: one graph per replica, fullgraph=True ==="
+              python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
+                  --device neuron --cores 1 --only-tile 1 \
+                  --warp nki-dyn --dtype fp32 \
+                  --compile whole --iters 0 \
+                  2>&1 | tee "$OUT/compile_whole.log" || echo "FAILED (exit $?)"
+              echo ""
+              echo "NEFFs in cache: $(find /tmp/neff_cache/ -name '*.neff' 2>/dev/null | wc -l)"
+              echo ""
+
+              ARCHIVE=/tmp/univr_compile_$(date -u +%Y%m%d_%H%M%S).tar.gz
+              tar -czf "$ARCHIVE" -C /tmp prof_out
+              mkdir -p /var/mdl/univr_neuron
+              cp "$ARCHIVE" /var/mdl/univr_neuron/
+              echo "Saved: /var/mdl/univr_neuron/$(basename "$ARCHIVE") ($(du -h "$ARCHIVE" | cut -f1))"
+              echo "Done."
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 48
+              memory: 248Gi
+            limits:
+              cpu: 84
+              memory: 248Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_NUM_CORES
+              value: "1"
+            - name: NEURON_RT_VISIBLE_CORES
+              value: "0"
+            - name: NEURON_CC_FLAGS
+              value: "--target trn2 --lnc 1 --model-type unet-inference"
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
