@@ -51,13 +51,22 @@ spec:
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
               GEOM="--height 1728 --width 4096 --tiles 2x4 --halo 128 --bar 3"
 
-              echo "=== [1/2] FUNCTIONAL CHECK — 8 tiles / 8 cores, warp=nki-dyn ==="
+              echo "=== [1/3] SERIAL WARMUP — 1 tile, 1 core, warp=nki-dyn ==="
+              python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
+                  --device neuron --cores 1 --only-tile 1 --warp nki-dyn --dtype fp32 --iters 1 \
+                  2>&1 | tee "$OUT/0_warmup_1core.log"
+              echo ""
+
+              echo "NEFFs cached after serial warmup: $(find /tmp/neff_cache/ -name '*.neff' 2>/dev/null | wc -l)"
+              echo ""
+
+              echo "=== [2/3] FUNCTIONAL CHECK — 8 tiles / 8 cores, warp=nki-dyn ==="
               python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
                   --device neuron --cores 8 --warp nki-dyn --dtype fp32 --iters 1 \
                   2>&1 | tee "$OUT/1_functional_nki_dyn.log"
               echo ""
 
-              echo "=== [2/2] MEASUREMENT — 8 tiles / 8 cores, warp=nki, 3 iters ==="
+              echo "=== [3/3] MEASUREMENT — 8 tiles / 8 cores, warp=nki, 3 iters ==="
               echo "    bundle reference: 3673.3 ms median, 98.68 dB, 0.64 LSB PASS"
               echo "    CUDA L40S for the same frame: eager 351.1 ms, inductor 237.9 ms, TRT 161 ms"
               python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
@@ -101,6 +110,8 @@ spec:
               value: "0-7"
             - name: NEURON_CC_FLAGS
               value: "--target trn2 --lnc 1 --model-type unet-inference"
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
             - name: OMP_NUM_THREADS
               value: "8"
             - name: NEURON_RT_LOG_LEVEL
