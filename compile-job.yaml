@@ -47,68 +47,14 @@ spec:
               REF="--weights pre_net_flow.pth"
               GEOM="--height 32 --width 32 --tiles 1x1 --halo 0"
 
-              echo "Does --compile whole (ONE graph, fullgraph=True) work, and up to what shape?"
-              echo "Every module compiled individually at 32x32, and whole failed at 992x1280 with"
-              echo "NCC_EBIR033. So the variable is SHAPE, not structure. Bisect it."
+              set +e
+              python -u compile_single_graph.py \
+                  --weights pre_net_flow.pth --rs0 rs70.png --rs1 rs71.png \
+                  --height 32 --width 32 2>&1 | tee "$OUT/single_graph.log"
+              rc=${PIPESTATUS[0]}
+              set -e
               echo ""
-
-              nefs() { find /tmp/neff_cache/ -name '*.neff' 2>/dev/null | wc -l; }
-
-              # HxW:halo, smallest first. 32 is TILE_ALIGN. The last entry is the production tile.
-              for SHAPE in 32x32:0 64x96:0 128x192:0 256x384:32 512x768:32 992x1280:32; do
-                HW=${SHAPE%%:*}; HALO=${SHAPE##*:}
-                H=${HW%%x*}; W=${HW##*x}
-                PX=$(( H * W ))
-                echo "=== --compile whole at ${H}x${W} halo $HALO (${PX} px) ==="
-                PREV=$(nefs)
-                set +e
-                NEURON_LAUNCH_BLOCKING=1 python -u repro_unrolling_trn2.py $FRAMES $REF \
-                    --height $H --width $W --tiles 1x1 --halo $HALO \
-                    --device neuron --cores 1 \
-                    --warp nki-dyn --dtype fp32 \
-                    --compile whole --iters 0 \
-                    2>&1 | tee "$OUT/whole_${H}x${W}.log"
-                rc=${PIPESTATUS[0]}
-                set -e
-                if grep -q "forward complete" "$OUT/whole_${H}x${W}.log"; then
-                  echo "  OK  $(grep -oE 'first call [0-9]+ ms' "$OUT/whole_${H}x${W}.log" | head -1)  NEFFs +$(( $(nefs) - PREV ))"
-                else
-                  code=$(grep -oE "NCC_E[A-Z0-9]+" "$OUT/whole_${H}x${W}.log" | head -1)
-                  ops=$(grep -oE "in=[0-9]+ and out=[0-9]+" "$OUT/whole_${H}x${W}.log" | head -1)
-                  other=$(grep -oE "torch._dynamo.exc.[A-Za-z]+|KeyError: '[^']*'" "$OUT/whole_${H}x${W}.log" | head -1)
-                  echo "  FAILED (exit $rc)  ${code:-${other:-unknown}}  ${ops:-}"
-                fi
-                echo ""
-              done
-
-              echo "=== SINGLE GRAPH vs SHAPE ==="
-              LAST_OK=""
-              for SHAPE in 32x32 64x96 128x192 256x384 512x768 992x1280; do
-                f="$OUT/whole_${SHAPE}.log"
-                [ -f "$f" ] || continue
-                if grep -q "forward complete" "$f"; then
-                  echo "  ${SHAPE}: OK"; LAST_OK=$SHAPE
-                else
-                  echo "  ${SHAPE}: FAILED  $(grep -oE 'NCC_E[A-Z0-9]+' "$f" | head -1)  $(grep -oE 'in=[0-9]+ and out=[0-9]+' "$f" | head -1)"
-                fi
-              done
-              echo ""
-              if [ -n "$LAST_OK" ]; then
-                echo "  ONE graph with fullgraph=True works up to $LAST_OK."
-              else
-                echo "  ONE graph failed at every shape tried, including the smallest."
-              fi
-              echo ""
-              echo "  total NEFFs: $(nefs) in /tmp/neff_cache"
-              echo ""
-
-              echo "=== NEFF FILES ==="
-              du -sh /tmp/neff_cache 2>/dev/null || true
-              find /tmp/neff_cache/ -name '*.neff' -printf '%10s  %P\n' 2>/dev/null \
-                | sort -rn | tee "$OUT/neff_listing.txt" | head -20
-              echo ""
-              cp -r /tmp/neff_cache "$OUT/neff_cache" 2>/dev/null || true
-              echo "  exported $(find "$OUT/neff_cache" -name '*.neff' 2>/dev/null | wc -l) NEFF files into the archive"
+              echo "exit $rc   NEFFs: $(find /tmp/neff_cache/ -name '*.neff' 2>/dev/null | wc -l)"
               echo ""
 
               ARCHIVE=/tmp/univr_compile_$(date -u +%Y%m%d_%H%M%S).tar.gz
