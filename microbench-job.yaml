@@ -38,7 +38,8 @@ spec:
               set +e
               python -u microbench.py --weights pre_net_flow.pth \
                   --rs0 rs70.png --rs1 rs71.png \
-                  --height "$H" --width "$W" --iters 3 2>&1 | tee "$OUT/run.log"
+                  --height "$H" --width "$W" --iters 3 \
+                  --warp "${WARP:-gridsample}" 2>&1 | tee "$OUT/run.log"
               rc=${PIPESTATUS[0]}
               set -e
               echo "exit $rc"
@@ -126,6 +127,8 @@ spec:
               value: "1"
             - name: RES
               value: "256x384"
+            - name: WARP
+              value: "gridsample"
             - name: NEURON_LOGICAL_NC_CONFIG
               value: "1"
             - name: NEURON_RT_NUM_CORES

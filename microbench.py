@@ -16,12 +16,15 @@ def main():
     ap.add_argument("--width", type=int, default=384)
     ap.add_argument("--gamma", type=float, default=0.98)
     ap.add_argument("--iters", type=int, default=3)
+    ap.add_argument("--warp", default="gridsample",
+                    choices=("gridsample", "gather", "nki", "nki-dyn"))
     a = ap.parse_args()
 
     R._PRELU = R.NeuronPReLU
-    R._WARP = R.warp_nki
-    R._NKI_DYN = True
-    R._NKI_FN, R._NKI_FN_DYN = R._build_nki()
+    R._WARP = R.WARPS[a.warp]
+    if a.warp.startswith("nki"):
+        R._NKI_DYN = (a.warp == "nki-dyn")
+        R._NKI_FN, R._NKI_FN_DYN = R._build_nki()
 
     torch.manual_seed(0)
     model = R.UniVR().eval()
@@ -35,6 +38,7 @@ def main():
 
     cc = dict(backend="neuron", dynamic=False, fullgraph=True)
     print("shape         %dx%d" % (a.height, a.width))
+    print("warp          %s" % a.warp)
     print("torch.compile %s" % cc)
     compiled = torch.compile(model, **cc)
 
