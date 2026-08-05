@@ -41,8 +41,11 @@ spec:
 
               OUT=/tmp/prof_out; mkdir -p "$OUT"
               FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
-              REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
-              GEOM="--height 1728 --width 4096 --tiles 2x4 --halo 128 --bar 3"
+              # Minimal shape: 32 is TILE_ALIGN, the floor. 1024 padded px against 1,269,760 at
+              # the production tile, so compile is ~1240x less work. No --gt: the reference is 4K
+              # and scoring a 32x32 output against it would resize and print a meaningless PSNR.
+              REF="--weights pre_net_flow.pth"
+              GEOM="--height 32 --width 32 --tiles 1x1 --halo 0"
 
               echo "PER-MODULE PROBE. The model runs EAGER and exactly one module is compiled,"
               echo "so a failure names the module rather than leaving it to be inferred."
@@ -52,22 +55,22 @@ spec:
 
               echo "=== BASELINE: fully eager ==="
               python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
-                  --device neuron --cores 1 --only-tile 1 \
+                  --device neuron --cores 1 \
                   --warp nki-dyn --dtype fp32 --compile none --iters 0 \
                   > "$OUT/eager.log" 2>&1 && echo "  RAN" || echo "  FAILED"
-              grep -iE "first call|PSNR|max_diff" "$OUT/eager.log" | head -3 | sed 's/^/    /' || true
+              grep -iE "first call|forward complete" "$OUT/eager.log" | head -2 | sed 's/^/    /' || true
               echo ""
 
               for MOD in unet contextnet a0 a1 a2 refine pyramid; do
                 echo "=== compile ONLY $MOD (rest eager) ==="
                 NEURON_LAUNCH_BLOCKING=1 python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
-                    --device neuron --cores 1 --only-tile 1 \
+                    --device neuron --cores 1 \
                     --warp nki-dyn --dtype fp32 \
                     --compile one --compile-only $MOD --iters 0 \
                     > "$OUT/one_$MOD.log" 2>&1 && rc=0 || rc=$?
                 if grep -q "forward complete" "$OUT/one_$MOD.log"; then
                   echo "  COMPILED OK"
-                  grep -iE "first call|PSNR|max_diff" "$OUT/one_$MOD.log" | head -3 | sed 's/^/    /'
+                  grep -iE "torch.compile:|first call" "$OUT/one_$MOD.log" | head -2 | sed 's/^/    /'
                 else
                   code=$(grep -oE "NCC_E[A-Z0-9]+" "$OUT/one_$MOD.log" | head -1)
                   ops=$(grep -oE "in=[0-9]+ and out=[0-9]+" "$OUT/one_$MOD.log" | head -1)
@@ -81,7 +84,7 @@ spec:
               for MOD in unet contextnet a0 a1 a2 refine pyramid; do
                 f="$OUT/one_$MOD.log"
                 if grep -q "forward complete" "$f" 2>/dev/null; then
-                  echo "  $MOD: OK  $(grep -oE 'max_diff +[0-9.]+ LSB +.[A-Z]+' "$f" | head -1)"
+                  echo "  $MOD: OK  $(grep -oE 'first call [0-9]+ ms' "$f" | head -1)"
                 else
                   echo "  $MOD: FAILS  $(grep -oE 'NCC_E[A-Z0-9]+' "$f" | head -1)  $(grep -oE 'in=[0-9]+ and out=[0-9]+' "$f" | head -1)"
                 fi
