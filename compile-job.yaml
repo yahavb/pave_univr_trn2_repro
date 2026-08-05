@@ -47,50 +47,56 @@ spec:
               REF="--weights pre_net_flow.pth"
               GEOM="--height 32 --width 32 --tiles 1x1 --halo 0"
 
-              echo "PER-MODULE PROBE. The model runs EAGER and exactly one module is compiled,"
-              echo "so a failure names the module rather than leaving it to be inferred."
-              echo "whole (1 graph) and halves (2) both fail NCC_EBIR033 with in=17776640 --"
-              echo "identical, so granularity did not change what the backend fuses."
+              echo "Does --compile whole (ONE graph, fullgraph=True) work, and up to what shape?"
+              echo "Every module compiled individually at 32x32, and whole failed at 992x1280 with"
+              echo "NCC_EBIR033. So the variable is SHAPE, not structure. Bisect it."
               echo ""
 
-              echo "=== BASELINE: fully eager ==="
-              python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
-                  --device neuron --cores 1 \
-                  --warp nki-dyn --dtype fp32 --compile none --iters 0 \
-                  > "$OUT/eager.log" 2>&1 && echo "  RAN" || echo "  FAILED"
-              grep -iE "first call|forward complete" "$OUT/eager.log" | head -2 | sed 's/^/    /' || true
-              echo ""
+              nefs() { find /tmp/neff_cache/ -name '*.neff' 2>/dev/null | wc -l; }
 
-              for MOD in unet contextnet a0 a1 a2 refine pyramid; do
-                echo "=== compile ONLY $MOD (rest eager) ==="
-                NEURON_LAUNCH_BLOCKING=1 python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
+              # HxW:halo, smallest first. 32 is TILE_ALIGN. The last entry is the production tile.
+              for SHAPE in 32x32:0 64x96:0 128x192:0 256x384:32 512x768:32 992x1280:32; do
+                HW=${SHAPE%%:*}; HALO=${SHAPE##*:}
+                H=${HW%%x*}; W=${HW##*x}
+                PX=$(( H * W ))
+                echo "=== --compile whole at ${H}x${W} halo $HALO (${PX} px) ==="
+                PREV=$(nefs)
+                NEURON_LAUNCH_BLOCKING=1 python -u repro_unrolling_trn2.py $FRAMES $REF \
+                    --height $H --width $W --tiles 1x1 --halo $HALO \
                     --device neuron --cores 1 \
                     --warp nki-dyn --dtype fp32 \
-                    --compile one --compile-only $MOD --iters 0 \
-                    > "$OUT/one_$MOD.log" 2>&1 && rc=0 || rc=$?
-                if grep -q "forward complete" "$OUT/one_$MOD.log"; then
-                  echo "  COMPILED OK"
-                  grep -iE "torch.compile:|first call" "$OUT/one_$MOD.log" | head -2 | sed 's/^/    /'
+                    --compile whole --iters 0 \
+                    > "$OUT/whole_${H}x${W}.log" 2>&1 && rc=0 || rc=$?
+                if grep -q "forward complete" "$OUT/whole_${H}x${W}.log"; then
+                  echo "  OK  $(grep -oE 'first call [0-9]+ ms' "$OUT/whole_${H}x${W}.log" | head -1)  NEFFs +$(( $(nefs) - PREV ))"
                 else
-                  code=$(grep -oE "NCC_E[A-Z0-9]+" "$OUT/one_$MOD.log" | head -1)
-                  ops=$(grep -oE "in=[0-9]+ and out=[0-9]+" "$OUT/one_$MOD.log" | head -1)
-                  other=$(grep -oE "torch._dynamo.exc.[A-Za-z]+|KeyError: '[^']*'|failed to legalize[^\"]*" "$OUT/one_$MOD.log" | head -1)
-                  echo "  FAILED  ${code:-${other:-unknown}}  ${ops:-}"
+                  code=$(grep -oE "NCC_E[A-Z0-9]+" "$OUT/whole_${H}x${W}.log" | head -1)
+                  ops=$(grep -oE "in=[0-9]+ and out=[0-9]+" "$OUT/whole_${H}x${W}.log" | head -1)
+                  other=$(grep -oE "torch._dynamo.exc.[A-Za-z]+|KeyError: '[^']*'" "$OUT/whole_${H}x${W}.log" | head -1)
+                  echo "  FAILED (exit $rc)  ${code:-${other:-unknown}}  ${ops:-}"
                 fi
                 echo ""
               done
 
-              echo "=== MAP: what can be compiled ==="
-              for MOD in unet contextnet a0 a1 a2 refine pyramid; do
-                f="$OUT/one_$MOD.log"
-                if grep -q "forward complete" "$f" 2>/dev/null; then
-                  echo "  $MOD: OK  $(grep -oE 'first call [0-9]+ ms' "$f" | head -1)"
+              echo "=== SINGLE GRAPH vs SHAPE ==="
+              LAST_OK=""
+              for SHAPE in 32x32 64x96 128x192 256x384 512x768 992x1280; do
+                f="$OUT/whole_${SHAPE}.log"
+                [ -f "$f" ] || continue
+                if grep -q "forward complete" "$f"; then
+                  echo "  ${SHAPE}: OK"; LAST_OK=$SHAPE
                 else
-                  echo "  $MOD: FAILS  $(grep -oE 'NCC_E[A-Z0-9]+' "$f" | head -1)  $(grep -oE 'in=[0-9]+ and out=[0-9]+' "$f" | head -1)"
+                  echo "  ${SHAPE}: FAILED  $(grep -oE 'NCC_E[A-Z0-9]+' "$f" | head -1)  $(grep -oE 'in=[0-9]+ and out=[0-9]+' "$f" | head -1)"
                 fi
               done
               echo ""
-              echo "  Modules marked OK can ship compiled with the rest eager."
+              if [ -n "$LAST_OK" ]; then
+                echo "  ONE graph with fullgraph=True works up to $LAST_OK."
+              else
+                echo "  ONE graph failed at every shape tried, including the smallest."
+              fi
+              echo ""
+              echo "  total NEFFs: $(nefs) in /tmp/neff_cache"
               echo ""
 
               ARCHIVE=/tmp/univr_compile_$(date -u +%Y%m%d_%H%M%S).tar.gz
