@@ -1512,7 +1512,14 @@ def main():
                   % (W, H, "triplet" if real_triplet else "pair"))
             print("  resolution and mode to get a comparable ratio.")
 
-    descriptor_report(CALL_SITES, itemsize, n_forwards=2 if real_triplet else 1)
+    if CALL_SITES:
+        descriptor_report(CALL_SITES, itemsize, n_forwards=2 if real_triplet else 1)
+    else:
+        # _RECORD is off under --compile (appending to a list from inside the warp is not
+        # traceable under fullgraph=True), so there is nothing to report. Printing the table
+        # anyway emitted a page of zeros followed by hardcoded figures from other runs.
+        print()
+        print("  (no descriptor accounting: --compile %s disables call-site recording)" % a.compile)
 
     if a.gate:
         # THE PORT'S OWN GATE, and the one the docs quote: the same weights and the same inputs
