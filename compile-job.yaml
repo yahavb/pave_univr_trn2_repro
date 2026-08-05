@@ -60,11 +60,17 @@ spec:
               for WARP in gather gridsample nki-dyn; do
                 f="$OUT/$WARP.log"
                 if grep -q "forward complete" "$f" 2>/dev/null; then
-                  echo "  $WARP: RAN   $(grep -oE 'max_diff +[0-9.]+ LSB +\[[A-Z]+' "$f" | head -1)"
+                  echo "  $WARP: RAN"
+                  grep -oE "max_diff +[0-9.]+ LSB +.(PASS|FAIL)" "$f" | head -1 | sed 's/^/      /'
                 else
-                  echo "  $WARP: FAILED  $(grep -oE 'NCC_E[A-Z0-9]+|KeyError[^,]*|[A-Za-z]*Error' "$f" | head -1)"
+                  code=$(grep -oE "NCC_E[A-Z0-9]+" "$f" | head -1)
+                  ops=$(grep -oE "in=[0-9]+ and out=[0-9]+" "$f" | head -1)
+                  echo "  $WARP: FAILED  ${code:-no-NCC-code}  ${ops:-}"
                 fi
               done
+              echo ""
+              echo "  Same code AND same operand sizes across all three arms means the fault is"
+              echo "  independent of the resample implementation."
               echo ""
 
               ARCHIVE=/tmp/univr_compile_$(date -u +%Y%m%d_%H%M%S).tar.gz
