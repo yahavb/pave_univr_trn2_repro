@@ -99,6 +99,15 @@ spec:
               echo "  total NEFFs: $(nefs) in /tmp/neff_cache"
               echo ""
 
+              echo "=== NEFF FILES ==="
+              du -sh /tmp/neff_cache 2>/dev/null || true
+              find /tmp/neff_cache/ -name '*.neff' -printf '%10s  %P\n' 2>/dev/null \
+                | sort -rn | tee "$OUT/neff_listing.txt" | head -20
+              echo ""
+              cp -r /tmp/neff_cache "$OUT/neff_cache" 2>/dev/null || true
+              echo "  exported $(find "$OUT/neff_cache" -name '*.neff' 2>/dev/null | wc -l) NEFF files into the archive"
+              echo ""
+
               ARCHIVE=/tmp/univr_compile_$(date -u +%Y%m%d_%H%M%S).tar.gz
               tar -czf "$ARCHIVE" -C /tmp prof_out
               mkdir -p /var/mdl/univr_neuron
