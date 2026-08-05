@@ -1,0 +1,152 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: univr-microbench
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: univr-microbench
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neurons
+          resourceClaimTemplateName: s-lnc1
+      containers:
+        - name: microbench
+          image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euo pipefail
+
+              cd /tmp
+              git clone -b main https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
+              cd REPRO
+              echo "commit $(git rev-parse HEAD)"
+
+              OUT=/tmp/mb; mkdir -p "$OUT"
+              RES="${RES:-256x384}"
+              H=${RES%%x*}; W=${RES##*x}
+
+              set +e
+              python -u microbench.py --weights pre_net_flow.pth \
+                  --rs0 rs70.png --rs1 rs71.png \
+                  --height "$H" --width "$W" --iters 3 2>&1 | tee "$OUT/run.log"
+              rc=${PIPESTATUS[0]}
+              set -e
+              echo "exit $rc"
+              echo ""
+
+              echo "=== NEFFs ==="
+              find /tmp/neff_cache -name '*.neff' -printf '%s\t%p\n' 2>/dev/null | sort -rn \
+                | tee "$OUT/neff_listing.txt" | head -10
+              echo "total $(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)"
+              echo ""
+
+              echo "=== capture top 5 ==="
+              POUT=/tmp/perneff; rm -rf "$POUT"; mkdir -p "$POUT"
+              PAIRS="$OUT/pairs"; mkdir -p "$PAIRS"
+              mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' -printf '%s\t%p\n' \
+                2>/dev/null | sort -rn | head -5 | cut -f2)
+              OK=0; RANK=0
+              for neff in "${NEFFS[@]}"; do
+                RANK=$((RANK+1))
+                hash=$(basename "$neff" .neff)
+                ntff="$POUT/$hash.ntff"; json="$POUT/$hash.json"; err="$POUT/$hash.capture.log"
+                echo "  rank$RANK $hash ($(stat -c%s "$neff") B)"
+                NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 3600 \
+                  neuron-profile capture --single-io -n "$neff" -s "$ntff" >"$err" 2>&1 || true
+                [ -s "$ntff" ] || timeout 3600 \
+                  neuron-profile capture --single-io -n "$neff" -s "$ntff" >>"$err" 2>&1 || true
+                if [ ! -s "$ntff" ]; then
+                  echo "    capture FAILED"; tail -8 "$err"; continue
+                fi
+                echo "    ntff $(stat -c%s "$ntff") B"
+                timeout 900 neuron-profile view -n "$neff" -s "$ntff" \
+                  --output-format summary-json > "$json" 2>/dev/null || true
+                [ -s "$json" ] && OK=$((OK+1))
+                PD=$(printf "%s/rank%02d_%s_%dMB" "$PAIRS" "$RANK" "${hash:0:8}" \
+                  "$(( $(stat -c%s "$neff") / 1000000 ))")
+                mkdir -p "$PD"
+                cp "$neff" "$PD/$hash.neff"; cp "$ntff" "$PD/$hash.ntff"
+                [ -s "$json" ] && cp "$json" "$PD/summary.json"
+                echo "    PAIR $PD"
+                ls -la "$PD"
+              done
+              echo "captured $OK / ${#NEFFS[@]}"
+              echo ""
+
+              echo "=== engine summary, rank01 ==="
+              R1=$(ls -d "$PAIRS"/rank01_* 2>/dev/null | head -1) || true
+              if [ -n "$R1" ]; then
+                N=$(ls "$R1"/*.neff | head -1); T=$(ls "$R1"/*.ntff | head -1)
+                timeout 900 neuron-profile view -n "$N" -s "$T" \
+                  --output-format summary-text 2>&1 | head -60 || true
+              fi
+              echo ""
+
+              ARCHIVE=/tmp/univr_microbench_$(date -u +%Y%m%d_%H%M%S).tar.gz
+              tar -czf "$ARCHIVE" -C /tmp mb
+              mkdir -p /var/mdl/univr_neuron
+              cp "$ARCHIVE" /var/mdl/univr_neuron/
+              echo "saved /var/mdl/univr_neuron/$(basename "$ARCHIVE") ($(du -h "$ARCHIVE" | cut -f1))"
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 48
+              memory: 248Gi
+            limits:
+              cpu: 84
+              memory: 248Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: RES
+              value: "256x384"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_NUM_CORES
+              value: "1"
+            - name: NEURON_RT_VISIBLE_CORES
+              value: "0"
+            - name: NEURON_CC_FLAGS
+              value: "--target trn2 --lnc 1 --model-type unet-inference"
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
