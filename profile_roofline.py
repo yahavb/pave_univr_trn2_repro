@@ -20,9 +20,24 @@ def main():
     expect_bytes = int(sys.argv[4]) if len(sys.argv) > 4 else 0
 
     d = json.load(open(path))
-    s = d.get("summary", d)
-    if isinstance(s, list):
-        s = s[0] if s else {}
+    s = d
+    for _ in range(4):
+        if isinstance(s, list):
+            s = s[0] if s else {}
+            continue
+        if isinstance(s, dict) and "total_active_time" not in s:
+            vals = [v for v in s.values() if isinstance(v, (dict, list))]
+            if len(vals) == 1:
+                s = vals[0]
+                continue
+            if "summary" in s:
+                s = s["summary"]
+                continue
+        break
+    if not isinstance(s, dict) or "total_active_time" not in s:
+        print("could not locate a summary record in %s" % path)
+        print("top-level keys: %s" % (list(d.keys())[:6] if isinstance(d, dict) else type(d).__name__))
+        return 1
 
     total = g(s, "total_active_time")
     sw = g(s, "software_dynamic_dma_packet_count")
