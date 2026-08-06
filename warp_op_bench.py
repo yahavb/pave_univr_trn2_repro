@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import argparse
-import time
+import os
 
 import torch
 import torch.nn.functional as F
@@ -51,70 +51,77 @@ def warp_gather(x, flow):
     return out.to(x.dtype)
 
 
-def warp_shift(x, flow):
+def transpose_only(x, flow):
     B, C, H, W = x.shape
-    dx = flow[:, 0:1].mean().round().int().item()
-    dy = flow[:, 1:2].mean().round().int().item()
-    return torch.roll(x, shifts=(dy, dx), dims=(2, 3))
+    return x.reshape(B, C, H * W).permute(0, 2, 1).reshape(B * H * W, C).float()
 
 
-OPS = {"gridsample": warp_gridsample, "gather": warp_gather, "shift": warp_shift}
+def shift_only(x, flow):
+    return torch.roll(x, shifts=(4, 4), dims=(2, 3))
 
 
-def bench(fn, x, flow, iters, dev):
-    with torch.no_grad():
-        o = fn(x, flow)
-    o.float().cpu()
-    ts = []
-    for _ in range(iters):
-        t0 = time.perf_counter()
-        with torch.no_grad():
-            o = fn(x, flow)
-        o.float().cpu()
-        ts.append((time.perf_counter() - t0) * 1e3)
-    ts.sort()
-    return ts[len(ts) // 2], o
+OPS = {
+    "gridsample": warp_gridsample,
+    "gather": warp_gather,
+    "transpose": transpose_only,
+    "shift": shift_only,
+}
+
+
+def roofline(C, H, W, itemsize=4):
+    px = H * W
+    return {
+        "output_px": px,
+        "output_bytes": px * C * itemsize,
+        "src_bytes": px * C * itemsize,
+        "taps": 4,
+        "tap_bytes": 4 * px * C * itemsize,
+        "min_desc_1_per_px": px,
+        "min_desc_2_per_px": 2 * px,
+        "bytes_per_desc_at_2C": 2 * C * itemsize,
+        "index_bytes": 2 * px * itemsize,
+        "weight_bytes": 4 * px * itemsize,
+    }
 
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--op", required=True, choices=sorted(OPS))
+    ap.add_argument("--shape", required=True, help="C,H,W")
     ap.add_argument("--device", default="neuron")
-    ap.add_argument("--iters", type=int, default=5)
-    ap.add_argument("--ops", default="gridsample,gather")
-    ap.add_argument("--compile", action="store_true")
     ap.add_argument("--flow-mag", type=float, default=8.0)
+    ap.add_argument("--dtype", default="fp32", choices=("fp32", "bf16"))
     a = ap.parse_args()
 
-    ops = [o for o in a.ops.split(",") if o]
+    C, H, W = (int(v) for v in a.shape.split(","))
+    dt = torch.bfloat16 if a.dtype == "bf16" else torch.float32
+
     torch.manual_seed(0)
+    x = torch.rand(1, C, H, W, dtype=dt)
+    flow = ((torch.rand(1, 2, H, W) * 2 - 1) * a.flow_mag).to(dt)
 
-    print("%-11s %5s %5s %5s %4s %10s %12s %11s %9s" % (
-        "op", "C", "H", "W", "n", "px", "median_ms", "per_call_ms", "MB"))
-    totals = {}
-    for name in ops:
-        fn = OPS[name]
-        if a.compile:
-            fn = torch.compile(fn, backend="neuron", dynamic=False, fullgraph=True)
-        tot = 0.0
-        for (C, H, W, n) in SHAPES:
-            x = torch.rand(1, C, H, W)
-            flow = (torch.rand(1, 2, H, W) * 2 - 1) * a.flow_mag
-            x = x.to(a.device)
-            flow = flow.to(a.device)
-            ms, o = bench(fn, x, flow, a.iters, a.device)
-            mb = 4 * 4 * C * H * W / 1e6
-            tot += ms * n
-            print("%-11s %5d %5d %5d %4d %10d %12.3f %11.3f %9.2f" % (
-                name, C, H, W, n, H * W, ms, ms, mb))
-        totals[name] = tot
-        print("%-11s %s per forward (14 sites): %.2f ms" % (name, " " * 32, tot))
-        print()
+    r = roofline(C, H, W, 2 if a.dtype == "bf16" else 4)
+    print("op            %s" % a.op)
+    print("shape         C=%d H=%d W=%d  dtype=%s" % (C, H, W, a.dtype))
+    print("output_px     %d" % r["output_px"])
+    print("output_bytes  %d" % r["output_bytes"])
+    print("tap_bytes     %d   (4 taps x C x px)" % r["tap_bytes"])
+    print("index_bytes   %d" % r["index_bytes"])
+    print("weight_bytes  %d" % r["weight_bytes"])
+    print("min_desc      %d at 1/px, %d at 2/px" % (r["min_desc_1_per_px"], r["min_desc_2_per_px"]))
+    print("B_per_desc    %d at 2C contiguous" % r["bytes_per_desc_at_2C"])
 
-    if len(totals) > 1:
-        base = totals[ops[0]]
-        print("relative to %s:" % ops[0])
-        for k, v in totals.items():
-            print("  %-11s %8.2f ms  %5.2fx" % (k, v, v / base))
+    x = x.to(a.device)
+    flow = flow.to(a.device)
+
+    cc = dict(backend="neuron", dynamic=False, fullgraph=True)
+    print("torch.compile %s" % cc)
+    fn = torch.compile(OPS[a.op], **cc)
+
+    with torch.no_grad():
+        out = fn(x, flow)
+    out.float().cpu()
+    print("ran           output %s" % (tuple(out.shape),))
     return 0
 
 

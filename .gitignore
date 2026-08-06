@@ -4,3 +4,7 @@ __pycache__/
 out_*.png
 out_*.npy
 *.log
+univr_microbench_*/
+univr_warpop_*/
+*.ntff
+*.tar.gz
