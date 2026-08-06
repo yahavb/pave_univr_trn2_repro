@@ -93,6 +93,9 @@ def main():
     ap.add_argument("--dtype", default="fp32", choices=("fp32", "bf16"))
     a = ap.parse_args()
 
+    if a.device == "neuron":
+        import torch_neuronx  # noqa: F401
+
     C, H, W = (int(v) for v in a.shape.split(","))
     dt = torch.bfloat16 if a.dtype == "bf16" else torch.float32
 
