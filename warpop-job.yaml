@@ -44,26 +44,30 @@ spec:
                           gridsample:32,64,96 gather:32,64,96 \
                           gridsample:64,32,48 gather:64,32,48 \
                           gridsample:128,16,24 gather:128,16,24; do
-                OP=${SPEC%%:*}; SH=${SPEC##*:}
-                TAG="${OP}_$(echo $SH | tr ',' 'x')"
+                OP=${SPEC%%:*}; SHP=${SPEC##*:}
+                TAG="${OP}_$(echo $SHP | tr ',' 'x')"
                 echo "################ $TAG"
                 BEFORE=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | sort)
                 set +e
-                python -u warp_op_bench.py --op "$OP" --shape "$SH" --device neuron \
+                python -u warp_op_bench.py --op "$OP" --shape "$SHP" --device neuron \
                     2>&1 | tee "$OUT/$TAG.log"
                 rc=${PIPESTATUS[0]}
                 set -e
-                [ "$rc" = "0" ] || { echo "  RUN FAILED rc=$rc"; continue; }
+                if [ "$rc" != "0" ]; then
+                  echo "  RUN FAILED rc=$rc"
+                  tail -25 "$OUT/$TAG.log" | sed 's/^/    /'
+                  continue
+                fi
 
-                PX=$(grep -oE "^output_px +[0-9]+" "$OUT/$TAG.log" | awk '{print $2}')
-                TB=$(grep -oE "^tap_bytes +[0-9]+" "$OUT/$TAG.log" | awk '{print $2}')
+                PX=$(grep -oE "^output_px +[0-9]+" "$OUT/$TAG.log" | awk '{print $2}' || true)
+                TB=$(grep -oE "^tap_bytes +[0-9]+" "$OUT/$TAG.log" | awk '{print $2}' || true)
 
                 for i in $(seq 1 30); do pgrep -f warp_op_bench.py >/dev/null || break; sleep 2; done
                 sleep 8
 
                 NEW=$(comm -13 <(echo "$BEFORE") <(find /tmp/neff_cache -name '*.neff' 2>/dev/null | sort))
                 echo "  new NEFFs: $(echo "$NEW" | grep -c . || true)"
-                BIG=$(for f in $NEW; do [ -f "$f" ] && stat -c '%s %n' "$f"; done | sort -rn | head -1 | cut -d' ' -f2)
+                BIG=$(for f in $NEW; do [ -f "$f" ] && stat -c '%s %n' "$f"; done | sort -rn | head -1 | cut -d' ' -f2 || true)
                 [ -n "$BIG" ] || { echo "  no new NEFF"; continue; }
 
                 hash=$(basename "$BIG" .neff)
@@ -89,10 +93,10 @@ spec:
               for f in "$OUT"/roofline_*.txt; do
                 [ -f "$f" ] || continue
                 T=$(basename "$f" .txt); T=${T#roofline_}
-                A=$(grep -oE "total_active_time +[0-9.]+" "$f" | awk '{print $2}')
-                D=$(grep -oE "per output pixel +[0-9.]+" "$f" | awk '{print $4}')
-                N=$(grep -oE "ns per descriptor +[0-9.]+" "$f" | awk '{print $4}')
-                G=$(grep -oE "gpsimd_engine +[0-9.]+ +[0-9.]+%" "$f" | awk '{print $3}')
+                A=$(grep -oE "total_active_time +[0-9.]+" "$f" | awk '{print $2}' || true)
+                D=$(grep -oE "per output pixel +[0-9.]+" "$f" | awk '{print $4}' || true)
+                N=$(grep -oE "ns per descriptor +[0-9.]+" "$f" | awk '{print $4}' || true)
+                G=$(grep -oE "gpsimd_engine +[0-9.]+ +[0-9.]+%" "$f" | awk '{print $3}' || true)
                 printf "%-24s %12s %14s %10s %10s\n" "$T" "${A:--}" "${D:--}" "${N:--}" "${G:--}"
               done
               echo ""
