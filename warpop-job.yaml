@@ -35,7 +35,8 @@ spec:
               RES="${RES:-256x384}"
               H=${RES%%x*}; W=${RES##*x}
 
-              nefs() { find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l; }
+              mkdir -p /tmp/neff_cache
+              nefs() { find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l || true; }
               PAIRS="$OUT/pairs"; mkdir -p "$PAIRS"
               POUT=/tmp/perneff; mkdir -p "$POUT"
 
@@ -47,7 +48,7 @@ spec:
                 OP=${SPEC%%:*}; SHP=${SPEC##*:}
                 TAG="${OP}_$(echo $SHP | tr ',' 'x')"
                 echo "################ $TAG"
-                BEFORE=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | sort)
+                BEFORE=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | sort || true)
                 set +e
                 python -u warp_op_bench.py --op "$OP" --shape "$SHP" --device neuron \
                     2>&1 | tee "$OUT/$TAG.log"
@@ -65,7 +66,8 @@ spec:
                 for i in $(seq 1 30); do pgrep -f warp_op_bench.py >/dev/null || break; sleep 2; done
                 sleep 8
 
-                NEW=$(comm -13 <(echo "$BEFORE") <(find /tmp/neff_cache -name '*.neff' 2>/dev/null | sort))
+                AFTER=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | sort || true)
+                NEW=$(comm -13 <(echo "$BEFORE") <(echo "$AFTER") || true)
                 echo "  new NEFFs: $(echo "$NEW" | grep -c . || true)"
                 BIG=$(for f in $NEW; do [ -f "$f" ] && stat -c '%s %n' "$f"; done | sort -rn | head -1 | cut -d' ' -f2 || true)
                 [ -n "$BIG" ] || { echo "  no new NEFF"; continue; }
