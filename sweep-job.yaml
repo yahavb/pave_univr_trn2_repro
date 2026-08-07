@@ -41,24 +41,21 @@ spec:
               POUT=/tmp/perneff; mkdir -p "$POUT"
 
               SPECS=""
-              for C in 1 3 4 8 16 32 64 128; do SPECS="$SPECS A:gather:$C,256,384:8:0"; done
-              for HW in 64,96 128,192 256,384 512,768; do SPECS="$SPECS B:gather:3,$HW:8:0"; done
-              for M in 0 1 4 16 64; do SPECS="$SPECS C:gather:3,256,384:$M:0"; done
-              for M in 0 4 64; do SPECS="$SPECS D:gather:3,256,384:$M:1"; done
+              for S in 3,992,1280 16,496,640 32,248,320 64,124,160 128,62,80; do
+                SPECS="$SPECS gather:$S"
+                SPECS="$SPECS gridsample:$S"
+              done
+              SPECS="$SPECS transpose:3,992,1280"
 
               for SPEC in $SPECS; do
-                SW=$(echo "$SPEC" | cut -d: -f1)
-                OP=$(echo "$SPEC" | cut -d: -f2)
-                SHP=$(echo "$SPEC" | cut -d: -f3)
-                MAG=$(echo "$SPEC" | cut -d: -f4)
-                INT=$(echo "$SPEC" | cut -d: -f5)
-                IFLAG=""; [ "$INT" = "1" ] && IFLAG="--int-flow"
-                TAG="${SW}_${OP}_$(echo $SHP | tr ',' 'x')_mag${MAG}${IFLAG:+_int}"
+                OP=${SPEC%%:*}
+                SHP=${SPEC#*:}
+                TAG="${OP}_$(echo $SHP | tr ',' 'x')"
                 echo "################ $TAG"
                 BEFORE=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | sort || true)
                 set +e
                 python -u warp_op_bench.py --op "$OP" --shape "$SHP" --device neuron \
-                    --flow-mag "$MAG" $IFLAG 2>&1 | tee "$OUT/$TAG.log"
+                    2>&1 | tee "$OUT/$TAG.log"
                 rc=${PIPESTATUS[0]}
                 set -e
                 if [ "$rc" != "0" ]; then
@@ -87,56 +84,16 @@ spec:
                 cp "$BIG" "$PD/$hash.neff"; cp "$ntff" "$PD/$hash.ntff"; cp "$json" "$PD/summary.json"
               done
 
-              echo "################ SUMMARY"
-              echo ""
-              echo "A: fixed px=98304, vary C. desc CONSTANT at 196608."
-              echo "   flat active_s => descriptor-bound, payload free. linear in C => byte-bound."
-              printf "  %-30s %11s %12s %11s %10s\n" tag active_s desc/px ns/desc gpsimd%
-              for f in "$OUT"/roofline_A_*.txt; do
+              echo "################ SUMMARY -- production tile 992x1280"
+              printf "  %-22s %12s %10s %12s %10s\n" op_shape active_us gpsimd% sw_packets pkt_per_px
+              for f in "$OUT"/roofline_*.txt; do
                 [ -f "$f" ] || continue
                 T=$(basename "$f" .txt); T=${T#roofline_}
-                A=$(grep -oE "total_active_time +[0-9.]+" "$f" | awk '{print $2}' || true)
-                D=$(grep -oE "per output pixel +[0-9.]+" "$f" | awk '{print $4}' || true)
-                N=$(grep -oE "ns per descriptor +[0-9.]+" "$f" | awk '{print $4}' || true)
+                A=$(grep -oE "total_active_time +[0-9.]+" "$f" | awk '{print $2*1000000}' || true)
                 G=$(grep -oE "gpsimd_engine +[0-9.]+ +[0-9.]+" "$f" | awk '{print $3}' || true)
-                printf "  %-30s %11s %12s %11s %10s\n" "$T" "${A:--}" "${D:--}" "${N:--}" "${G:--}"
-              done
-              echo ""
-              echo "B: fixed C=3, vary pixels. linear => per-pixel cost. superlinear => a cliff."
-              printf "  %-30s %11s %12s %11s %10s\n" tag active_s desc/px ns/desc gpsimd%
-              for f in "$OUT"/roofline_B_*.txt; do
-                [ -f "$f" ] || continue
-                T=$(basename "$f" .txt); T=${T#roofline_}
-                A=$(grep -oE "total_active_time +[0-9.]+" "$f" | awk '{print $2}' || true)
+                P=$(grep -oE "sw_dynamic_dma_packets +[0-9]+" "$f" | awk '{print $2}' || true)
                 D=$(grep -oE "per output pixel +[0-9.]+" "$f" | awk '{print $4}' || true)
-                N=$(grep -oE "ns per descriptor +[0-9.]+" "$f" | awk '{print $4}' || true)
-                G=$(grep -oE "gpsimd_engine +[0-9.]+ +[0-9.]+" "$f" | awk '{print $3}' || true)
-                printf "  %-30s %11s %12s %11s %10s\n" "$T" "${A:--}" "${D:--}" "${N:--}" "${G:--}"
-              done
-              echo ""
-              echo "C: fixed shape, vary flow magnitude. mag 0 is CONTIGUOUS reads."
-              echo "   delta from mag0 to mag64 = the cost of SCATTER alone."
-              printf "  %-30s %11s %12s %11s %10s\n" tag active_s desc/px ns/desc gpsimd%
-              for f in "$OUT"/roofline_C_*.txt; do
-                [ -f "$f" ] || continue
-                T=$(basename "$f" .txt); T=${T#roofline_}
-                A=$(grep -oE "total_active_time +[0-9.]+" "$f" | awk '{print $2}' || true)
-                D=$(grep -oE "per output pixel +[0-9.]+" "$f" | awk '{print $4}' || true)
-                N=$(grep -oE "ns per descriptor +[0-9.]+" "$f" | awk '{print $4}' || true)
-                G=$(grep -oE "gpsimd_engine +[0-9.]+ +[0-9.]+" "$f" | awk '{print $3}' || true)
-                printf "  %-30s %11s %12s %11s %10s\n" "$T" "${A:--}" "${D:--}" "${N:--}" "${G:--}"
-              done
-              echo ""
-              echo "D: integer flow. 1 tap instead of 4 -- prices bilinear interpolation."
-              printf "  %-30s %11s %12s %11s %10s\n" tag active_s desc/px ns/desc gpsimd%
-              for f in "$OUT"/roofline_D_*.txt; do
-                [ -f "$f" ] || continue
-                T=$(basename "$f" .txt); T=${T#roofline_}
-                A=$(grep -oE "total_active_time +[0-9.]+" "$f" | awk '{print $2}' || true)
-                D=$(grep -oE "per output pixel +[0-9.]+" "$f" | awk '{print $4}' || true)
-                N=$(grep -oE "ns per descriptor +[0-9.]+" "$f" | awk '{print $4}' || true)
-                G=$(grep -oE "gpsimd_engine +[0-9.]+ +[0-9.]+" "$f" | awk '{print $3}' || true)
-                printf "  %-30s %11s %12s %11s %10s\n" "$T" "${A:--}" "${D:--}" "${N:--}" "${G:--}"
+                printf "  %-22s %12s %10s %12s %10s\n" "$T" "${A:--}" "${G:--}" "${P:--}" "${D:--}"
               done
               echo ""
 
