@@ -1,0 +1,200 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: univr-sweep
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: univr-sweep
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neurons
+          resourceClaimTemplateName: s-lnc1
+      containers:
+        - name: sweep
+          image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euo pipefail
+
+              cd /tmp
+              git clone -b main https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
+              cd REPRO
+              echo "commit $(git rev-parse HEAD)"
+
+              OUT=/tmp/mb; mkdir -p "$OUT"
+              RES="${RES:-256x384}"
+              H=${RES%%x*}; W=${RES##*x}
+
+              mkdir -p /tmp/neff_cache
+              nefs() { find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l || true; }
+              PAIRS="$OUT/pairs"; mkdir -p "$PAIRS"
+              POUT=/tmp/perneff; mkdir -p "$POUT"
+
+              SPECS=""
+              for C in 1 3 4 8 16 32 64 128; do SPECS="$SPECS A:gather:$C,256,384:8:0"; done
+              for HW in 64,96 128,192 256,384 512,768; do SPECS="$SPECS B:gather:3,$HW:8:0"; done
+              for M in 0 1 4 16 64; do SPECS="$SPECS C:gather:3,256,384:$M:0"; done
+              for M in 0 4 64; do SPECS="$SPECS D:gather:3,256,384:$M:1"; done
+
+              for SPEC in $SPECS; do
+                SW=$(echo "$SPEC" | cut -d: -f1)
+                OP=$(echo "$SPEC" | cut -d: -f2)
+                SHP=$(echo "$SPEC" | cut -d: -f3)
+                MAG=$(echo "$SPEC" | cut -d: -f4)
+                INT=$(echo "$SPEC" | cut -d: -f5)
+                IFLAG=""; [ "$INT" = "1" ] && IFLAG="--int-flow"
+                TAG="${SW}_${OP}_$(echo $SHP | tr ',' 'x')_mag${MAG}${IFLAG:+_int}"
+                echo "################ $TAG"
+                BEFORE=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | sort || true)
+                set +e
+                python -u warp_op_bench.py --op "$OP" --shape "$SHP" --device neuron \
+                    --flow-mag "$MAG" $IFLAG 2>&1 | tee "$OUT/$TAG.log"
+                rc=${PIPESTATUS[0]}
+                set -e
+                if [ "$rc" != "0" ]; then
+                  echo "  RUN FAILED rc=$rc"; tail -20 "$OUT/$TAG.log" | sed 's/^/    /'; continue
+                fi
+                PX=$(grep -oE "^output_px +[0-9]+" "$OUT/$TAG.log" | awk '{print $2}' || true)
+                TB=$(grep -oE "^tap_bytes +[0-9]+" "$OUT/$TAG.log" | awk '{print $2}' || true)
+                for i in $(seq 1 30); do pgrep -f warp_op_bench.py >/dev/null || break; sleep 2; done
+                sleep 8
+                AFTER=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | sort || true)
+                NEW=$(comm -13 <(echo "$BEFORE") <(echo "$AFTER") || true)
+                BIG=$(for f in $NEW; do [ -f "$f" ] && stat -c '%s %n' "$f"; done | sort -rn | head -1 | cut -d' ' -f2 || true)
+                if [ -z "$BIG" ]; then echo "  no new NEFF (cache hit)"; continue; fi
+                hash=$(basename "$BIG" .neff)
+                ntff="$POUT/$hash.ntff"; json="$POUT/$hash.json"
+                echo "  neff $hash ($(stat -c%s "$BIG") B)"
+                timeout 3600 neuron-profile capture --single-io -n "$BIG" -s "$ntff" \
+                    >"$POUT/$hash.cap.log" 2>&1 || true
+                [ -s "$ntff" ] || { echo "  CAPTURE FAILED"; tail -6 "$POUT/$hash.cap.log"; continue; }
+                timeout 900 neuron-profile view -n "$BIG" -s "$ntff" \
+                    --output-format summary-json > "$json" 2>/dev/null || true
+                [ -s "$json" ] || { echo "  VIEW FAILED"; continue; }
+                python3 profile_roofline.py "$json" "$TAG" "${PX:-0}" "${TB:-0}" \
+                    2>&1 | tee "$OUT/roofline_$TAG.txt"
+                PD="$PAIRS/$TAG"; mkdir -p "$PD"
+                cp "$BIG" "$PD/$hash.neff"; cp "$ntff" "$PD/$hash.ntff"; cp "$json" "$PD/summary.json"
+              done
+
+              echo "################ SUMMARY"
+              echo ""
+              echo "A: fixed px=98304, vary C. desc CONSTANT at 196608."
+              echo "   flat active_s => descriptor-bound, payload free. linear in C => byte-bound."
+              printf "  %-30s %11s %12s %11s %10s\n" tag active_s desc/px ns/desc gpsimd%
+              for f in "$OUT"/roofline_A_*.txt; do
+                [ -f "$f" ] || continue
+                T=$(basename "$f" .txt); T=${T#roofline_}
+                A=$(grep -oE "total_active_time +[0-9.]+" "$f" | awk '{print $2}' || true)
+                D=$(grep -oE "per output pixel +[0-9.]+" "$f" | awk '{print $4}' || true)
+                N=$(grep -oE "ns per descriptor +[0-9.]+" "$f" | awk '{print $4}' || true)
+                G=$(grep -oE "gpsimd_engine +[0-9.]+ +[0-9.]+" "$f" | awk '{print $3}' || true)
+                printf "  %-30s %11s %12s %11s %10s\n" "$T" "${A:--}" "${D:--}" "${N:--}" "${G:--}"
+              done
+              echo ""
+              echo "B: fixed C=3, vary pixels. linear => per-pixel cost. superlinear => a cliff."
+              printf "  %-30s %11s %12s %11s %10s\n" tag active_s desc/px ns/desc gpsimd%
+              for f in "$OUT"/roofline_B_*.txt; do
+                [ -f "$f" ] || continue
+                T=$(basename "$f" .txt); T=${T#roofline_}
+                A=$(grep -oE "total_active_time +[0-9.]+" "$f" | awk '{print $2}' || true)
+                D=$(grep -oE "per output pixel +[0-9.]+" "$f" | awk '{print $4}' || true)
+                N=$(grep -oE "ns per descriptor +[0-9.]+" "$f" | awk '{print $4}' || true)
+                G=$(grep -oE "gpsimd_engine +[0-9.]+ +[0-9.]+" "$f" | awk '{print $3}' || true)
+                printf "  %-30s %11s %12s %11s %10s\n" "$T" "${A:--}" "${D:--}" "${N:--}" "${G:--}"
+              done
+              echo ""
+              echo "C: fixed shape, vary flow magnitude. mag 0 is CONTIGUOUS reads."
+              echo "   delta from mag0 to mag64 = the cost of SCATTER alone."
+              printf "  %-30s %11s %12s %11s %10s\n" tag active_s desc/px ns/desc gpsimd%
+              for f in "$OUT"/roofline_C_*.txt; do
+                [ -f "$f" ] || continue
+                T=$(basename "$f" .txt); T=${T#roofline_}
+                A=$(grep -oE "total_active_time +[0-9.]+" "$f" | awk '{print $2}' || true)
+                D=$(grep -oE "per output pixel +[0-9.]+" "$f" | awk '{print $4}' || true)
+                N=$(grep -oE "ns per descriptor +[0-9.]+" "$f" | awk '{print $4}' || true)
+                G=$(grep -oE "gpsimd_engine +[0-9.]+ +[0-9.]+" "$f" | awk '{print $3}' || true)
+                printf "  %-30s %11s %12s %11s %10s\n" "$T" "${A:--}" "${D:--}" "${N:--}" "${G:--}"
+              done
+              echo ""
+              echo "D: integer flow. 1 tap instead of 4 -- prices bilinear interpolation."
+              printf "  %-30s %11s %12s %11s %10s\n" tag active_s desc/px ns/desc gpsimd%
+              for f in "$OUT"/roofline_D_*.txt; do
+                [ -f "$f" ] || continue
+                T=$(basename "$f" .txt); T=${T#roofline_}
+                A=$(grep -oE "total_active_time +[0-9.]+" "$f" | awk '{print $2}' || true)
+                D=$(grep -oE "per output pixel +[0-9.]+" "$f" | awk '{print $4}' || true)
+                N=$(grep -oE "ns per descriptor +[0-9.]+" "$f" | awk '{print $4}' || true)
+                G=$(grep -oE "gpsimd_engine +[0-9.]+ +[0-9.]+" "$f" | awk '{print $3}' || true)
+                printf "  %-30s %11s %12s %11s %10s\n" "$T" "${A:--}" "${D:--}" "${N:--}" "${G:--}"
+              done
+              echo ""
+
+              ARCHIVE=/tmp/univr_sweep_$(date -u +%Y%m%d_%H%M%S).tar.gz
+              tar -czf "$ARCHIVE" -C /tmp mb
+              mkdir -p /var/mdl/univr_neuron
+              cp "$ARCHIVE" /var/mdl/univr_neuron/
+              echo "saved /var/mdl/univr_neuron/$(basename "$ARCHIVE") ($(du -h "$ARCHIVE" | cut -f1))"
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 48
+              memory: 248Gi
+            limits:
+              cpu: 84
+              memory: 248Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: RES
+              value: "256x384"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_NUM_CORES
+              value: "1"
+            - name: NEURON_RT_VISIBLE_CORES
+              value: "0"
+            - name: NEURON_CC_FLAGS
+              value: "--target trn3 --lnc 1 --model-type unet-inference"
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc

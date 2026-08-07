@@ -91,6 +91,7 @@ def main():
     ap.add_argument("--device", default="neuron")
     ap.add_argument("--flow-mag", type=float, default=8.0)
     ap.add_argument("--dtype", default="fp32", choices=("fp32", "bf16"))
+    ap.add_argument("--int-flow", action="store_true")
     a = ap.parse_args()
 
     if a.device == "neuron":
@@ -101,7 +102,10 @@ def main():
 
     torch.manual_seed(0)
     x = torch.rand(1, C, H, W, dtype=dt)
-    flow = ((torch.rand(1, 2, H, W) * 2 - 1) * a.flow_mag).to(dt)
+    flow = (torch.rand(1, 2, H, W) * 2 - 1) * a.flow_mag
+    if a.int_flow:
+        flow = flow.round()
+    flow = flow.to(dt)
 
     r = roofline(C, H, W, 2 if a.dtype == "bf16" else 4)
     print("op            %s" % a.op)
@@ -113,6 +117,7 @@ def main():
     print("weight_bytes  %d" % r["weight_bytes"])
     print("min_desc      %d at 1/px, %d at 2/px" % (r["min_desc_1_per_px"], r["min_desc_2_per_px"]))
     print("B_per_desc    %d at 2C contiguous" % r["bytes_per_desc_at_2C"])
+    print("flow_mag      %g%s" % (a.flow_mag, " (integer)" if a.int_flow else ""))
 
     x = x.to(a.device)
     flow = flow.to(a.device)
