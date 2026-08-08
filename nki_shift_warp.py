@@ -3,30 +3,33 @@
 
 Design follows from two measurements, not from preference:
 
-  1. Real flow at the production tile has max |displacement| = 2.33 px (measured by
-     capturing the flow the model actually produces at the C=3 site). The bundle's
+  1. Real flow at the production tile has max |displacement| = 2.33 px, measured by
+     capturing the flow the model actually produces at the C=3 site. The bundle's
      43.28 px figure does not hold for this frame pair.
   2. The whole C=3 992x1280 tile is 15.3 MB, which FITS the 24 MB SBUF.
 
 Together those mean the source neighbourhood every output pixel needs is already
 on-chip. The per-pixel indirect gather -- 1,278,496 software descriptors, 99.2% of
-device time on GpSimd -- exists only because the reference implementation addresses
-HBM per pixel. If the band is resident in SBUF, the 4 taps become STATIC offsets
-into SBUF and the descriptor count drops to a handful of band loads.
+device time on GpSimd -- exists only because the reference addresses HBM per pixel.
+With the band resident in SBUF the 4 taps become STATIC offsets into SBUF, and the
+descriptor count drops from per-pixel to per-band.
 
-Structure, per row band of P=128 output rows:
-  * one static DMA loads rows [r-R, r+P+R) x W x C into SBUF   <- descriptors per BAND
-  * for each of (2R+1)^2 integer offsets, a static SBUF slice is multiplied by a
-    precomputed weight plane and accumulated                    <- Vector engine
+Per band of `band_rows` output rows:
+  * one static DMA loads (band_rows + 2R) x (W + 2R) x C into SBUF
+  * for each of (2R+1)^2 integer offsets (oy, ox), a STATIC slice of that band is
+    multiplied by a precomputed weight plane and accumulated on the Vector engine
   * one static DMA stores the band
 
-Weights are computed on the host (they depend on flow, which is an activation, but
-they are elementwise -- no addressing), so nothing data-dependent reaches an
-access pattern. That is the whole point: the descriptor path stays static.
+The caller pads the image by R in BOTH y and x, so every (oy, ox) slice is in
+bounds and no clamping is needed inside the kernel.
 
-References used from KaenaNeuronKernelLibrary:
-  experimental/misc/gather.py            -- tiling over pmax, ap(pattern=...) form
-  experimental/deformable_attention/ms_deformable_attention.py -- bilinear-in-NKI
+Weight planes are elementwise functions of flow, precomputed on the host. Flow is an
+activation, but the weights never enter an access pattern -- only tensor data. That
+is what keeps the descriptor path static and off GpSimd.
+
+References from KaenaNeuronKernelLibrary:
+  experimental/misc/gather.py  -- ap(pattern=...) tiling over nl.tile_size.pmax
+  experimental/deformable_attention/ms_deformable_attention.py  -- bilinear in NKI
 """
 from __future__ import annotations
 
@@ -39,69 +42,82 @@ P_MAX = 128
 
 @nki.jit
 def shift_warp_band(img, wts):
-    """img: [H+2R, W, C] in HBM, replicate-padded in y by R. wts: [T, H, W] weight
-    planes in HBM, T = (2R+1)^2, ordered oy-major then ox. Returns [H, W, C].
+    """img: [H+2R, W+2R, C] fp32 HBM, replicate-padded by R in y and x.
+    wts: [T, H, W] fp32 HBM weight planes, T = (2R+1)^2, ordered oy-major.
+    Returns [H, W, C].
 
-    R is derived from T at trace time, so the kernel is shape-generic over radius.
+    R is derived from T at trace time, so the kernel is generic over radius.
     """
-    Hp = img.shape[0]
-    W = img.shape[1]
+    Wp = img.shape[1]
     C = img.shape[2]
     T = wts.shape[0]
     H = wts.shape[1]
-    dtype = img.dtype
+    W = wts.shape[2]
 
     side = 1
     while side * side < T:
         side += 1
     R = (side - 1) // 2
 
-    out = nl.ndarray((H, W, C), dtype=dtype, buffer=nl.shared_hbm)
+    out = nl.ndarray((H, W, C), dtype=nl.float32, buffer=nl.shared_hbm)
 
-    n_bands = (H + P_MAX - 1) // P_MAX
+    # The loaded band occupies (rows + 2R) partitions and the hardware cap is 128,
+    # so the OUTPUT band must be P_MAX - 2R. Asking for P_MAX output rows requests
+    # 132 partitions at R=2 and the validator rejects it.
+    band_rows = P_MAX - 2 * R
+    n_bands = (H + band_rows - 1) // band_rows
 
     for b in nl.affine_range(n_bands):
-        r0 = b * P_MAX
-        rows = min(P_MAX, H - r0)
+        r0 = b * band_rows
+        rows = min(band_rows, H - r0)
 
-        # One static load of the band plus its vertical halo. Contiguous in W*C,
-        # so this is a handful of large descriptors rather than one per pixel.
-        band = nl.ndarray((rows + 2 * R, W * C), dtype=nl.float32, buffer=nl.sbuf)
+        band = nl.ndarray((rows + 2 * R, Wp * C), dtype=nl.float32, buffer=nl.sbuf)
         nisa.dma_copy(
             dst=band,
-            src=img.ap(pattern=[[W * C, rows + 2 * R], [1, W * C]], offset=r0 * W * C),
+            src=img.ap(pattern=[[Wp * C, rows + 2 * R], [1, Wp * C]],
+                       offset=r0 * Wp * C),
         )
 
         acc = nl.ndarray((rows, W * C), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(acc, 0.0)
 
+        wplane = nl.ndarray((rows, W), dtype=nl.float32, buffer=nl.sbuf)
+        wbc = nl.ndarray((rows, W * C), dtype=nl.float32, buffer=nl.sbuf)
+        shifted = nl.ndarray((rows, W * C), dtype=nl.float32, buffer=nl.sbuf)
+        prod = nl.ndarray((rows, W * C), dtype=nl.float32, buffer=nl.sbuf)
+
         for t in nl.affine_range(T):
             oy = t // side - R
             ox = t % side - R
 
-            wplane = nl.ndarray((rows, W), dtype=nl.float32, buffer=nl.sbuf)
             nisa.dma_copy(
                 dst=wplane,
                 src=wts.ap(pattern=[[W, rows], [1, W]], offset=t * H * W + r0 * W),
             )
 
-            # Broadcast the per-pixel weight across C. C is small (3 at the site
-            # that matters), so this is a cheap Vector-engine op.
-            wbc = nl.ndarray((rows, W * C), dtype=nl.float32, buffer=nl.sbuf)
+            # Broadcast one weight per pixel across its C channels: write the
+            # W-wide plane into a stride-C view of the W*C-wide buffer, C times.
             for c in nl.affine_range(C):
-                nisa.tensor_copy(dst=wbc[:, nl.ds(c, W * C - c)], src=wplane)
+                nisa.tensor_copy(
+                    dst=wbc.ap(pattern=[[W * C, rows], [C, W]], offset=c),
+                    src=wplane,
+                )
 
-            # STATIC slice: the y offset is a band-row shift, the x offset a byte
-            # shift of C elements. No index tensor, no vector_offset, no SWDGE.
-            src = band[nl.ds(R + oy, rows), :]
-            prod = nl.ndarray((rows, W * C), dtype=nl.float32, buffer=nl.sbuf)
-            nisa.tensor_tensor(dst=prod, data1=src, data2=wbc, op=nl.multiply)
+            # STATIC slice. y shifts by whole partitions, x by ox*C elements in the
+            # free dim. Both are compile-time constants, so this is not an indirect
+            # access and generates no software descriptors.
+            nisa.tensor_copy(
+                dst=shifted,
+                src=band.ap(pattern=[[Wp * C, rows], [1, W * C]],
+                            offset=(R + oy) * Wp * C + (R + ox) * C),
+            )
+
+            nisa.tensor_tensor(dst=prod, data1=shifted, data2=wbc, op=nl.multiply)
             nisa.tensor_tensor(dst=acc, data1=acc, data2=prod, op=nl.add)
 
-        band_out = nl.copy(acc, dtype=dtype)
         nisa.dma_copy(
             dst=out.ap(pattern=[[W * C, rows], [1, W * C]], offset=r0 * W * C),
-            src=band_out,
+            src=acc,
         )
 
     return out

@@ -130,7 +130,7 @@ def warp_nkishift(x, flow, radius=2):
             tx = (1.0 - (rx - ox).abs()).clamp_min(0.0)
             planes.append((tx * ty)[0, 0])
     wts = torch.stack(planes, 0).contiguous()
-    imgp = F.pad(x.float(), (0, 0, R, R), mode="replicate")[0].permute(1, 2, 0).contiguous()
+    imgp = F.pad(x.float(), (R, R, R, R), mode="replicate")[0].permute(1, 2, 0).contiguous()
     out = wrap_nki(shift_warp_band)(imgp, wts)
     return out.permute(2, 0, 1).unsqueeze(0).to(x.dtype)
 
