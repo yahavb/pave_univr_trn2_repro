@@ -50,6 +50,9 @@ spec:
               SPECS="$SPECS window1:3,992,1280"
               SPECS="$SPECS window2:3,992,1280"
               SPECS="$SPECS shiftmatmul:3,992,1280"
+              for T in 1728,2176 1728,1152 992,2176 992,640 704,1152 576,1152 576,640 576,384; do
+                SPECS="$SPECS gather:3,$T"
+              done
 
               for SPEC in $SPECS; do
                 OP=${SPEC%%:*}
