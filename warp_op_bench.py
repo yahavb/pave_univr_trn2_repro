@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import math
 import os
 
 import torch
@@ -84,16 +85,15 @@ def warp_window2(x, flow):
     return warp_window(x, flow, radius=2)
 
 
-def warp_shiftmatmul(x, flow, radius=2):
+def warp_shiftmatmul(x, flow, radius=2, bulk=(0, 0)):
     B, C, H, W = x.shape
     d = flow.device
     R = radius
+    by, bx = bulk
     gx = torch.arange(W, device=d, dtype=torch.float32).view(1, 1, 1, W)
     gy = torch.arange(H, device=d, dtype=torch.float32).view(1, 1, H, 1)
     sx = (gx + flow[:, 0:1].float()).clamp(0.0, W - 1.0)
     sy = (gy + flow[:, 1:2].float()).clamp(0.0, H - 1.0)
-    bx = int(flow[:, 0:1].float().mean().round().item())
-    by = int(flow[:, 1:2].float().mean().round().item())
     rx = sx - gx - float(bx)
     ry = sy - gy - float(by)
     base = torch.roll(x.float(), shifts=(by, bx), dims=(2, 3))
@@ -111,6 +111,30 @@ def warp_shiftmatmul(x, flow, radius=2):
     return (S * Wt).sum(0).to(x.dtype)
 
 
+def warp_nkishift(x, flow, radius=2):
+    B, C, H, W = x.shape
+    d = flow.device
+    R = radius
+    from nki_shift_warp import shift_warp_band
+    from torch_neuronx.nki_hop import wrap_nki
+    gx = torch.arange(W, device=d, dtype=torch.float32).view(1, 1, 1, W)
+    gy = torch.arange(H, device=d, dtype=torch.float32).view(1, 1, H, 1)
+    sx = (gx + flow[:, 0:1].float()).clamp(0.0, W - 1.0)
+    sy = (gy + flow[:, 1:2].float()).clamp(0.0, H - 1.0)
+    rx = sx - gx
+    ry = sy - gy
+    planes = []
+    for oy in range(-R, R + 1):
+        ty = (1.0 - (ry - oy).abs()).clamp_min(0.0)
+        for ox in range(-R, R + 1):
+            tx = (1.0 - (rx - ox).abs()).clamp_min(0.0)
+            planes.append((tx * ty)[0, 0])
+    wts = torch.stack(planes, 0).contiguous()
+    imgp = F.pad(x.float(), (0, 0, R, R), mode="replicate")[0].permute(1, 2, 0).contiguous()
+    out = wrap_nki(shift_warp_band)(imgp, wts)
+    return out.permute(2, 0, 1).unsqueeze(0).to(x.dtype)
+
+
 OPS = {
     "gridsample": warp_gridsample,
     "gather": warp_gather,
@@ -119,6 +143,7 @@ OPS = {
     "window1": warp_window,
     "window2": warp_window2,
     "shiftmatmul": warp_shiftmatmul,
+    "nkishift": warp_nkishift,
 }
 
 
@@ -176,14 +201,40 @@ def main():
     x = x.to(a.device)
     flow = flow.to(a.device)
 
+    bulk = (0, 0)
+    if a.op == "shiftmatmul":
+        by = int(flow[:, 1:2].float().mean().round().item())
+        bx = int(flow[:, 0:1].float().mean().round().item())
+        bulk = (by, bx)
+        print("bulk_shift    (dy=%d, dx=%d)  computed on host, baked as a constant" % bulk)
+
     cc = dict(backend="neuron", dynamic=False, fullgraph=True)
     print("torch.compile %s" % cc)
-    fn = torch.compile(OPS[a.op], **cc)
+    op = OPS[a.op]
+    if a.op == "shiftmatmul":
+        _b = bulk
+        op = lambda t, f: warp_shiftmatmul(t, f, radius=2, bulk=_b)
+    fn = torch.compile(op, **cc)
 
     with torch.no_grad():
         out = fn(x, flow)
-    out.float().cpu()
+    got = out.float().cpu()
     print("ran           output %s" % (tuple(out.shape),))
+
+    with torch.no_grad():
+        ref = warp_gridsample(x.float().cpu(), flow.float().cpu())
+    if ref.shape == got.shape:
+        diff = (ref - got).abs()
+        lsb = diff.max().item() * 255.0
+        mse = (diff ** 2).mean().item()
+        psnr = float("inf") if mse == 0 else 10.0 * math.log10(1.0 / mse)
+        cos = torch.nn.functional.cosine_similarity(
+            ref.flatten().double(), got.flatten().double(), dim=0).item()
+        print("ACCURACY      max_diff %.4f LSB   PSNR %.2f dB   cos %.6f   [%s vs bar 3]"
+              % (lsb, psnr, cos, "PASS" if lsb <= 3.0 else "FAIL"))
+    else:
+        print("ACCURACY      n/a: shape %s is not comparable to grid_sample %s"
+              % (tuple(got.shape), tuple(ref.shape)))
     return 0
 
 

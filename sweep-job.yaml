@@ -50,6 +50,7 @@ spec:
               SPECS="$SPECS window1:3,992,1280"
               SPECS="$SPECS window2:3,992,1280"
               SPECS="$SPECS shiftmatmul:3,992,1280"
+              SPECS="$SPECS nkishift:3,992,1280"
               for T in 1728,2176 1728,1152 992,2176 992,640 704,1152 576,1152 576,640 576,384; do
                 SPECS="$SPECS gather:3,$T"
               done
@@ -92,7 +93,7 @@ spec:
               done
 
               echo "################ SUMMARY -- production tile 992x1280"
-              printf "  %-22s %12s %10s %12s %10s\n" op_shape active_us gpsimd% sw_packets pkt_per_px
+              printf "  %-22s %12s %10s %12s %10s %10s %6s\n" op_shape active_us gpsimd% sw_packets pkt_per_px max_LSB gate
               for f in "$OUT"/roofline_*.txt; do
                 [ -f "$f" ] || continue
                 T=$(basename "$f" .txt); T=${T#roofline_}
@@ -100,7 +101,9 @@ spec:
                 G=$(grep -oE "gpsimd_engine +[0-9.]+ +[0-9.]+" "$f" | awk '{print $3}' || true)
                 P=$(grep -oE "sw_dynamic_dma_packets +[0-9]+" "$f" | awk '{print $2}' || true)
                 D=$(grep -oE "per output pixel +[0-9.]+" "$f" | awk '{print $4}' || true)
-                printf "  %-22s %12s %10s %12s %10s\n" "$T" "${A:--}" "${G:--}" "${P:--}" "${D:--}"
+                L=$(grep -oE "max_diff [0-9.]+ LSB" "$OUT/$T.log" 2>/dev/null | awk '{print $2}' | head -1 || true)
+                V=$(grep -oE "\[(PASS|FAIL) vs bar 3\]" "$OUT/$T.log" 2>/dev/null | tr -d '[]' | awk '{print $1}' | head -1 || true)
+                printf "  %-22s %12s %10s %12s %10s %10s %6s\n" "$T" "${A:--}" "${G:--}" "${P:--}" "${D:--}" "${L:--}" "${V:--}"
               done
               echo ""
 
