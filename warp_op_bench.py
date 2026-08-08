@@ -60,11 +60,37 @@ def shift_only(x, flow):
     return torch.roll(x, shifts=(4, 4), dims=(2, 3))
 
 
+def warp_window(x, flow, radius=1):
+    B, C, H, W = x.shape
+    d = flow.device
+    gx = torch.arange(W, device=d, dtype=torch.float32).view(1, 1, 1, W)
+    gy = torch.arange(H, device=d, dtype=torch.float32).view(1, 1, H, 1)
+    sx = (gx + flow[:, 0:1].float()).clamp(0.0, W - 1.0)
+    sy = (gy + flow[:, 1:2].float()).clamp(0.0, H - 1.0)
+    rx = sx - gx
+    ry = sy - gy
+    R = radius
+    pad = F.pad(x.float(), (R, R, R, R), mode="replicate")
+    acc = torch.zeros(B, C, H, W, device=d, dtype=torch.float32)
+    for oy in range(-R, R + 1):
+        ty = (1.0 - (ry - oy).abs()).clamp_min(0.0)
+        for ox in range(-R, R + 1):
+            tx = (1.0 - (rx - ox).abs()).clamp_min(0.0)
+            acc = acc + pad[:, :, R + oy:R + oy + H, R + ox:R + ox + W] * (tx * ty)
+    return acc.to(x.dtype)
+
+
+def warp_window2(x, flow):
+    return warp_window(x, flow, radius=2)
+
+
 OPS = {
     "gridsample": warp_gridsample,
     "gather": warp_gather,
     "transpose": transpose_only,
     "shift": shift_only,
+    "window1": warp_window,
+    "window2": warp_window2,
 }
 
 

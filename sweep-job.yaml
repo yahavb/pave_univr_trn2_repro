@@ -46,6 +46,9 @@ spec:
                 SPECS="$SPECS gridsample:$S"
               done
               SPECS="$SPECS transpose:3,992,1280"
+              SPECS="$SPECS shift:3,992,1280"
+              SPECS="$SPECS window1:3,992,1280"
+              SPECS="$SPECS window2:3,992,1280"
 
               for SPEC in $SPECS; do
                 OP=${SPEC%%:*}
