@@ -49,6 +49,7 @@ spec:
               SPECS="$SPECS shift:3,992,1280"
               SPECS="$SPECS window1:3,992,1280"
               SPECS="$SPECS window2:3,992,1280"
+              SPECS="$SPECS shiftmatmul:3,992,1280"
 
               for SPEC in $SPECS; do
                 OP=${SPEC%%:*}
@@ -113,7 +114,7 @@ spec:
               memory: 248Gi
             limits:
               cpu: 84
-              memory: 248Gi
+              memory: 500Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm

@@ -84,6 +84,33 @@ def warp_window2(x, flow):
     return warp_window(x, flow, radius=2)
 
 
+def warp_shiftmatmul(x, flow, radius=2):
+    B, C, H, W = x.shape
+    d = flow.device
+    R = radius
+    gx = torch.arange(W, device=d, dtype=torch.float32).view(1, 1, 1, W)
+    gy = torch.arange(H, device=d, dtype=torch.float32).view(1, 1, H, 1)
+    sx = (gx + flow[:, 0:1].float()).clamp(0.0, W - 1.0)
+    sy = (gy + flow[:, 1:2].float()).clamp(0.0, H - 1.0)
+    bx = int(flow[:, 0:1].float().mean().round().item())
+    by = int(flow[:, 1:2].float().mean().round().item())
+    rx = sx - gx - float(bx)
+    ry = sy - gy - float(by)
+    base = torch.roll(x.float(), shifts=(by, bx), dims=(2, 3))
+    pad = F.pad(base, (R, R, R, R), mode="replicate")
+    shifts = []
+    wts = []
+    for oy in range(-R, R + 1):
+        ty = (1.0 - (ry - oy).abs()).clamp_min(0.0)
+        for ox in range(-R, R + 1):
+            tx = (1.0 - (rx - ox).abs()).clamp_min(0.0)
+            shifts.append(pad[:, :, R + oy:R + oy + H, R + ox:R + ox + W])
+            wts.append(tx * ty)
+    S = torch.stack(shifts, 0)
+    Wt = torch.stack(wts, 0)
+    return (S * Wt).sum(0).to(x.dtype)
+
+
 OPS = {
     "gridsample": warp_gridsample,
     "gather": warp_gather,
@@ -91,6 +118,7 @@ OPS = {
     "shift": shift_only,
     "window1": warp_window,
     "window2": warp_window2,
+    "shiftmatmul": warp_shiftmatmul,
 }
 
 
