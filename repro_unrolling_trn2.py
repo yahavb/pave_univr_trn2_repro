@@ -425,8 +425,69 @@ def warp_nki(tenInput, tenFlow):
     return out.reshape(B, N, C).permute(0, 2, 1).reshape(B, C, H, W)
 
 
+_SHIFTWARP_FN = None      # wrap_nki(shift_warp_band), built eagerly in main()
+_SHIFTWARP_R = 3          # set by --shiftwarp-radius
+_SHIFTWARP_MAXC = 3       # sites with C above this fall back; see the note in warp_shiftwarp
+
+
+def _build_shiftwarp():
+    """Wrap the SBUF-resident static-DMA kernel. Separate module, so its `import nki.language as nl`
+    is at module scope there -- inlining it here would put nl in a closure and break NKI's name
+    resolution, which is the same trap documented at the top of this file."""
+    if not _HAVE_NKI:
+        raise SystemExit("--warp shiftwarp needs the Neuron toolchain (nki, torch_neuronx) installed")
+    from nki_shift_warp import shift_warp_band
+    from torch_neuronx.nki_hop import wrap_nki
+    return wrap_nki(shift_warp_band)
+
+
+def warp_shiftwarp(tenInput, tenFlow):
+    """Bounded-displacement warp with STATIC DMA: the (2R+1)^2 taps are compile-time offsets into an
+    SBUF-resident band, so no per-pixel indirect descriptor is generated inside the kernel.
+
+    Measured at the production tile (C=3 992x1280), microbenchmark: 42,439 us vs the gather's
+    49,278 us = 1.16x, at 0.0417 max_diff LSB -- identical accuracy to the gather.
+
+    FALLS BACK to warp_gather above C=_SHIFTWARP_MAXC. The kernel is only VERIFIED at C=3: R=3 was
+    chosen because the real flow at that site is 2.33 px, and the accuracy cliff is hard -- R=2
+    measured 76.19 LSB on the same flow, a clean FAIL. Displacement at the four ctx sites has never
+    been measured, so the correct radius there is unknown and a silent quality regression is the
+    likely failure mode. Raising _SHIFTWARP_MAXC without measuring ctx-site displacement first is
+    exactly the mistake this guard exists to prevent."""
+    B, C, H, W = tenInput.shape
+    if C > _SHIFTWARP_MAXC:
+        return warp_gather(tenInput, tenFlow)
+    if _RECORD:
+        CALL_SITES.append(("shiftwarp", C, H, W))
+    global _SHIFTWARP_FN
+    if _SHIFTWARP_FN is None:
+        _SHIFTWARP_FN = _build_shiftwarp()
+    R = _SHIFTWARP_R
+    d = tenFlow.device
+    gx = torch.arange(W, device=d, dtype=torch.float32).view(1, 1, 1, W)
+    gy = torch.arange(H, device=d, dtype=torch.float32).view(1, 1, H, 1)
+    sx = (gx + tenFlow[:, 0:1].float()).clamp(0.0, W - 1.0)
+    sy = (gy + tenFlow[:, 1:2].float()).clamp(0.0, H - 1.0)
+    rx = sx - gx
+    ry = sy - gy
+    # Weight planes are elementwise functions of flow, computed on the HOST. Flow is an activation,
+    # but the weights only ever enter as tensor DATA, never as an access pattern -- that is what
+    # keeps the kernel's descriptor path static.
+    planes = []
+    for oy in range(-R, R + 1):
+        ty = (1.0 - (ry - oy).abs()).clamp_min(0.0)
+        for ox in range(-R, R + 1):
+            tx = (1.0 - (rx - ox).abs()).clamp_min(0.0)
+            planes.append((tx * ty)[0, 0])
+    wts = torch.stack(planes, 0).contiguous()
+    imgp = F.pad(tenInput.float(), (R, R, R, R), mode="replicate")[0].permute(1, 2, 0).contiguous()
+    out = _SHIFTWARP_FN(imgp, wts)
+    return out.permute(2, 0, 1).unsqueeze(0).to(tenInput.dtype)
+
+
 WARPS = {"gridsample": warp_gridsample, "gather": warp_gather,
-         "window": warp_window, "nki": warp_nki, "nki-dyn": warp_nki}
+         "window": warp_window, "nki": warp_nki, "nki-dyn": warp_nki,
+         "shiftwarp": warp_shiftwarp}
 _WARP = warp_gridsample          # swapped by --warp; Contextnet and IFNet_m both call through it
 
 
@@ -1154,6 +1215,13 @@ def main():
     ap.add_argument("--warp", default="gather", choices=sorted(WARPS),
                     help="nki = unrolled kernel (best runtime, 80-100 min compile at 4K tiles); "
                          "nki-dyn = device-loop kernel (seconds to compile, ~2x runtime)")
+    ap.add_argument("--shiftwarp-radius", type=int, default=3,
+                    help="shiftwarp support radius; R covers |displacement| <= R px EXACTLY. R=3 is "
+                         "the smallest that passes the gate on the real 2.33 px flow (R=2 measured "
+                         "76.19 LSB, a clean FAIL)")
+    ap.add_argument("--shiftwarp-max-c", type=int, default=3,
+                    help="shiftwarp handles sites with C <= this; larger C falls back to gather. "
+                         "Default 3 = only the image-warp site, the one where the kernel is verified")
     ap.add_argument("--compile", default="none", choices=("none", "one", "whole", "halves", "stages"),
                     help="none = eager; one = compile ONLY --compile-only, rest eager; "
                          "then coarsest first: whole = 1 graph; "
@@ -1230,6 +1298,7 @@ def main():
                  "self-generated .npy reference for equivalence testing, or supply --weights.")
 
     global _NKI_DYN, _PRELU, _PROFILE_BLOCKS, _NKI_FN, _NKI_FN_DYN
+    global _SHIFTWARP_FN, _SHIFTWARP_R, _SHIFTWARP_MAXC
     _NKI_DYN = (a.warp == "nki-dyn")
     if a.per_block and a.compile != "none":
         ap.error("--per-block needs --compile none: torch.compile dissolves the module boundaries "
@@ -1245,6 +1314,17 @@ def main():
     if a.warp == "window":
         _r = a.radius
         _WARP = lambda x, f: warp_window(x, f, radius=_r)   # noqa: E731
+    if a.warp == "shiftwarp":
+        if a.device != "neuron":
+            ap.error("--warp shiftwarp requires --device neuron")
+        _SHIFTWARP_R = a.shiftwarp_radius
+        _SHIFTWARP_MAXC = a.shiftwarp_max_c
+        # Same eager-build reason as the nki path below: building the wrapper lazily on first use
+        # puts wrap_nki() inside a traced frame under --compile.
+        _SHIFTWARP_FN = _build_shiftwarp()
+        print("shiftwarp     R=%d -> %d terms, covers |disp| <= %d px; sites with C > %d fall back "
+              "to gather" % (_SHIFTWARP_R, (2 * _SHIFTWARP_R + 1) ** 2, _SHIFTWARP_R,
+                             _SHIFTWARP_MAXC))
     if a.warp.startswith("nki") and a.device != "neuron":
         ap.error("--warp %s requires --device neuron" % a.warp)
     if a.warp.startswith("nki"):
