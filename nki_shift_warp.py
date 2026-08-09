@@ -71,49 +71,65 @@ def shift_warp_band(img, wts):
         r0 = b * band_rows
         rows = min(band_rows, H - r0)
 
-        band = nl.ndarray((rows + 2 * R, Wp * C), dtype=nl.float32, buffer=nl.sbuf)
-        nisa.dma_copy(
-            dst=band,
-            src=img.ap(pattern=[[Wp * C, rows + 2 * R], [1, Wp * C]],
-                       offset=r0 * Wp * C),
-        )
-
         acc = nl.ndarray((rows, W * C), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(acc, 0.0)
 
         # Three buffers, not six: the weight broadcast is a stride-0 access pattern
         # rather than a materialised W*C copy.
+        band = nl.ndarray((rows, Wp * C), dtype=nl.float32, buffer=nl.sbuf)
         wplane = nl.ndarray((rows, W), dtype=nl.float32, buffer=nl.sbuf)
         prod = nl.ndarray((rows, W * C), dtype=nl.float32, buffer=nl.sbuf)
 
-        for t in nl.affine_range(T):
-            oy = t // side - R
-            ox = t % side - R
-
-            # wts is [T, H, W]; take rows [r0, r0+rows) of plane t. Partition dim
-            # strides by W within the plane, free dim is contiguous W.
+        # The y offset is folded into the DMA, NOT expressed as an access-pattern
+        # offset on a single resident band. nisa.tensor_tensor requires both operands
+        # to START AT THE SAME SBUF PARTITION, and an offset of (R+oy)*Wp*C on a
+        # pattern whose partition stride is Wp*C decomposes to partition offset R+oy.
+        # That aligns only at oy=-R; at oy=-R+1 the compiler rejects it with
+        # "'lhs' and 'rhs' have different partition start offsets (1 vs 0)".
+        # Loading rows [r0+R+oy, +rows) per oy keeps every operand at partition 0.
+        # Cost is 2R+1 static band DMAs instead of 1 -- still per BAND, not per pixel.
+        # Plain range(), not affine_range, for two reasons. (1) Both loops carry a
+        # dependency -- `acc` accumulates and `band` is rewritten each oy -- which is
+        # exactly what affine_range asserts is absent; nkilib uses sequential_range
+        # for accumulation (scatter_add.py:88). (2) range() unrolls at compile time,
+        # so oy/ox are Python ints and the ap offsets below are compile-time
+        # constants, which a traced loop index would not guarantee.
+        for i in range(side):
+            oy = i - R
             nisa.dma_copy(
-                dst=wplane,
-                src=wts[t, nl.ds(r0, rows), :],
+                dst=band,
+                src=img.ap(pattern=[[Wp * C, rows], [1, Wp * C]],
+                           offset=(r0 + R + oy) * Wp * C),
             )
 
-            # Broadcast one weight per pixel across its C channels with a STRIDE-0
-            # inner dim: [[W, rows], [1, W], [0, C]] replicates each weight C times
-            # without materialising a copy. The library uses stride 0 for exactly
-            # this (moe_cte_utils.py:780 broadcasts a per-expert scalar over tiles);
-            # a per-channel affine_range loop appears nowhere in it.
-            #
-            # STATIC slice of the band: y shifts whole partitions, x shifts ox*C
-            # elements in the free dim. Both are compile-time constants, so nothing
-            # here is an indirect access and no software descriptors are generated.
-            nisa.tensor_tensor(
-                dst=prod,
-                data1=band.ap(pattern=[[Wp * C, rows], [1, W * C]],
-                              offset=(R + oy) * Wp * C + (R + ox) * C),
-                data2=wplane.ap(pattern=[[W, rows], [1, W], [0, C]]),
-                op=nl.multiply,
-            )
-            nisa.tensor_tensor(dst=acc, data1=acc, data2=prod, op=nl.add)
+            for j in range(side):
+                ox = j - R
+
+                # wts is [T, H, W]; take rows [r0, r0+rows) of plane t. Partition dim
+                # strides by W within the plane, free dim is contiguous W.
+                nisa.dma_copy(
+                    dst=wplane,
+                    src=wts[i * side + j, nl.ds(r0, rows), :],
+                )
+
+                # Broadcast one weight per pixel across its C channels with a STRIDE-0
+                # inner dim: [[W, rows], [1, W], [0, C]] replicates each weight C times
+                # without materialising a copy. The library uses stride 0 for exactly
+                # this (moe_cte_utils.py:780 broadcasts a per-expert scalar over tiles);
+                # a per-channel affine_range loop appears nowhere in it.
+                #
+                # Only the x shift remains as an access-pattern offset. (R+ox)*C is
+                # smaller than the Wp*C partition stride, so it moves the byte offset
+                # WITHIN partition 0 and never the partition start. Compile-time
+                # constant, so no indirect access and no software descriptors.
+                nisa.tensor_tensor(
+                    dst=prod,
+                    data1=band.ap(pattern=[[Wp * C, rows], [1, W * C]],
+                                  offset=(R + ox) * C),
+                    data2=wplane.ap(pattern=[[W, rows], [1, W], [0, C]]),
+                    op=nl.multiply,
+                )
+                nisa.tensor_tensor(dst=acc, data1=acc, data2=prod, op=nl.add)
 
         nisa.dma_copy(
             dst=out.ap(pattern=[[W * C, rows], [1, W * C]], offset=r0 * W * C),

@@ -96,7 +96,15 @@ def warp_shiftmatmul(x, flow, radius=2, bulk=(0, 0)):
     sy = (gy + flow[:, 1:2].float()).clamp(0.0, H - 1.0)
     rx = sx - gx - float(bx)
     ry = sy - gy - float(by)
-    base = torch.roll(x.float(), shifts=(by, bx), dims=(2, 3))
+    # Roll ONLY the dims with a nonzero shift. A shift of 0 lowers to
+    # concatenate(x[-0:], x[:-0]), and -0 == 0 in Python, so both slices are the
+    # WHOLE tensor and the concat infers 2H (1984 = 2x992) instead of H. by/bx are
+    # host ints baked in as constants, so this branch costs nothing at trace time.
+    base = x.float()
+    roll_shifts = tuple(s for s in (by, bx) if s != 0)
+    roll_dims = tuple(d for s, d in ((by, 2), (bx, 3)) if s != 0)
+    if roll_dims:
+        base = torch.roll(base, shifts=roll_shifts, dims=roll_dims)
     pad = F.pad(base, (R, R, R, R), mode="replicate")
     shifts = []
     wts = []
