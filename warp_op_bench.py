@@ -207,7 +207,12 @@ def main():
     if a.flow_smooth:
         # Coarse control grid upsampled: smooth like real optical flow. Rescaled after
         # interpolation because bicubic overshoots and would exceed flow_mag.
-        ctrl = (torch.rand(1, 2, 8, 10) * 2 - 1)
+        # Control grid ~1/16 of the output, so the upsample ratio (and hence smoothness)
+        # is scale-invariant. A fixed 8x10 grid is NOT smooth when the output is itself
+        # small -- at 8x10 out it gives a 4.28 px neighbour jump, at 992x1280 it gives
+        # 0.03 px. Clamped to >=2 so interpolate always has something to work with.
+        ch, cw = max(2, H // 16), max(2, W // 16)
+        ctrl = (torch.rand(1, 2, ch, cw) * 2 - 1)
         flow = F.interpolate(ctrl, size=(H, W), mode="bicubic", align_corners=True)
         flow = flow / flow.abs().max().clamp_min(1e-6) * a.flow_mag
     else:

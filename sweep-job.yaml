@@ -49,21 +49,48 @@ spec:
               SPECS="$SPECS shift:3,992,1280"
               SPECS="$SPECS window1:3,992,1280"
               SPECS="$SPECS window2:3,992,1280"
-              SPECS="$SPECS shiftmatmul:3,992,1280"
-              SPECS="$SPECS nkishift:3,992,1280"
+              # shiftmatmul is dropped: measured 160,422 us at R=2, bit-identical to
+              # window2 (same packets, same LSB) because the bulk shift is (0,0). It is
+              # 3.3x worse than the gather at C=3, and its cost scales as terms x C x px
+              # while the gather is descriptor-bound and nearly flat in C, so the gap
+              # only widens at the ctx sites. R=3 would double its terms. Nothing left
+              # to learn; window2 already covers the dense-torch cost probe.
+              # Both radii: R=3 is the verdict run (smallest radius that covers the real
+              # 2.33 px flow), R=2 is the cost control. R=2 is KNOWN to fail accuracy at
+              # 2.33 px (78 LSB, verified on CPU) and is here only to price the extra 24
+              # terms against the 39,477 us already measured at R=2 -- otherwise a slower
+              # R=3 could not be attributed to term count vs anything else.
+              SPECS="$SPECS nkishift/3:3,992,1280"
+              SPECS="$SPECS nkishift/2:3,992,1280"
               for T in 1728,2176 1728,1152 992,2176 992,640 704,1152 576,1152 576,640 576,384; do
                 SPECS="$SPECS gather:3,$T"
               done
 
+              # Accuracy is scored against REAL flow: smooth, 2.33 px max, which is what
+              # the model produces. Uniform random flow at the old default of 8 px is
+              # outside every bounded-radius arm's support and made the gate
+              # uninformative -- nkishift and the window arms all reported ~254 LSB
+              # regardless of whether they were correct. METHOD.md section 5.
+              FLOW="--flow-smooth --flow-mag 2.33"
+
               for SPEC in $SPECS; do
-                OP=${SPEC%%:*}
+                OPSPEC=${SPEC%%:*}
                 SHP=${SPEC#*:}
-                TAG="${OP}_$(echo $SHP | tr ',' 'x')"
+                # "op" or "op/R". The radius is part of the TAG so the two nkishift runs
+                # land in separate logs and separate summary rows instead of colliding.
+                OP=${OPSPEC%%/*}
+                if [ "$OPSPEC" != "$OP" ]; then
+                  RAD="--radius ${OPSPEC#*/}"
+                  TAG="${OP}R${OPSPEC#*/}_$(echo $SHP | tr ',' 'x')"
+                else
+                  RAD=""
+                  TAG="${OP}_$(echo $SHP | tr ',' 'x')"
+                fi
                 echo "################ $TAG"
                 BEFORE=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | sort || true)
                 set +e
                 python -u warp_op_bench.py --op "$OP" --shape "$SHP" --device neuron \
-                    2>&1 | tee "$OUT/$TAG.log"
+                    $FLOW $RAD 2>&1 | tee "$OUT/$TAG.log"
                 rc=${PIPESTATUS[0]}
                 set -e
                 if [ "$rc" != "0" ]; then
