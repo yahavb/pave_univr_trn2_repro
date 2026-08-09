@@ -51,27 +51,7 @@ spec:
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
               GEOM="--height 1728 --width 4096 --tiles 2x4 --halo 128 --bar 3"
 
-              # The A/B knob. MEASURE_WARP is the arm stage [3/3] times; everything else is
-              # unchanged. Set it to shiftwarp for the kernel arm and gather for the baseline, and
-              # compare the stage [3/3] median between the two runs.
-              MEASURE_WARP="${MEASURE_WARP:-nki}"
-              # FUNCTIONAL_WARP is the fast-compiling correctness pass for stage [2/3]. It defaults
-              # to nki-dyn (device-loop kernel: seconds to compile, ~2x runtime), the cheap way to
-              # prove 8 tiles / 8 cores works before paying for the measurement arm. For an A/B set
-              # it EQUAL to MEASURE_WARP -- otherwise every run also compiles and runs the shipping
-              # nki-dyn kernel, which is dead weight for the comparison. It cannot corrupt the number
-              # either way: each stage is a separate process and _WARP is set once per process, so
-              # the arms never share state. Defined HERE, before the warmup loop that reads it.
-              FUNCTIONAL_WARP="${FUNCTIONAL_WARP:-nki-dyn}"
-              echo "MEASURE_WARP: $MEASURE_WARP   FUNCTIONAL_WARP: $FUNCTIONAL_WARP"
-
-              # Deduplicated: with FUNCTIONAL_WARP == MEASURE_WARP this warms ONE arm, not two, so no
-              # unrelated NKI kernel gets compiled. Set them differently and both warm as before.
-              WARMUP_ARMS="$FUNCTIONAL_WARP"
-              [ "$MEASURE_WARP" != "$FUNCTIONAL_WARP" ] && WARMUP_ARMS="$FUNCTIONAL_WARP $MEASURE_WARP"
-              echo "WARMUP_ARMS: $WARMUP_ARMS"
-
-              for WARP in $WARMUP_ARMS; do
+              for WARP in nki-dyn nki; do
                 for T in 0 1; do
                   echo "=== [1/3] SERIAL WARMUP — tile $T, 1 core, warp=$WARP ==="
                   python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
@@ -83,18 +63,18 @@ spec:
                 done
               done
 
-              echo "=== [2/3] FUNCTIONAL CHECK — 8 tiles / 8 cores, warp=$FUNCTIONAL_WARP ==="
+              echo "=== [2/3] FUNCTIONAL CHECK — 8 tiles / 8 cores, warp=nki-dyn ==="
               python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
-                  --device neuron --cores 8 --warp $FUNCTIONAL_WARP --dtype fp32 --iters 1 \
-                  2>&1 | tee "$OUT/1_functional_${FUNCTIONAL_WARP}.log"
+                  --device neuron --cores 8 --warp nki-dyn --dtype fp32 --iters 1 \
+                  2>&1 | tee "$OUT/1_functional_nki_dyn.log"
               echo ""
 
-              echo "=== [3/3] MEASUREMENT — 8 tiles / 8 cores, warp=$MEASURE_WARP, 3 iters ==="
+              echo "=== [3/3] MEASUREMENT — 8 tiles / 8 cores, warp=nki, 3 iters ==="
               echo "    bundle reference: 3673.3 ms median, 98.68 dB, 0.64 LSB PASS"
               echo "    CUDA L40S for the same frame: eager 351.1 ms, inductor 237.9 ms, TRT 161 ms"
               python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
-                  --device neuron --cores 8 --warp $MEASURE_WARP --dtype fp32 --iters 3 \
-                  2>&1 | tee "$OUT/2_measurement_${MEASURE_WARP}.log"
+                  --device neuron --cores 8 --warp nki --dtype fp32 --iters 3 \
+                  2>&1 | tee "$OUT/2_measurement_nki.log"
               echo ""
 
               echo "=== SUMMARY (grep of both arms) ==="
@@ -123,17 +103,6 @@ spec:
             - name: 621547421844-ap-southeast-4-pvc
               mountPath: /var/mdl
           env:
-            # A/B knob for stage [3/3]. "shiftwarp" = the SBUF-resident kernel arm (1.16x at the
-            # C=3 site in the microbenchmark, ctx sites fall back to gather); "gather" = baseline;
-            # "nki" = the shipping kernel. Override per run with:
-            #   kubectl set env job/univr-trn-repro MEASURE_WARP=shiftwarp
-            # or by editing this value before apply.
-            - name: MEASURE_WARP
-              value: "shiftwarp"
-            # Set equal to MEASURE_WARP for a clean A/B: leaving it at nki-dyn means every run also
-            # compiles and runs the shipping NKI kernel, which is dead weight for the comparison.
-            - name: FUNCTIONAL_WARP
-              value: "shiftwarp"
             - name: PYTHONUNBUFFERED
               value: "1"
             - name: NEURON_LOGICAL_NC_CONFIG
