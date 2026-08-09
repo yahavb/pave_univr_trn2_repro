@@ -106,9 +106,10 @@ def warp_shiftmatmul(x, flow, radius=2, bulk=(0, 0)):
             tx = (1.0 - (rx - ox).abs()).clamp_min(0.0)
             shifts.append(pad[:, :, R + oy:R + oy + H, R + ox:R + ox + W])
             wts.append(tx * ty)
-    S = torch.stack(shifts, 0)
-    Wt = torch.stack(wts, 0)
-    return (S * Wt).sum(0).to(x.dtype)
+    acc = shifts[0] * wts[0]
+    for i in range(1, len(shifts)):
+        acc = acc + shifts[i] * wts[i]
+    return acc.to(x.dtype)
 
 
 def warp_nkishift(x, flow, radius=2):

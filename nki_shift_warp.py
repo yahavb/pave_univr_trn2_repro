@@ -81,18 +81,20 @@ def shift_warp_band(img, wts):
         acc = nl.ndarray((rows, W * C), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(acc, 0.0)
 
+        # Three buffers, not six: multiply the broadcast weights BY the shifted
+        # band in place, so no separate `shifted` or `prod` is needed.
         wplane = nl.ndarray((rows, W), dtype=nl.float32, buffer=nl.sbuf)
         wbc = nl.ndarray((rows, W * C), dtype=nl.float32, buffer=nl.sbuf)
-        shifted = nl.ndarray((rows, W * C), dtype=nl.float32, buffer=nl.sbuf)
-        prod = nl.ndarray((rows, W * C), dtype=nl.float32, buffer=nl.sbuf)
 
         for t in nl.affine_range(T):
             oy = t // side - R
             ox = t % side - R
 
+            # wts is [T, H, W]; take rows [r0, r0+rows) of plane t. Partition dim
+            # strides by W within the plane, free dim is contiguous W.
             nisa.dma_copy(
                 dst=wplane,
-                src=wts.ap(pattern=[[W, rows], [1, W]], offset=t * H * W + r0 * W),
+                src=wts[t, nl.ds(r0, rows), :],
             )
 
             # Broadcast one weight per pixel across its C channels: write the
@@ -106,14 +108,14 @@ def shift_warp_band(img, wts):
             # STATIC slice. y shifts by whole partitions, x by ox*C elements in the
             # free dim. Both are compile-time constants, so this is not an indirect
             # access and generates no software descriptors.
-            nisa.tensor_copy(
-                dst=shifted,
-                src=band.ap(pattern=[[Wp * C, rows], [1, W * C]],
-                            offset=(R + oy) * Wp * C + (R + ox) * C),
+            nisa.tensor_tensor(
+                dst=wbc,
+                data1=wbc,
+                data2=band.ap(pattern=[[Wp * C, rows], [1, W * C]],
+                              offset=(R + oy) * Wp * C + (R + ox) * C),
+                op=nl.multiply,
             )
-
-            nisa.tensor_tensor(dst=prod, data1=shifted, data2=wbc, op=nl.multiply)
-            nisa.tensor_tensor(dst=acc, data1=acc, data2=prod, op=nl.add)
+            nisa.tensor_tensor(dst=acc, data1=acc, data2=wbc, op=nl.add)
 
         nisa.dma_copy(
             dst=out.ap(pattern=[[W * C, rows], [1, W * C]], offset=r0 * W * C),
