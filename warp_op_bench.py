@@ -178,6 +178,13 @@ def main():
     ap.add_argument("--shape", required=True, help="C,H,W")
     ap.add_argument("--device", default="neuron")
     ap.add_argument("--flow-mag", type=float, default=8.0)
+    # Uniform random flow is NOT a valid accuracy test. At mag 2 it still has ~4 px
+    # neighbour-to-neighbour jumps, so a bounded-radius kernel is scored against
+    # displacement it never claimed to support. Real optical flow is smooth: the
+    # model's measured field is max 2.33 px with 0.04 px neighbour jumps. --flow-smooth
+    # upsamples a coarse control grid to get that property. METHOD.md section 5.
+    ap.add_argument("--flow-smooth", action="store_true",
+                    help="smooth (bicubic-upsampled) flow instead of uniform random")
     ap.add_argument("--dtype", default="fp32", choices=("fp32", "bf16"))
     ap.add_argument("--int-flow", action="store_true")
     a = ap.parse_args()
@@ -190,7 +197,14 @@ def main():
 
     torch.manual_seed(0)
     x = torch.rand(1, C, H, W, dtype=dt)
-    flow = (torch.rand(1, 2, H, W) * 2 - 1) * a.flow_mag
+    if a.flow_smooth:
+        # Coarse control grid upsampled: smooth like real optical flow. Rescaled after
+        # interpolation because bicubic overshoots and would exceed flow_mag.
+        ctrl = (torch.rand(1, 2, 8, 10) * 2 - 1)
+        flow = F.interpolate(ctrl, size=(H, W), mode="bicubic", align_corners=True)
+        flow = flow / flow.abs().max().clamp_min(1e-6) * a.flow_mag
+    else:
+        flow = (torch.rand(1, 2, H, W) * 2 - 1) * a.flow_mag
     if a.int_flow:
         flow = flow.round()
     flow = flow.to(dt)
@@ -205,7 +219,11 @@ def main():
     print("weight_bytes  %d" % r["weight_bytes"])
     print("min_desc      %d at 1/px, %d at 2/px" % (r["min_desc_1_per_px"], r["min_desc_2_per_px"]))
     print("B_per_desc    %d at 2C contiguous" % r["bytes_per_desc_at_2C"])
-    print("flow_mag      %g%s" % (a.flow_mag, " (integer)" if a.int_flow else ""))
+    print("flow_mag      %g%s%s" % (a.flow_mag, " (integer)" if a.int_flow else "",
+                                    " SMOOTH" if a.flow_smooth else " uniform-random"))
+    print("flow_maxabs   %.4f px   max neighbour jump %.4f px"
+          % (flow.float().abs().max(),
+             (flow.float()[:, :, :, 1:] - flow.float()[:, :, :, :-1]).abs().max()))
 
     x = x.to(a.device)
     flow = flow.to(a.device)
