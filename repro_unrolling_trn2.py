@@ -144,6 +144,15 @@ TEST_ASSET_SHA256 = {
 CALL_SITES: list[tuple[str, int, int, int]] = []
 _RECORD = False
 
+# Measured displacement per resample call, as (C, H, W, max_abs_px, pct_over_2, pct_over_3).
+# This exists because the bounded-radius kernel silently CLAMPS anything beyond R px, and the only
+# displacement figure on record (2.33 px) came from a single site at one tile. shiftwarp scored
+# 229.72 LSB in the model with p50 = 0.00 and p99 = 172.99 -- 93% of pixels exact and ~7%
+# catastrophically wrong, which is the signature of a clamp, not of numerical error. Populated by
+# _bilinear_terms so every site is covered, including the ctx sites that fall back to gather.
+FLOW_STATS: list[tuple[int, int, int, float, float, float]] = []
+_RECORD_FLOW = False
+
 
 # =============================================================================================
 # THE RESAMPLE, four ways
@@ -161,6 +170,18 @@ def _bilinear_terms(tenInput, tenFlow):
     gy = torch.arange(H, device=dev, dtype=dt).view(1, 1, H, 1)
     sx = (gx + tenFlow[:, 0:1].to(dt)).clamp(0.0, W - 1.0)
     sy = (gy + tenFlow[:, 1:2].to(dt)).clamp(0.0, H - 1.0)
+    if _RECORD_FLOW:
+        # POST-clamp displacement: sx/sy are already clamped to the tile, so this is the
+        # displacement the kernel actually has to reach, not the raw flow. That is the quantity R
+        # has to cover. Sync to host here -- only ever enabled in an eager diagnostic run.
+        dxa = (sx - gx).abs()
+        dya = (sy - gy).abs()
+        m = torch.maximum(dxa.max(), dya.max()).item()
+        over = torch.maximum(dxa, dya)
+        n = over.numel()
+        FLOW_STATS.append((C, H, W, m,
+                           100.0 * (over > 2.0).sum().item() / n,
+                           100.0 * (over > 3.0).sum().item() / n))
     x0 = torch.floor(sx)
     y0 = torch.floor(sy)
     ax = (sx - x0)
@@ -1215,6 +1236,10 @@ def main():
     ap.add_argument("--warp", default="gather", choices=sorted(WARPS),
                     help="nki = unrolled kernel (best runtime, 80-100 min compile at 4K tiles); "
                          "nki-dyn = device-loop kernel (seconds to compile, ~2x runtime)")
+    ap.add_argument("--record-flow", action="store_true",
+                    help="measure post-clamp displacement at every resample call and print a table. "
+                         "Diagnostic: answers what radius a bounded-neighbourhood kernel needs. "
+                         "Forces eager (--compile none) and syncs to host, so do not time it")
     ap.add_argument("--shiftwarp-radius", type=int, default=3,
                     help="shiftwarp support radius; R covers |displacement| <= R px EXACTLY. R=3 is "
                          "the smallest that passes the gate on the real 2.33 px flow (R=2 measured "
@@ -1265,7 +1290,7 @@ def main():
                          "manifest, for use as --gt on another device")
     a = ap.parse_args()
 
-    global _WARP, _RECORD
+    global _WARP, _RECORD, _RECORD_FLOW
     H, W = a.height, a.width
     itemsize = 2 if a.dtype == "bf16" else 4
 
@@ -1314,6 +1339,9 @@ def main():
     if a.warp == "window":
         _r = a.radius
         _WARP = lambda x, f: warp_window(x, f, radius=_r)   # noqa: E731
+    if a.record_flow and a.compile != "none":
+        ap.error("--record-flow needs --compile none: it appends to a list and syncs to host inside "
+                 "the warp, which fullgraph=True cannot trace")
     if a.warp == "shiftwarp":
         if a.device != "neuron":
             ap.error("--warp shiftwarp requires --device neuron")
@@ -1474,6 +1502,11 @@ def main():
     # is a graph break and dynamo raises instead of tracing, so the accounting is only collected on
     # the eager path. --report-only still produces the full table from shapes alone, with no device.
     _RECORD = (a.compile == "none")
+    # Same graph-break reason as _RECORD: appending to a Python list and calling .item() inside the
+    # warp cannot be traced, so this is eager-only. main() already errors if --record-flow is
+    # combined with --compile.
+    _RECORD_FLOW = a.record_flow and (a.compile == "none")
+    FLOW_STATS.clear()
     CALL_SITES.clear()
     t0 = time.perf_counter()
     out = one_frame()
@@ -1482,6 +1515,34 @@ def main():
     out = out.float().cpu()          # completion barrier: the copy forces the device to finish
     first_ms = (time.perf_counter() - t0) * 1e3
     _RECORD = False
+    _RECORD_FLOW = False
+
+    if FLOW_STATS:
+        print()
+        print("=" * 100)
+        print("MEASURED DISPLACEMENT PER RESAMPLE CALL (post-clamp, the distance the kernel must reach)")
+        print("=" * 100)
+        print("  %-4s %-11s %10s %10s %10s   %s"
+              % ("#", "C,H,W", "max_px", ">2px %", ">3px %", "min R that covers it"))
+        worst = 0.0
+        worst_c3 = 0.0
+        for i, (C, H, W, m, o2, o3) in enumerate(FLOW_STATS):
+            need = int(math.ceil(m)) if m > 0 else 0
+            print("  %-4d %-11s %10.3f %10.4f %10.4f   R=%d"
+                  % (i, "%d,%d,%d" % (C, H, W), m, o2, o3, need))
+            worst = max(worst, m)
+            if C <= 3:
+                worst_c3 = max(worst_c3, m)
+        print()
+        print("  WORST over all sites: %.3f px  -> needs R=%d  (%d terms)"
+              % (worst, math.ceil(worst), (2 * math.ceil(worst) + 1) ** 2))
+        print("  WORST at C<=3 (the sites shiftwarp actually handles): %.3f px -> needs R=%d"
+              % (worst_c3, math.ceil(worst_c3)))
+        print("  shiftwarp ran at R=%d, which covers |disp| <= %d px EXACTLY. Anything beyond that is"
+              % (_SHIFTWARP_R, _SHIFTWARP_R))
+        print("  SILENTLY CLAMPED -- no error, just wrong pixels, which is the 229.72 LSB / p50=0.00 /")
+        print("  p99=172.99 signature. Compare the >%dpx column against the ~7%% of pixels that failed."
+              % _SHIFTWARP_R)
     print()
     print("  forward complete: %s  range [%.4f, %.4f]  first call %.0f ms (includes compile/warmup)"
           % (tuple(out.shape), out.min(), out.max(), first_ms))
