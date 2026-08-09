@@ -185,6 +185,13 @@ def main():
     # upsamples a coarse control grid to get that property. METHOD.md section 5.
     ap.add_argument("--flow-smooth", action="store_true",
                     help="smooth (bicubic-upsampled) flow instead of uniform random")
+    # Support radius for the bounded-neighbourhood arms. R covers displacement up to
+    # EXACTLY R px, not R.xx: measured on CPU, the gate passes at 2.00 px and fails at
+    # 2.10 (19 LSB) and 2.33 (75 LSB). The model's real flow is 2.33 px max, so R=3 is
+    # the smallest radius that can pass. Kept a flag, not hardcoded, so the cliff stays
+    # testable and the ctx sites can be swept.
+    ap.add_argument("--radius", type=int, default=3,
+                    help="support radius for nkishift/shiftmatmul; (2R+1)^2 terms")
     ap.add_argument("--dtype", default="fp32", choices=("fp32", "bf16"))
     ap.add_argument("--int-flow", action="store_true")
     a = ap.parse_args()
@@ -221,6 +228,9 @@ def main():
     print("B_per_desc    %d at 2C contiguous" % r["bytes_per_desc_at_2C"])
     print("flow_mag      %g%s%s" % (a.flow_mag, " (integer)" if a.int_flow else "",
                                     " SMOOTH" if a.flow_smooth else " uniform-random"))
+    if a.op in ("nkishift", "shiftmatmul"):
+        print("radius        R=%d  -> %d terms  (covers |disp| <= %d px)"
+              % (a.radius, (2 * a.radius + 1) ** 2, a.radius))
     print("flow_maxabs   %.4f px   max neighbour jump %.4f px"
           % (flow.float().abs().max(),
              (flow.float()[:, :, :, 1:] - flow.float()[:, :, :, :-1]).abs().max()))
@@ -240,7 +250,11 @@ def main():
     op = OPS[a.op]
     if a.op == "shiftmatmul":
         _b = bulk
-        op = lambda t, f: warp_shiftmatmul(t, f, radius=2, bulk=_b)
+        _r = a.radius
+        op = lambda t, f: warp_shiftmatmul(t, f, radius=_r, bulk=_b)
+    elif a.op == "nkishift":
+        _r = a.radius
+        op = lambda t, f: warp_nkishift(t, f, radius=_r)
     fn = torch.compile(op, **cc)
 
     with torch.no_grad():
