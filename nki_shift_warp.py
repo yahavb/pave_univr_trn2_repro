@@ -81,10 +81,10 @@ def shift_warp_band(img, wts):
         acc = nl.ndarray((rows, W * C), dtype=nl.float32, buffer=nl.sbuf)
         nisa.memset(acc, 0.0)
 
-        # Three buffers, not six: multiply the broadcast weights BY the shifted
-        # band in place, so no separate `shifted` or `prod` is needed.
+        # Three buffers, not six: the weight broadcast is a stride-0 access pattern
+        # rather than a materialised W*C copy.
         wplane = nl.ndarray((rows, W), dtype=nl.float32, buffer=nl.sbuf)
-        wbc = nl.ndarray((rows, W * C), dtype=nl.float32, buffer=nl.sbuf)
+        prod = nl.ndarray((rows, W * C), dtype=nl.float32, buffer=nl.sbuf)
 
         for t in nl.affine_range(T):
             oy = t // side - R
@@ -97,25 +97,23 @@ def shift_warp_band(img, wts):
                 src=wts[t, nl.ds(r0, rows), :],
             )
 
-            # Broadcast one weight per pixel across its C channels: write the
-            # W-wide plane into a stride-C view of the W*C-wide buffer, C times.
-            for c in nl.affine_range(C):
-                nisa.tensor_copy(
-                    dst=wbc.ap(pattern=[[W * C, rows], [C, W]], offset=c),
-                    src=wplane,
-                )
-
-            # STATIC slice. y shifts by whole partitions, x by ox*C elements in the
-            # free dim. Both are compile-time constants, so this is not an indirect
-            # access and generates no software descriptors.
+            # Broadcast one weight per pixel across its C channels with a STRIDE-0
+            # inner dim: [[W, rows], [1, W], [0, C]] replicates each weight C times
+            # without materialising a copy. The library uses stride 0 for exactly
+            # this (moe_cte_utils.py:780 broadcasts a per-expert scalar over tiles);
+            # a per-channel affine_range loop appears nowhere in it.
+            #
+            # STATIC slice of the band: y shifts whole partitions, x shifts ox*C
+            # elements in the free dim. Both are compile-time constants, so nothing
+            # here is an indirect access and no software descriptors are generated.
             nisa.tensor_tensor(
-                dst=wbc,
-                data1=wbc,
-                data2=band.ap(pattern=[[Wp * C, rows], [1, W * C]],
+                dst=prod,
+                data1=band.ap(pattern=[[Wp * C, rows], [1, W * C]],
                               offset=(R + oy) * Wp * C + (R + ox) * C),
+                data2=wplane.ap(pattern=[[W, rows], [1, W], [0, C]]),
                 op=nl.multiply,
             )
-            nisa.tensor_tensor(dst=acc, data1=acc, data2=wbc, op=nl.add)
+            nisa.tensor_tensor(dst=acc, data1=acc, data2=prod, op=nl.add)
 
         nisa.dma_copy(
             dst=out.ap(pattern=[[W * C, rows], [1, W * C]], offset=r0 * W * C),
