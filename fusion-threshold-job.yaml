@@ -1,0 +1,186 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: univr-fusion-threshold
+  namespace: default
+spec:
+  template:
+    metadata:
+      labels:
+        app: univr-fusion-threshold
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neurons
+          resourceClaimTemplateName: s-lnc1
+      containers:
+        - name: repro
+          image: 621547421844.dkr.ecr.us-west-2.amazonaws.com/native-pytorch:2.11.0-neuronx-py312-sdk2.31.0-ubuntu24.04-neurondlcbuilder-development-6486001458-0
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euo pipefail
+
+              cd /tmp
+              git clone -b main https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
+              cd REPRO
+
+              echo "┌── PROVENANCE ──"
+              echo "│ commit : $(git rev-parse HEAD)"
+              echo "│ subject: $(git log -1 --pretty=%s)"
+              echo "└────────────────"
+              echo "neuronx-cc: $(neuronx-cc --version 2>&1 | head -1 || true)"
+              echo ""
+
+              # GOAL: the LARGEST tile whose whole forward compiles as ONE graph.
+              #
+              # Whole-graph fullgraph=True is rejected by the backend with
+              #   [NCC_EBIR033] ... in=17776640 out=128
+              # and 17,776,640 = 1,269,760 px (992x1280) x 14 resamples per forward. Retested on
+              # this exact image (neuronx-cc 2.26.6360.0, same version the original doc recorded):
+              # identical operands, identical failing instruction I-21406-0_VN_0. The limit is real
+              # and deterministic, and no newer compiler is available.
+              #
+              # But STATE.md records single-graph WORKING at 512x768 = 393,216 px = 5,505,024.
+              # So the threshold lies in (5.5M .. 17.7M] and the failing operand scales with
+              # px x 14. Every legal geometry maps onto that axis:
+              #
+              #   grid  padded      px x 14      total px vs 2x4   status
+              #   2x4   992x1280    17,776,640   1.00x             FAILS (measured)
+              #   3x4   704x1280    12,615,680   1.06x             unknown
+              #   2x8   992x768     10,665,984   1.20x             unknown
+              #   4x4   576x1280    10,321,920   1.16x             unknown
+              #   4x8   576x768      6,193,152   1.39x             unknown
+              #   6x8   416x768      4,472,832   1.51x             WORKS (below 5.5M)
+              #
+              # WHY IT MATTERS: a tile that fuses gives ~4 NEFFs instead of the 275 an eager run
+              # caches, which is the dispatch overhead ~/pave-unrolling/RESULTS.md identified as
+              # dominant ("95% dispatch-idle ... the real lever is batching the dispatches").
+              # The cost is halo re-read: smaller tiles do MORE total pixel work, and measured
+              # gather cost is flat at ~38.8 ns/px across a 10x tile range, so that cost is real.
+              # 3x4 is the standout -- only 6% more pixel work, largest untested geometry below
+              # the failure point.
+              #
+              # COMPILE ONLY: --iters 0, one tile, one core. No timing here; this establishes
+              # WHICH geometries fuse. Timing the winner is a separate run, because a benchmark
+              # of a geometry that cannot compile is wasted device time.
+              #
+              # gather only: needs no NKI toolchain, and the doc established the failure is
+              # independent of the resample implementation (gather / gridsample / nki-dyn all
+              # produced the identical error and operands).
+              #
+              # Ordered LARGEST-FIRST so the first PASS is the answer; later arms still run so the
+              # full boundary is mapped rather than inferred from one point.
+
+              OUT=/tmp/univr_ft_out; mkdir -p "$OUT"
+              FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
+              REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
+
+              for G in 3x4 2x8 4x4 4x8; do
+                echo "================================================================"
+                echo "=== --tiles $G   whole-graph fullgraph=True, 1 tile, 1 core"
+                echo "================================================================"
+                set +e
+                NEURON_LAUNCH_BLOCKING=1 python -u repro_unrolling_trn2.py \
+                    $FRAMES $REF \
+                    --height 1728 --width 4096 --tiles "$G" --halo 128 --bar 3 \
+                    --device neuron --cores 1 --only-tile 1 \
+                    --warp gather --dtype fp32 --compile whole --iters 0 \
+                    2>&1 | tee "$OUT/whole_${G}.log"
+                rc=${PIPESTATUS[0]}
+                set -e
+                echo "$rc" > "$OUT/rc_${G}.txt"
+                if grep -q "NCC_EBIR033" "$OUT/whole_${G}.log"; then
+                  echo "  RESULT: FUSION REJECTED"
+                  grep -oE "got in=[0-9]+ and out=[0-9]+" "$OUT/whole_${G}.log" | head -1 \
+                    | sed 's/^/    /'
+                elif [ "$rc" = "0" ]; then
+                  echo "  RESULT: COMPILES AS ONE GRAPH"
+                else
+                  echo "  RESULT: failed for a DIFFERENT reason (not NCC_EBIR033)"
+                  tail -25 "$OUT/whole_${G}.log" | sed 's/^/    /'
+                fi
+                echo ""
+                for i in $(seq 1 30); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                sleep 5
+              done
+
+              echo "################ FUSION BOUNDARY"
+              printf "  %-6s %-12s %13s %10s %s\n" tiles padded px_x_14 rc verdict
+              for G in 3x4 2x8 4x4 4x8; do
+                L="$OUT/whole_${G}.log"; [ -f "$L" ] || continue
+                rc=$(cat "$OUT/rc_${G}.txt" 2>/dev/null || echo '?')
+                PAD=$(grep -oE "padded [0-9]+x[0-9]+" "$L" | head -1 | awk '{print $2}' || true)
+                IN=$(grep -oE "got in=[0-9]+" "$L" | head -1 | cut -d= -f2 || true)
+                if grep -q "NCC_EBIR033" "$L"; then V=REJECTED
+                elif [ "$rc" = "0" ]; then V=FUSES
+                else V=OTHER_FAILURE; fi
+                printf "  %-6s %-12s %13s %10s %s\n" "$G" "${PAD:--}" "${IN:--}" "$rc" "$V"
+              done
+              echo ""
+              echo "  2x4 992x1280 = 17,776,640 is REJECTED (measured on this image)."
+              echo "  The largest geometry marked FUSES is the optimal NEFF layout under this"
+              echo "  compiler. Timing it against the eager 8-tile baseline is the next run."
+              echo ""
+
+              ARCHIVE=/tmp/univr_ft_$(date -u +%Y%m%d_%H%M%S).tar.gz
+              tar -czf "$ARCHIVE" -C /tmp univr_ft_out
+              mkdir -p /var/mdl/univr_neuron
+              cp "$ARCHIVE" /var/mdl/univr_neuron/
+              echo "Saved: /var/mdl/univr_neuron/$(basename "$ARCHIVE") ($(du -h "$ARCHIVE" | cut -f1))"
+              echo "Done."
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 48
+              memory: 248Gi
+            limits:
+              cpu: 84
+              memory: 248Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_NUM_CORES
+              value: "8"
+            - name: NEURON_RT_VISIBLE_CORES
+              value: "0-7"
+            - name: NEURON_CC_FLAGS
+              value: "--target trn2 --lnc 1 --model-type unet-inference"
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
