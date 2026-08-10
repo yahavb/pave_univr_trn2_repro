@@ -8,6 +8,48 @@ The failure is **independent of how the resample is written**. Three implementat
 one NKI kernel and two plain PyTorch formulations — produce the identical error code and
 the identical operand sizes.
 
+## What "one graph" means here: PER TILE, never the 4K frame
+
+Worth stating up front, because it is easy to read this document as "the 4K frame will not
+compile as one graph" and then chase the wrong target.
+
+**The 4K frame is never one graph, at any tile size, by construction.** 1728x4096 is always
+split into N tiles that are dispatched across 8 NeuronCores. `build_replicas()` builds one
+model replica per core and a `ThreadPoolExecutor(max_workers=ncore)` runs them, so tiles
+execute as separate graphs on separate cores. Fusing the frame into a single graph is not
+something this design attempts, and shrinking the tile does not move toward it.
+
+What `--compile whole` fuses is **the forward pass of ONE tile** — its 14 resamples plus the
+conv trunks, U-Net and Contextnet, into one graph. The script reports the graph inventory
+directly:
+
+```
+padded tile shapes: 992x1152, 992x1280  -> 2 distinct graph(s) per timestamp
+x2 timestamps (triplet)                 -> up to 4 graphs to compile
+```
+
+Four graphs, because the tiling produces two distinct padded shapes (edge and interior) and
+a triplet runs two timestamps. Two shapes x two timestamps = 4. The count is set by the
+number of distinct *shapes*, not by the number of tiles: 8 tiles reuse the same 2 shapes,
+so a compiled 2x4 run would still be 4 graphs, and each additional distinct shape adds one.
+
+So the prize is per-tile-shape, and it is a dispatch-count prize:
+
+| | graphs / NEFFs |
+|---|---|
+| eager (`--compile none`, what every run so far used) | **275 NEFFs cached** |
+| whole-graph, if it compiled | **~4** |
+
+The 275 is what an eager run actually caches — every op dispatched separately. The ~4 is the
+script's own reported graph structure. Closing that gap is the reason to care about fusion:
+`~/pave-unrolling/RESULTS.md` measured 0.82 s of device-active time against a 16.5 s frame
+and concluded "95% is dispatch/idle ... the real lever is batching the dispatches."
+
+The practical consequence: because the rejection scales with `px x 14`, buying fusion means
+shrinking the tile, which raises tile count and therefore total pixel work (every tile
+re-reads its halo). That is the trade `fusion-threshold-job.yaml` exists to price — not a
+route to a single 4K graph, which is not on the table.
+
 ## Error
 
 ```

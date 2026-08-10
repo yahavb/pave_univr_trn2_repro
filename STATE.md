@@ -20,7 +20,8 @@ Full method in `METHOD.md`.
 | `sweep-job.yaml` | the microbenchmark k8s job |
 | `repro-job.yaml` | the whole-model k8s job, from the bundle |
 | `METHOD.md` | method, tile geometry, acceptance criteria |
-| `SINGLE_GRAPH_NCC_EBIR033.md` | STALE. Says single graph never compiles; it does, up to 512x768 |
+| `SINGLE_GRAPH_NCC_EBIR033.md` | whole-forward fusion of ONE TILE is rejected at 992x1280. RETESTED on the current image: same operands, same failing instruction. Limit scales as `px x 14`, works at 512x768, so it is a threshold not a wall |
+| `fusion-threshold-job.yaml` | finds the largest tile that fuses: 3x4 / 2x8 / 4x4 / 4x8, compile-only |
 
 Run: `kubectl delete job univr-sweep --ignore-not-found; kubectl apply -f sweep-job.yaml`
 Results: `s3://621547421844-ap-southeast-4/univr_neuron/univr_sweep_<ts>.tar.gz`
