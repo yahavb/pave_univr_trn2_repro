@@ -1,0 +1,166 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: univr-compile-modes
+  namespace: default
+spec:
+  template:
+    metadata:
+      labels:
+        app: univr-compile-modes
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neurons
+          resourceClaimTemplateName: s-lnc1
+      containers:
+        - name: repro
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euo pipefail
+
+              cd /tmp
+              git clone -b main https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
+              cd REPRO
+
+              echo "┌── PROVENANCE ──"
+              echo "│ commit : $(git rev-parse HEAD)"
+              echo "│ subject: $(git log -1 --pretty=%s)"
+              echo "└────────────────"
+
+              # WHAT THIS TESTS
+              # repro-job.yaml never passes --compile, so it defaults to "none" = EAGER. The
+              # README's 3673.3 ms was produced by the same flagless command, so the documented
+              # baseline is an eager number too. In that mode the run caches 275 NEFFs while the
+              # script itself reports the graph structure as only "2 distinct graph(s) per
+              # timestamp, x2 timestamps -> up to 4 graphs". 275 dispatches against 4 graphs is
+              # the dispatch overhead ~/pave-unrolling/RESULTS.md pointed at:
+              #   "GpSimd is 46% of only 5% active time. The 95% dispatch-idle dominates.
+              #    The real lever is batching the 64 dispatches/frame into fewer device calls."
+              # This job measures whether collapsing dispatches actually moves wall clock.
+              #
+              # warp=nki-dyn throughout, NOT nki: the README puts nki at 80-100 min compile per
+              # distinct tile shape, and --compile multiplies the graph count, so nki here could
+              # run for many hours. nki-dyn compiles in seconds at ~1.1-1.3x runtime. The
+              # QUESTION is whether fewer dispatches helps at all, and the eager arm below is
+              # measured with the same warp so the comparison is internally consistent rather
+              # than against a number from another mode.
+              #
+              # Coarsest-first, and every arm is allowed to FAIL without killing the job: a
+              # single 4K graph may not compile. STATE.md records single-graph compiles working
+              # only up to 512x768, and SINGLE_GRAPH_NCC_EBIR033.md is marked STALE on exactly
+              # this question, so this is a live unknown, not a formality.
+
+              OUT=/tmp/univr_cmp_out; mkdir -p "$OUT"
+              FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
+              REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
+              GEOM="--height 1728 --width 4096 --tiles 2x4 --halo 128 --bar 3"
+
+              for MODE in none stages halves whole; do
+                echo "================================================================"
+                echo "=== --compile $MODE  (8 tiles / 8 cores, warp=nki-dyn, 3 iters)"
+                echo "================================================================"
+                B=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l || echo 0)
+                set +e
+                python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
+                    --device neuron --cores 8 --warp nki-dyn --dtype fp32 --iters 3 \
+                    --compile "$MODE" 2>&1 | tee "$OUT/compile_${MODE}.log"
+                rc=${PIPESTATUS[0]}
+                set -e
+                A=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l || echo 0)
+                echo "  rc=$rc   NEFFs before=$B after=$A  (+$((A-B)) this arm)"
+                # Written to a file per arm: the summary loop below re-reads these rather than
+                # re-deriving them, so the table cannot silently disagree with the per-arm lines.
+                echo "$((A-B))" > "$OUT/neffs_${MODE}.txt"
+                echo "$rc" > "$OUT/rc_${MODE}.txt"
+                if [ "$rc" != "0" ]; then
+                  echo "  ARM FAILED -- keeping going, a failure here is a real datapoint"
+                  tail -25 "$OUT/compile_${MODE}.log" | sed 's/^/    /'
+                fi
+                echo ""
+                # NEFF cache is deliberately NOT cleared between arms: a later arm that reuses a
+                # cached graph is the realistic case, and the +N delta above still shows what each
+                # mode added.
+                for i in $(seq 1 30); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                sleep 5
+              done
+
+              echo "################ SUMMARY: dispatch count vs wall clock"
+              printf "  %-10s %14s %12s %10s %8s\n" mode median_ms neffs_added max_LSB gate
+              for MODE in none stages halves whole; do
+                L="$OUT/compile_${MODE}.log"
+                [ -f "$L" ] || continue
+                MS=$(grep -oE "steady state: median [0-9.]+ ms" "$L" | head -1 | awk '{print $4}' || true)
+                LSB=$(grep -oE "max_diff +[0-9.]+ LSB" "$L" | head -1 | awk '{print $2}' || true)
+                G=$(grep -oE "\[(PASS|FAIL) vs the shipped bar" "$L" | head -1 | tr -d '[' | awk '{print $1}' || true)
+                N=$(grep -oE "NEFFs before=[0-9]+ after=[0-9]+" "$L" 2>/dev/null | head -1 || true)
+                printf "  %-10s %14s %12s %10s %8s\n" "$MODE" "${MS:--}" "-" "${LSB:--}" "${G:--}"
+              done
+              echo ""
+              echo "  The graph-count line each arm prints is the thing to read next to the median:"
+              grep -h "distinct graph\|graphs to compile\|torch.compile\[" "$OUT"/compile_*.log | sort -u || true
+              echo ""
+
+              ARCHIVE=/tmp/univr_cmp_$(date -u +%Y%m%d_%H%M%S).tar.gz
+              tar -czf "$ARCHIVE" -C /tmp univr_cmp_out
+              mkdir -p /var/mdl/univr_neuron
+              cp "$ARCHIVE" /var/mdl/univr_neuron/
+              echo "Saved: /var/mdl/univr_neuron/$(basename "$ARCHIVE") ($(du -h "$ARCHIVE" | cut -f1))"
+              echo "Done."
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 48
+              memory: 248Gi
+            limits:
+              cpu: 84
+              memory: 248Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_NUM_CORES
+              value: "8"
+            - name: NEURON_RT_VISIBLE_CORES
+              value: "0-7"
+            - name: NEURON_CC_FLAGS
+              value: "--target trn2 --lnc 1 --model-type unet-inference"
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc

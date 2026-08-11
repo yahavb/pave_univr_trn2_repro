@@ -1,0 +1,196 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: univr-profile-model
+  namespace: default
+spec:
+  template:
+    metadata:
+      labels:
+        app: univr-profile-model
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neurons
+          resourceClaimTemplateName: s-lnc1
+      containers:
+        - name: profile
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euo pipefail
+
+              cd /tmp
+              git clone -b main https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
+              cd REPRO
+
+              echo "┌── PROVENANCE ──"
+              echo "│ commit : $(git rev-parse HEAD)"
+              echo "│ subject: $(git log -1 --pretty=%s)"
+              echo "└────────────────"
+
+              # WHY THIS JOB EXISTS
+              # ~/pave-unrolling/RESULTS.md measured, across all 110 NEFFs of a 4K frame:
+              #   "Summed device-active time across ALL 110 NEFFs = 0.82s (vs 16.5s frame =>
+              #    device only ~5% active, 95% is dispatch/idle)"
+              # and concluded: "GpSimd is 46% of only 5% active time. Killing GpSimd saves ~0.4s
+              # of 16.5s. The real lever is batching the 64 dispatches/frame into fewer device
+              # calls."
+              # If that still holds on the current 8-core 2x4 config, then every resample-kernel
+              # optimisation is bounded by ~5% of wall time and the real target is dispatch count.
+              # repro-job.yaml captures NO profiles -- only host wall timers (prep/dev/d2h), which
+              # cannot distinguish device-busy from device-idle inside the forward call. This job
+              # measures it: build every NEFF the model uses, profile each one, sum device-active
+              # time, and compare that sum against the measured wall clock.
+
+              OUT=/tmp/univr_prof_out; mkdir -p "$OUT"
+              POUT="$OUT/perneff"; mkdir -p "$POUT"
+              FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
+              REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
+              GEOM="--height 1728 --width 4096 --tiles 2x4 --halo 128 --bar 3"
+
+              # nki-dyn, not nki: compiles in seconds instead of 80-100 min per tile shape, at
+              # ~1.1-1.3x runtime. The active-vs-wall RATIO is what this job measures, and that
+              # ratio is what RESULTS.md reports; using nki would spend hours compiling to move a
+              # number this job is not reading. Stage 2 records the matching wall clock so the
+              # ratio is computed against the SAME arm, not against a figure from another run.
+              echo "=== [1/3] RUN THE MODEL, 8 tiles / 8 cores, warp=nki-dyn, 3 iters ==="
+              python -u repro_unrolling_trn2.py $FRAMES $REF $GEOM \
+                  --device neuron --cores 8 --warp nki-dyn --dtype fp32 --iters 3 \
+                  2>&1 | tee "$OUT/1_model_run.log"
+              echo ""
+
+              WALL=$(grep -oE "steady state: median [0-9.]+ ms" "$OUT/1_model_run.log" \
+                     | head -1 | awk '{print $4}' || true)
+              echo "  measured wall clock per frame: ${WALL:-UNKNOWN} ms"
+              echo ""
+
+              echo "=== [2/3] PROFILE EVERY CACHED NEFF ==="
+              mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)
+              echo "  ${#NEFFS[@]} NEFFs to profile"
+              ok=0; fail=0
+              for f in "${NEFFS[@]}"; do
+                hash=$(basename "$f" .neff)
+                ntff="$POUT/$hash.ntff"; json="$POUT/$hash.json"
+                timeout 1200 neuron-profile capture --single-io -n "$f" -s "$ntff" \
+                    >"$POUT/$hash.cap.log" 2>&1 || true
+                if [ ! -s "$ntff" ]; then fail=$((fail+1)); continue; fi
+                timeout 600 neuron-profile view -n "$f" -s "$ntff" \
+                    --output-format summary-json > "$json" 2>/dev/null || true
+                if [ ! -s "$json" ]; then fail=$((fail+1)); continue; fi
+                ok=$((ok+1))
+                rm -f "$ntff"        # NTFFs are hundreds of MB each; the JSON carries the numbers
+              done
+              echo "  profiled OK $ok, failed $fail"
+              echo ""
+
+              echo "=== [3/3] SUM DEVICE-ACTIVE TIME vs WALL CLOCK ==="
+              python3 - "$POUT" "${WALL:-0}" <<'PY' 2>&1 | tee "$OUT/3_active_vs_wall.txt"
+              import glob, json, sys
+              d, wall = sys.argv[1], float(sys.argv[2])
+              eng = ["gpsimd_engine", "vector_engine", "scalar_engine", "tensor_engine",
+                     "sync_engine", "static_dma", "software_dynamic_dma", "hardware_dynamic_dma"]
+              tot = 0.0
+              acc = {e: 0.0 for e in eng}
+              n = 0
+              per = []
+              for p in sorted(glob.glob(d + "/*.json")):
+                  try:
+                      s = json.load(open(p))
+                  except Exception:
+                      continue
+                  s = s[list(s)[0]]
+                  t = s.get("total_active_time", 0.0)
+                  tot += t
+                  n += 1
+                  per.append((t, p.split("/")[-1][:12],
+                              s.get("gpsimd_engine_active_time_percent", 0.0)))
+                  for e in eng:
+                      acc[e] += s.get(e + "_active_time", 0.0)
+              print("NEFFs summed              %d" % n)
+              print("device-active total       %.4f s" % tot)
+              if wall > 0:
+                  # One frame is 2 timestamps x 8 tiles, and every NEFF is executed at least once
+                  # per frame, so the NEFF sum is the per-frame device-active work.
+                  print("measured wall per frame   %.4f s" % (wall / 1000.0))
+                  print("DEVICE ACTIVE SHARE       %.1f%%  -> dispatch/idle %.1f%%"
+                        % (100.0 * tot / (wall / 1000.0), 100.0 - 100.0 * tot / (wall / 1000.0)))
+                  print()
+                  print("RESULTS.md measured 0.82 s active vs a 16.5 s frame = ~5%% active,")
+                  print("95%% dispatch-idle, on the OLD 32-tile single-core config. If the share")
+                  print("above is also small, resample-kernel work is bounded by that share and")
+                  print("the lever is dispatch count, not descriptors.")
+              print()
+              print("per-engine active time, summed over all NEFFs:")
+              for e in sorted(acc, key=lambda k: -acc[k]):
+                  print("  %-24s %9.4f s  %6.1f%% of active"
+                        % (e, acc[e], 100.0 * acc[e] / tot if tot else 0.0))
+              print()
+              print("10 costliest NEFFs:")
+              for t, h, g in sorted(per, reverse=True)[:10]:
+                  print("  %-14s %9.6f s  gpsimd %5.1f%%" % (h, t, g))
+              PY
+              echo ""
+
+              ARCHIVE=/tmp/univr_prof_$(date -u +%Y%m%d_%H%M%S).tar.gz
+              tar -czf "$ARCHIVE" -C /tmp univr_prof_out
+              mkdir -p /var/mdl/univr_neuron
+              cp "$ARCHIVE" /var/mdl/univr_neuron/
+              echo "Saved: /var/mdl/univr_neuron/$(basename "$ARCHIVE") ($(du -h "$ARCHIVE" | cut -f1))"
+              echo "Done."
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 48
+              memory: 248Gi
+            limits:
+              cpu: 84
+              memory: 248Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_NUM_CORES
+              value: "8"
+            - name: NEURON_RT_VISIBLE_CORES
+              value: "0-7"
+            - name: NEURON_CC_FLAGS
+              value: "--target trn2 --lnc 1 --model-type unet-inference"
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
