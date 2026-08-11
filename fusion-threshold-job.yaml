@@ -93,34 +93,36 @@ spec:
               # known-DMA-working point, so if it ALSO reports NCC_EBVF030 the instruction ceiling
               # is tile-independent and whole-forward fusion is closed for this compiler.
               # Override with ARMS to re-test anything.
-              ARMS="${ARMS:-4x8}"
+              # 4x8 FUSES. The flag sweep settled which flags matter, so this run sweeps
+              # GEOMETRY instead, largest tile first -- a larger tile means less halo re-read,
+              # less total pixel work, and fewer distinct padded shapes.
+              #
+              #   arm  padded    tile px   tiles  total px  shapes  earlier result
+              #   2x4  992x1280  1,269,760    8    1.00x      2     EBIR033 in=17,776,640
+              #   3x4  576x1280    737,280   12    1.06x      4     EBIR033 in=12,615,680
+              #   2x8  992x768     761,856   16    1.20x      2     EBVF030 6,013,317 instr
+              #   4x8  576x768     442,368   32    1.39x      4     FUSES  <- confirmed
+              #
+              # Every one of those failures was measured WITH "--target trn2" on a trn3-dev1 node.
+              # Dropping --target is what made 4x8 compile, so those results are all suspect and
+              # worth one retest each under the flagset that works.
+              #
+              # 2x8 is the priority: it is a LARGER tile than 4x8 (992x768 vs 576x768), does
+              # 1.20x the pixel work instead of 1.39x, and keeps only 2 distinct padded shapes
+              # instead of 4 -- so it is strictly better than 4x8 on every axis if it fuses.
+              # 3x4 and 2x4 are larger still; 2x4 is the production 8-tile geometry at 1.00x, and
+              # fusing that would be the ideal outcome.
+              #
+              # ONE FLAGSET, the one proven to fuse. -O1 is EXCLUDED: it is what produced the
+              # in=4 / I-3276 rejection, confirmed because in=4 appeared in both -O1 arms and in
+              # neither non-O1 arm, including trn2_O1 -- so -O1 caused it and --target did not.
+              # baseline uses the backend's default optlevel, which already fuses at 4x8.
+              ARMS="${ARMS:-2x8 3x4 2x4}"
               echo "arms this run: $ARMS"
               echo "NEURON_CC_FLAGS from env: ${NEURON_CC_FLAGS:-<unset>}"
 
-              # FLAG SWEEP on a FIXED geometry, because the last 4x8 run changed TWO things at
-              # once (dropped --target trn2, added -O1) and produced a failure unlike any other:
-              #
-              #   2x4  992x1280  EBIR033  in=17,776,640   I-21406   <- px*14
-              #   3x4  576x1280  EBIR033  in=12,615,680   I-21405   <- px*14
-              #   2x8  992x768   EBVF030  6,013,317 instr           <- cleared DMA entirely
-              #   4x8  576x768   EBIR033  in=4            I-3276    <- fits NOTHING
-              #
-              # in=4 against out=128, on a different failing instruction, is not the px*14 wall
-              # at a smaller size -- it is a distinct defect, and it is uninterpretable while two
-              # variables moved together. This sweep pins it: same tile, one flag combination per
-              # arm, so the cause is attributable.
-              #
-              # -O1 is the substantive lever. The 2x8 wall is an instruction COUNT (6,013,317 vs a
-              # 5,000,000 cap, a 17% gap) and the origin repo's scripts/neuron/run_unet_optlevel.sh
-              # records "the backend runs at --optlevel 2 by default". Optlevel governs unrolling
-              # and fusion, hence instruction count and compiler memory. -O3 is included because
-              # more aggressive fusion can REDUCE instruction count as easily as inflate it, and
-              # that is cheaper to measure than to argue about.
               BASE="--lnc 1 --model-type unet-inference"
-              FLAGSETS="${FLAGSETS:-baseline|$BASE
-              O1|$BASE -O1
-              O3|$BASE -O3
-              trn2_O1|--target trn2 $BASE -O1}"
+              FLAGSETS="${FLAGSETS:-baseline|$BASE}"
 
               OUT_ROOT=/tmp/univr_ft_out; mkdir -p "$OUT_ROOT"
 
@@ -174,12 +176,15 @@ spec:
                done
               done
 
-              echo "################ FLAG SWEEP RESULT"
-              echo "  reference points from earlier runs, all with '--target trn2 --lnc 1' default optlevel:"
-              echo "    2x4 992x1280 EBIR033 in=17,776,640 (I-21406)  <- px*14"
-              echo "    3x4 576x1280 EBIR033 in=12,615,680 (I-21405)  <- px*14"
-              echo "    2x8 992x768  EBVF030 6,013,317 instr vs 5,000,000 cap  <- cleared DMA"
-              echo "    4x8 576x768  EBIR033 in=4 (I-3276)            <- fits no pattern"
+              echo "################ GEOMETRY SWEEP RESULT (flagset: proven-to-fuse baseline)"
+              echo "  CONFIRMED: 4x8 576x768 FUSES, 1 graph over the whole forward, fullgraph=True."
+              echo "  -O1 was the cause of the earlier in=4 / I-3276 rejection, not the geometry."
+              echo "  Earlier failures below were all measured WITH --target trn2, so they are the"
+              echo "  ones being retested here:"
+              echo "    2x4 992x1280 1.00x px, 2 shapes -- was EBIR033 in=17,776,640"
+              echo "    3x4 576x1280 1.06x px, 4 shapes -- was EBIR033 in=12,615,680"
+              echo "    2x8 992x768  1.20x px, 2 shapes -- was EBVF030 6,013,317 instr"
+              echo "    4x8 576x768  1.39x px, 4 shapes -- FUSES"
               echo ""
               printf "  %-16s %-12s %11s %11s %5s %s\n" arm padded dma_in instr rc verdict
               for f in "$OUT"/whole_*.log; do
@@ -198,14 +203,20 @@ spec:
                   "$TAG" "${PAD:--}" "${IN:--}" "${NI:--}" "$rc" "$V"
               done
               echo ""
-              echo "  HOW TO READ IT:"
-              echo "  * any row FUSES        -> that flagset is the answer; time it next."
-              echo "  * O1/O3 rows show a LOWER instr count than 6,013,317 -> optlevel is a real"
-              echo "    lever and a tile between 2x8 and this one may clear the 5,000,000 cap."
-              echo "  * baseline reproduces in=4 but trn2_O1 does not (or vice versa) -> the in=4"
-              echo "    defect is caused by the FLAG, not by the 4x8 geometry, and 4x8 is still live."
-              echo "  * every row REJECTED with instr stuck near 6M -> optlevel does not move the"
-              echo "    count, and whole-forward fusion is closed for this compiler at any geometry."
+              echo "  HOW TO READ IT: take the LARGEST tile that FUSES -- that is the one with the"
+              echo "  least halo re-read and the fewest distinct shapes. Preference order is"
+              echo "  2x4 > 3x4 > 2x8 > 4x8. 4x8 already fuses, so it is the floor, not the answer."
+              echo ""
+              echo "  * 2x4 FUSES  -> best case. Production 8-tile geometry, 1.00x pixel work,"
+              echo "                  2 shapes. Nothing further to search."
+              echo "  * 2x8 FUSES  -> strictly better than 4x8: larger tile, 1.20x vs 1.39x pixel"
+              echo "                  work, 2 shapes vs 4. Use it."
+              echo "  * all reject -> 4x8 stands as the only fusing geometry and is what gets timed."
+              echo ""
+              echo "  NOTHING HERE IS A LATENCY RESULT. --iters 0 and --only-tile 1: this compiles"
+              echo "  one tile on one core and stops. Whether a fused tile actually beats the eager"
+              echo "  8-tile run needs a timed 8-core run WITH an accuracy score -- a fused graph"
+              echo "  that is fast and wrong is worth nothing."
               echo ""
 
               ARCHIVE=/tmp/univr_ft_$(date -u +%Y%m%d_%H%M%S).tar.gz
