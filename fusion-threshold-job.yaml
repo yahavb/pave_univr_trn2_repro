@@ -113,16 +113,60 @@ spec:
               # 3x4 and 2x4 are larger still; 2x4 is the production 8-tile geometry at 1.00x, and
               # fusing that would be the ideal outcome.
               #
-              # ONE FLAGSET, the one proven to fuse. -O1 is EXCLUDED: it is what produced the
-              # in=4 / I-3276 rejection, confirmed because in=4 appeared in both -O1 arms and in
-              # neither non-O1 arm, including trn2_O1 -- so -O1 caused it and --target did not.
-              # baseline uses the backend's default optlevel, which already fuses at 4x8.
-              ARMS="${ARMS:-2x8 3x4 2x4}"
+              # ============================================================================
+              # THIS RUN: can 2x8 be rescued, and is there a geometry better than 4x8?
+              # ============================================================================
+              # 2x8 missed by 19.8%: 5,988,611 instructions against a 5,000,000 cap. Two
+              # measured points give instructions/pixel of the MAX padded shape:
+              #     2x8  992x768 = 761,856 px -> 5,988,611 instr = 7.861 instr/px
+              #     4x8  576x768 = 442,368 px -> FUSES, so < 5,000,000
+              # 7.861 instr/px predicts 4x8's largest shape (704x768) at 4.25M, consistent with
+              # fusing. Pixel budget for the cap is therefore ~636,000 px. That is a RANKING
+              # model fitted to one point, not a prediction -- the graph also holds fixed
+              # conv/U-Net work, so treat the estimates as ordering only.
+              #
+              # THREE PROBES, in the order requested:
+              #
+              # (1) -O3 on 2x8. Untested. -O1 is excluded for good reason -- it produced the
+              #     in=4 / I-3276 rejection, confirmed because in=4 appeared in BOTH -O1 arms
+              #     and NEITHER non-O1 arm including trn2_O1, so -O1 caused it and --target did
+              #     not. -O3 fuses more aggressively, which can cut instruction count as easily
+              #     as inflate it. If it cuts 20%, 2x8 fuses and is the answer.
+              #
+              # (2) Geometries between 4x8 and the budget. Padded shapes here are computed with
+              #     the script's OWN tiling math (vh=ceil(H/ny), halo 128, TILE_ALIGN 32), not
+              #     guessed, and ranked by TOTAL pixel work -- what actually costs time -- rather
+              #     than by tile size. Total pixel work relative to the 2x4 production geometry:
+              #       3x9  27 tiles  max 832x736  est 4.81M  6 shapes  1.47x
+              #       2x12 24 tiles  max 992x640  est 4.99M  3 shapes  1.49x
+              #       3x10 30 tiles  max 832x704  est 4.60M  6 shapes  1.55x
+              #       4x8  32 tiles  max 704x768  est 4.25M  4 shapes  1.56x  <- current best
+              #       2x16 32 tiles  max 992x512  est 3.99M  2 shapes  1.63x
+              #     3x9 and 2x12 beat 4x8 on total pixel work. 2x16 keeps only 2 distinct
+              #     shapes, the fewest of any candidate, which matters because the NEFF count
+              #     scales with distinct SHAPES, not tile count.
+              #
+              # (3) bf16 on 2x8, LAST and conditional. Halving element size may cut generated
+              #     instructions. It fails the quality gate at 23.31 dB per STATE.md, so it is
+              #     run here purely as a compile-feasibility probe: if bf16 2x8 fuses and fp32
+              #     does not, the limit is size-driven and that is worth knowing even though
+              #     bf16 is not shippable at this accuracy.
+              #
+              # CORRECTION carried forward: earlier comments in this file quoted 4x8 as 1.39x
+              # pixel work and 2x8 as 1.20x. Those came from a wrong padded-shape table. Recomputed
+              # from the real tiling code, 4x8 is 1.56x. The 4x8 shape list is also
+              # 576x640/576x768/704x640/704x768 -- FOUR shapes, and --only-tile 1 compiled only
+              # 576x768, so "4x8 FUSES" is established for one shape of four. A full 8-core run
+              # must compile all four, the largest being 704x768 at an estimated 4.25M.
+              ARMS="${ARMS:-2x8 3x9 2x12 2x16}"
               echo "arms this run: $ARMS"
               echo "NEURON_CC_FLAGS from env: ${NEURON_CC_FLAGS:-<unset>}"
 
               BASE="--lnc 1 --model-type unet-inference"
-              FLAGSETS="${FLAGSETS:-baseline|$BASE}"
+              # dtype is per-flagset so probe (3) rides the same loop. Field 3 is the --dtype value.
+              FLAGSETS="${FLAGSETS:-baseline|$BASE|fp32
+              O3|$BASE -O3|fp32
+              bf16|$BASE|bf16}"
 
               OUT_ROOT=/tmp/univr_ft_out; mkdir -p "$OUT_ROOT"
 
@@ -134,12 +178,31 @@ spec:
               # cached graph from a previous flagset cannot mask a compile failure in this one --
               # the whole point is which flags compile.
               for G in $ARMS; do
-               echo "$FLAGSETS" | while IFS='|' read -r FSNAME FSFLAGS; do
+               echo "$FLAGSETS" | while IFS='|' read -r FSNAME FSFLAGS FSDTYPE; do
                 FSNAME=$(echo "$FSNAME" | xargs); FSFLAGS=$(echo "$FSFLAGS" | xargs)
+                FSDTYPE=$(echo "${FSDTYPE:-fp32}" | xargs)
                 [ -z "$FSNAME" ] && continue
+                # bf16 is probe (3) and only earns device time where fp32 has already failed:
+                # its purpose is to show whether the limit is size-driven, which is only a
+                # question for a geometry that did not fuse in fp32. Skip it elsewhere.
+                if [ "$FSNAME" = "bf16" ] && [ "$G" != "2x8" ]; then
+                  echo "  (skip bf16 on $G -- only probed on 2x8, the near-miss)"; continue
+                fi
                 TAG="${G}_${FSNAME}"
+                # --only-tile must hit the LARGEST padded shape, because that is the binding
+                # constraint -- instruction count and the DMA operand both scale with tile pixels,
+                # so a smaller shape can fuse while the largest still fails. Tile 1 is NOT always
+                # the largest: verified against the tiling code (which reproduces every logged
+                # shape exactly), tile 1 is largest for 2x8 / 2x12 / 2x16 but tile 10 is largest
+                # for 3x9 and tile 9 for 4x8. This is why "4x8 FUSES" is only established for
+                # 576x768 -- its largest shape, 704x768, was never compiled.
+                case "$G" in
+                  3x9)  T=10 ;;
+                  4x8)  T=9  ;;
+                  *)    T=1  ;;
+                esac
                 echo "================================================================"
-                echo "=== --tiles $G   flags: $FSFLAGS"
+                echo "=== --tiles $G  tile $T (largest shape)  dtype: $FSDTYPE  flags: $FSFLAGS"
                 echo "================================================================"
                 rm -rf /tmp/neff_cache; mkdir -p /tmp/neff_cache
                 set +e
@@ -147,8 +210,8 @@ spec:
                 python -u repro_unrolling_trn2.py \
                     $FRAMES $REF \
                     --height 1728 --width 4096 --tiles "$G" --halo 128 --bar 3 \
-                    --device neuron --cores 1 --only-tile 1 \
-                    --warp gather --dtype fp32 --compile whole --iters 0 \
+                    --device neuron --cores 1 --only-tile "$T" \
+                    --warp gather --dtype "$FSDTYPE" --compile whole --iters 0 \
                     2>&1 | tee "$OUT/whole_${TAG}.log"
                 rc=${PIPESTATUS[0]}
                 set -e
@@ -176,15 +239,13 @@ spec:
                done
               done
 
-              echo "################ GEOMETRY SWEEP RESULT (flagset: proven-to-fuse baseline)"
-              echo "  CONFIRMED: 4x8 576x768 FUSES, 1 graph over the whole forward, fullgraph=True."
-              echo "  -O1 was the cause of the earlier in=4 / I-3276 rejection, not the geometry."
-              echo "  Earlier failures below were all measured WITH --target trn2, so they are the"
-              echo "  ones being retested here:"
-              echo "    2x4 992x1280 1.00x px, 2 shapes -- was EBIR033 in=17,776,640"
-              echo "    3x4 576x1280 1.06x px, 4 shapes -- was EBIR033 in=12,615,680"
-              echo "    2x8 992x768  1.20x px, 2 shapes -- was EBVF030 6,013,317 instr"
-              echo "    4x8 576x768  1.39x px, 4 shapes -- FUSES"
+              echo "################ RESULT: can 2x8 be rescued, and is anything better than 4x8?"
+              echo "  BASELINE OF RECORD, all fp32 default optlevel:"
+              echo "    4x8  max 704x768  1.56x total px  4 shapes -- FUSES (576x768 shape tested)"
+              echo "    2x8  max 992x768  1.28x total px  2 shapes -- 5,988,611 instr vs 5,000,000"
+              echo "    3x4  704x1280                             -- EBIR033 in=12,615,680"
+              echo "    2x4  992x1280     1.00x            2 shapes -- EBIR033 in=17,776,640"
+              echo "  Estimates below use 7.861 instr/px fitted to the 2x8 point; ranking only."
               echo ""
               printf "  %-16s %-12s %11s %11s %5s %s\n" arm padded dma_in instr rc verdict
               for f in "$OUT"/whole_*.log; do
@@ -203,15 +264,23 @@ spec:
                   "$TAG" "${PAD:--}" "${IN:--}" "${NI:--}" "$rc" "$V"
               done
               echo ""
-              echo "  HOW TO READ IT: take the LARGEST tile that FUSES -- that is the one with the"
-              echo "  least halo re-read and the fewest distinct shapes. Preference order is"
-              echo "  2x4 > 3x4 > 2x8 > 4x8. 4x8 already fuses, so it is the floor, not the answer."
+              echo "  HOW TO READ IT: pick the FUSING row with the LOWEST total pixel work, since"
+              echo "  that is what costs time. Tile size alone is not the criterion -- 4x8 is 1.56x"
+              echo "  and 3x9 is 1.47x despite 3x9 having smaller tiles, because halo re-read"
+              echo "  depends on the whole grid. Total px vs the 2x4 production geometry:"
+              echo "    3x9 1.47x | 2x12 1.49x | 3x10 1.55x | 4x8 1.56x | 2x16 1.63x | 2x8 1.28x"
               echo ""
-              echo "  * 2x4 FUSES  -> best case. Production 8-tile geometry, 1.00x pixel work,"
-              echo "                  2 shapes. Nothing further to search."
-              echo "  * 2x8 FUSES  -> strictly better than 4x8: larger tile, 1.20x vs 1.39x pixel"
-              echo "                  work, 2 shapes vs 4. Use it."
-              echo "  * all reject -> 4x8 stands as the only fusing geometry and is what gets timed."
+              echo "  * 2x8_O3 FUSES     -> best outcome. 1.28x px and only 2 distinct shapes,"
+              echo "                        the fewest of any candidate. Adopt -O3 and use 2x8."
+              echo "  * 2x8_O3 instr FALLS but still >5M -> optlevel is a real lever; the gap is"
+              echo "                        19.8%, so report the number, it decides whether any"
+              echo "                        further optlevel or graph-splitting work is worthwhile."
+              echo "  * 3x9 or 2x12 FUSES -> beats 4x8 on total pixel work. Use the lower one."
+              echo "  * 2x16 FUSES        -> 1.63x px but only 2 shapes, so the fewest NEFFs of any"
+              echo "                        fusing option. Worth timing against 4x8 despite more px."
+              echo "  * only bf16 FUSES   -> the limit is SIZE-driven, not structural. Not shippable"
+              echo "                        at 23.31 dB, but it says a narrower fp32 path could work."
+              echo "  * all reject        -> 4x8 stands, and it is the geometry to time."
               echo ""
               echo "  NOTHING HERE IS A LATENCY RESULT. --iters 0 and --only-tile 1: this compiles"
               echo "  one tile on one core and stops. Whether a fused tile actually beats the eager"
