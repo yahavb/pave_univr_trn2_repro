@@ -192,6 +192,7 @@ exist to settle it: `sum(convs) + sum(warps)` vs the wall.
 | `fused-4x8-timing-job.yaml` | superseded by halo64; it timed halo-128 4x8 which cannot fuse |
 | `AB_RUN.md` | the shiftwarp A/B protocol |
 | `SINGLE_GRAPH_NCC_EBIR033.md` | the fusion walls, and the per-tile clarification |
+| `TILING_AND_GRAPH.md` | **read this first.** The tiling algorithm, halo, halo quantisation, the full op graph, graph-count-follows-shapes, and why the operand is `px x 14` |
 
 ## Next
 
