@@ -1,0 +1,229 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: univr-bigtile-noflag
+  namespace: default
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: univr-bigtile-noflag
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neurons
+          resourceClaimTemplateName: s-lnc1
+      containers:
+        - name: repro
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euo pipefail
+
+              cd /tmp
+              git clone -b main https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
+              cd REPRO
+
+              echo "┌── PROVENANCE ──"
+              echo "│ commit : $(git rev-parse HEAD)"
+              echo "│ subject: $(git log -1 --pretty=%s)"
+              echo "└────────────────"
+              echo "neuronx-cc: $(neuronx-cc --version 2>&1 | head -1 || true)"
+              echo "NEURON_CC_FLAGS: ${NEURON_CC_FLAGS:-<unset>}"
+              echo ""
+
+              # ============================================================================
+              # LARGEST TILES, WITHOUT --model-type unet-inference
+              # ============================================================================
+              # MEASURED: dropping --model-type made a rejecting shape compile. Same tile, same
+              # geometry, same fullgraph=True, one flag apart:
+              #     --lnc 1 --model-type unet-inference   4x8 h64 tile 0 (512x576)  in=23,040 REJECT
+              #     --lnc 1                               4x8 h64 tile 0 (512x576)  FUSES
+              # Confirmed in the log: "1 graph over the whole forward", padded 512x576, ran to
+              # "forward complete". That flag was inherited from ~/pave-unrolling, never varied
+              # there either, and carried unquestioned into every run in this repo -- including all
+              # the geometry and halo sweeps. So those sweeps were varying tile shape while the
+              # actual cause sat in the flags, which is why the operand values looked incoherent.
+              #
+              # THEREFORE EVERY GEOMETRY REJECTION ON RECORD IS SUSPECT. All of them were measured
+              # with the flag. Re-testing the LARGEST tiles first, because larger tiles mean fewer
+              # tiles, less halo re-read, and fewer distinct shapes to compile:
+              #
+              #   grid  tiles halo  largest    maxpx     totpx  shapes  prior verdict WITH flag
+              #   2x4     8    64   928x1152  1,069,056  0.86x    2     NEVER TESTED
+              #   3x4    12    64   704x1152    811,008  0.92x    4     never tested at h64
+              #   2x8    16    64   928x640     593,920  0.96x    2     OOM x3 at 600/1000/1500Gi
+              #   2x4     8   128   992x1280  1,269,760  1.00x    2     in=17,776,640
+              #   4x8    32    64   576x640     368,640  1.13x    4     3 of 4 fuse, 4th now fuses
+              #
+              # 2x4 halo 64 is the standout and has never been run: 0.86x the total pixel work of
+              # the production 2x4 halo 128 baseline -- LESS work, not more -- with only 2 distinct
+              # shapes, so the fewest graphs of any candidate. Ordered largest-tile-first so the
+              # first success is the best available configuration.
+              #
+              # ALL SHAPES, NOT ONE TILE. A frame needs every distinct padded shape to compile;
+              # tiles of a rejected shape have no graph, their pixels are never written, and the run
+              # dies (observed rc=139). Testing one tile and generalising produced a false
+              # "4x8 FUSES" verdict that stood for several runs. Tile indices below are one per
+              # distinct shape, taken from plan_tiles directly.
+              #
+              # Compile-only. Steady-state latency is the critical path and compile is a one-off
+              # that the NEFF cache absorbs, so this job spends its time establishing WHICH
+              # configuration is viable and leaves timing to a follow-up that runs 8 cores with
+              # accuracy scored.
+
+              OUT=/tmp/univr_bt_out; mkdir -p "$OUT"
+              FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
+              REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
+
+              # grid:halo:tile,tile,...  -- one tile per distinct padded shape, from the planner.
+              # DEFAULT IS THE TWO BEST CANDIDATES ONLY, 4 compiles. A single fused compile took
+              # 118 minutes in the flag sweep, so a 14-compile sweep would run for over a day and
+              # most of it on configs that only matter if the first two fail. 2x4 h64 is the
+              # standout (0.86x pixel work, 2 shapes, never tested) and 2x4 h128 is the production
+              # geometry itself. Override CONFIGS to reach the rest:
+              #   3x4:64:0,1,4,5   0.92x, 4 shapes
+              #   2x8:64:0,1       0.96x, 2 shapes, previously OOM x3
+              #   4x8:64:0,1,8,9   1.13x, 4 shapes, 3 already fuse and the 4th now fuses
+              CONFIGS="${CONFIGS:-2x4:64:0,1 2x4:128:0,1}"
+              echo "configs (largest tile first): $CONFIGS"
+              echo ""
+
+              for C in $CONFIGS; do
+                GRID=$(echo "$C" | cut -d: -f1); HL=$(echo "$C" | cut -d: -f2)
+                TILES=$(echo "$C" | cut -d: -f3 | tr ',' ' ')
+                ALL=1; SHAPES=""
+                echo "================================================================"
+                echo "=== $GRID halo $HL   shapes at tiles: $TILES"
+                echo "================================================================"
+                for T in $TILES; do
+                  TAG="${GRID}_h${HL}_t${T}"
+                  rm -rf /tmp/neff_cache; mkdir -p /tmp/neff_cache
+                  set +e
+                  NEURON_CC_FLAGS="--lnc 1" NEURON_LAUNCH_BLOCKING=1 \
+                  python -u repro_unrolling_trn2.py \
+                      $FRAMES $REF \
+                      --height 1728 --width 4096 --tiles "$GRID" --halo "$HL" --bar 3 \
+                      --device neuron --cores 1 --only-tile "$T" \
+                      --warp gather --dtype fp32 --iters 0 \
+                      2>&1 | tee "$OUT/${TAG}.log"
+                  rc=${PIPESTATUS[0]}
+                  set -e
+                  echo "$rc" > "$OUT/rc_${TAG}.txt"
+                  SH=$(grep -aoE "padded [0-9]+x[0-9]+" "$OUT/${TAG}.log" | head -1 | awk '{print $2}' || true)
+                  echo "$SH" > "$OUT/sh_${TAG}.txt"
+                  if [ "$rc" = "0" ]; then
+                    echo "  tile $T  $SH  FUSES"
+                  else
+                    ALL=0
+                    echo "  tile $T  $SH  REJECTED"
+                    grep -aoE "got in=[0-9]+ and out=[0-9]+|Instructions generated by compiler [0-9]+ exceeds the typical limit of [0-9]+" \
+                      "$OUT/${TAG}.log" | head -2 | sed 's/^/      /'
+                  fi
+                  for i in $(seq 1 60); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                  sleep 5
+                done
+                echo "$ALL" > "$OUT/all_${GRID}_h${HL}.txt"
+                echo "  ==> $GRID halo $HL : ALL SHAPES FUSE = $ALL"
+                echo ""
+              done
+
+              echo "################ WHICH GEOMETRY IS FULLY FUSABLE (NEURON_CC_FLAGS=--lnc 1)"
+              printf "  %-16s %-10s %5s %s\n" arm padded rc verdict
+              for f in "$OUT"/*_h*_t*.log; do
+                [ -f "$f" ] || continue
+                TAG=$(basename "$f" .log)
+                rc=$(cat "$OUT/rc_${TAG}.txt" 2>/dev/null || echo '?')
+                SH=$(cat "$OUT/sh_${TAG}.txt" 2>/dev/null || echo '-')
+                IN=$(grep -aoE "got in=[0-9]+" "$f" | head -1 | cut -d= -f2 || true)
+                V=$([ "$rc" = "0" ] && echo FUSES || echo "REJ${IN:+ in=$IN}")
+                printf "  %-16s %-10s %5s %s\n" "$TAG" "$SH" "$rc" "$V"
+              done
+              echo ""
+              echo "  COMPLETE CONFIGS (1 = every shape fused; only these can run a frame):"
+              for f in "$OUT"/all_*.txt; do
+                [ -f "$f" ] || continue
+                B=$(basename "$f" .txt); B=${B#all_}
+                echo "    $B = $(cat "$f")"
+              done
+              echo ""
+              echo "  HOW TO READ IT:"
+              echo "  * the FIRST complete config in this ordering is the best one -- they are"
+              echo "    ordered by ascending total pixel work, so 2x4 h64 (0.86x) beats 2x8 h64"
+              echo "    (0.96x) beats 2x4 h128 (1.00x) beats 4x8 h64 (1.13x)."
+              echo "  * 2x4 halo 64 complete -> 8 tiles, 2 shapes, LESS pixel work than the"
+              echo "    production baseline. Nothing further to search; go straight to timing."
+              echo "  * 2x4 h128 complete -> the production geometry itself fuses, and the whole"
+              echo "    halo question was an artefact of the flag."
+              echo "  * a config that rejects with the SAME in= as it did with the flag -> that"
+              echo "    rejection is real and independent of --model-type."
+              echo "  * 2x8 rejects or OOMs again -> its failure was never about the flag."
+              echo ""
+              echo "  Next step for any complete config: populate the NEFF cache once, then run"
+              echo "  8 cores with --iters 3 and read the steady-state median plus the accuracy gate."
+              echo "  Compile time is a one-off and is NOT the critical path."
+              echo ""
+
+              ARCHIVE=/tmp/univr_bt_$(date -u +%Y%m%d_%H%M%S).tar.gz
+              tar -czf "$ARCHIVE" -C /tmp univr_bt_out
+              mkdir -p /var/mdl/univr_neuron
+              cp "$ARCHIVE" /var/mdl/univr_neuron/
+              echo "Saved: /var/mdl/univr_neuron/$(basename "$ARCHIVE") ($(du -h "$ARCHIVE" | cut -f1))"
+              echo "Done."
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 48
+              memory: 248Gi
+            limits:
+              cpu: 150
+              memory: 1500Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_NUM_CORES
+              value: "8"
+            - name: NEURON_RT_VISIBLE_CORES
+              value: "0-7"
+            # Each arm exports NEURON_CC_FLAGS="--lnc 1" itself. Deliberately NOT set here, so
+            # there is no chance of a stale value overriding the point of the experiment.
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
