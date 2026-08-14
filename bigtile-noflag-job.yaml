@@ -13,6 +13,11 @@ spec:
       restartPolicy: Never
       nodeSelector:
         node-type: trn3-dev1
+        # Pinned: the S3 add-on backing the 621547421844-ap-southeast-4-pvc mount only runs on
+        # this node. Elsewhere the pod sits Pending on
+        #   MountVolume.SetUp failed ... DeadlineExceeded
+        # which is what happened on ip-192-168-192-40 (21 mount retries over 74 min).
+        kubernetes.io/hostname: ip-192-168-192-189.us-east-2.compute.internal
       resourceClaims:
         - name: neurons
           resourceClaimTemplateName: s-lnc1
