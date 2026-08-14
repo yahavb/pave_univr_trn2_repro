@@ -1,247 +1,159 @@
 # Session state
 
-Repo: `github.com/yahavb/pave_univr_trn2_repro` (private, `main`), HEAD `a77f4d0`.
-Local: `~/pave_univr_trn2_repro`. Everything below is committed and pushed except
-`profile_hotspots.py`, which is untracked and unused (see Dead ends).
+HEAD `0e161c2`, `main`, pushed. Local `~/pave_univr_trn2_repro`.
+Origin repo for reference only: `~/pave-unrolling`.
 
-Origin repo, for reference only: `~/pave-unrolling`, branch `batch-tile-dispatch`.
+## The goal
 
-## Where this landed
+Cut 4K frame latency on trn3. Best trn2 number on record is **3673.3 ms** (README,
+never reproduced). g6e L40S is 351.1 ms measured, 161 ms with ONNX+TRT.
 
-Two lines of work ran this session. The first is finished and negative; the second is
-open and has one confirmed positive result.
+## Where the time goes — MEASURED, and it is not where the kernel work assumed
 
-1. **NKI resample kernel (`shiftwarp`) — DEAD.** Faster at the op level, wrong in the
-   model. Killed by a measurement, not a guess: real displacement is 29.02 px, the
-   kernel supports R px, and R=30 is unaffordable.
-2. **Graph fusion to cut dispatch count — OPEN.** `4x8` at `--halo 64` **FUSES**
-   (confirmed on the largest tile). No timing or accuracy number yet.
+Per tile-triplet, device-active, from `conv-bench-job.yaml` and the warp sweep:
 
-## The numbers that matter
-
-| | value | source |
+| | ms | share of device-active |
 |---|---|---|
-| trn2 frame, eager 2x4, `--warp nki` | 3673.3 ms / 0.64 LSB PASS | REPRO_README, NOT reproduced |
-| trn2 frame, same command re-run | 4125.5 ms / **81.46 LSB FAIL** | run `kdfn8` |
-| g6e L40S, torch eager fp32 | 351.1 ms | measured by this script |
-| g6e L40S, ONNX+TRT | 161 ms | reported, RESULTS.md calls it the goal |
-| origin repo, 32 tiles bf16 LNC=2 | 12,511 ms | run `8w2dm` |
+| 14 warps | 614.2 | 63.1% |
+| 54 convs | 359.0 | 36.9% |
+| **device-active total** | **973.2** | 100% |
+| **measured frame wall** | **4125** | device is only **23.6%** |
 
-**The baseline does not reproduce.** Same command, 12% slower and accuracy fails at
-81.46 LSB against a bar of 3. Localised to **tile 0** (fails on both `nki` and
-`nki-dyn`; tile 1 passes both), so it is implementation-independent and predates every
-change made this session. **Unexplained, and it blocks every "faster" claim** — there
-is no correct baseline to compare against.
+**~76% of the frame is dispatch and idle.** The resample is 63% of *device* work but
+~15% of *wall*, which is why the NKI kernel's 1.16x op-level win vanished end to end.
+Eager caches **275 NEFFs** per frame; that call count is the dominant cost.
 
-The `60.3 ms` figure in the origin repo's job comment is a **256x384 microbenchmark**,
-not a 4K frame. Not a target.
+Caveat: the 973 ms is a sum of single-op profiles, which may undercount concurrency, so
+23.6% is an upper bound on device utilisation.
 
-## Line 1: the NKI kernel, and why it died
+## Two things blocking everything
 
-`nki_shift_warp.py` + `--warp shiftwarp` in `repro_unrolling_trn2.py`. Both still
-present and selectable; not deleted, because the op-level result is real.
+1. **The baseline does not reproduce.** Same command as the README gives 4125.5 ms and
+   **81.46 LSB against a bar of 3** — localised to tile 0, fails on both `nki` and
+   `nki-dyn`, predates every change this session. In the last three jobs the eager arm
+   also died outright in this image (`KeyError: torch_mlir.dialects.builtin`). **No
+   correct baseline exists, so no speed claim can be checked.**
+2. **Whole-forward fusion does not compile at any geometry.**
 
-Op level at the production tile (3x992x1280), from `univr_sweep_20260809_150451`:
+## Fusion: what was tried and what the error actually means
 
-| arm | active_us | gate | max_LSB |
-|---|---|---|---|
-| gather (baseline) | 49,278 | PASS | 0.0417 |
-| **nkishift R=3** | **42,439** | PASS | 0.0417 |
-| nkishift R=2 | 39,479 | FAIL | 76.19 |
-| shiftmatmul | 160,422 | FAIL | — |
+`--compile whole` = `fullgraph=True` over one tile's forward. Rejected everywhere:
 
-1.16x faster with identical accuracy. Then it failed end-to-end at **5671 ms /
-229.72 LSB**, and `--record-flow` explained exactly why:
-
-* Real displacement across all 112 resample calls in a forward is **29.02 px max**,
-  ranging 0.055 to 29.02 depending on IFBlock and tile.
-* The kernel covers exactly R px and **silently clamps** beyond it. At R=3 the failing
-  calls show >3px fractions of 7.31 / 6.10 / 15.10 / 31.99 percent, and the model
-  measured 7.16% of pixels above 3 LSB. Clamped fraction = wrong-pixel fraction, and
-  p50 = 0.00 because most pixels are inside R.
-* Covering 29 px needs **R=30 = 3,721 terms** against 49 at R=3. Terms go as (2R+1)^2,
-  and R=2 -> R=3 already cost 2,960 us for 24 extra terms. The SBUF band would also
-  need rows+60 partitions against a 128 limit.
-
-**The premise was wrong, not the code.** The design rested on a 2.33 px figure from
-STATE.md that was ONE call at ONE tile, treated as representative without checking.
-
-`--record-flow` is the durable win: any future bounded-neighbourhood idea can be
-checked against real displacement in ~8 s on CPU before a kernel is written.
-
-## Line 2: fusion, and the two compiler walls
-
-Whole-forward `fullgraph=True` is rejected by the backend, and the operand is
-`padded_px x 14` (14 = resamples per forward). Two independent walls:
-
-* `NCC_EBIR033` — DMA access-pattern limit, scales with padded px.
-* `NCC_EBVF030` — "Instructions generated by compiler N exceeds the typical limit of
-  5000000".
-
-Every geometry tested, all at halo 128 unless noted:
-
-| grid | max padded | operand / instr | verdict |
-|---|---|---|---|
-| 2x4 | 992x1280 | in=17,776,640 | EBIR033 |
-| 3x4 | 704x1280 | in=12,615,680 | EBIR033 |
-| 3x9 | 832x736 | in=8,572,928 | EBIR033 |
-| 4x8 | 704x768 | in=7,569,408 | EBIR033 |
-| 2x16 | 992x512 | in=7,110,656 | EBIR033 |
-| 2x8 | 992x768 | 5,988,611 instr | EBVF030 |
-| 2x12 | 992x608 | 5,983,171 instr | EBVF030 |
-| **4x8 halo 64** | **576x640** | in=5,160,960 | **FUSES** |
-
-DMA budget bracket: largest that fused 442,368 px, smallest that failed 507,904 px.
-
-### What is ruled out, so none of it is retried
-
-* **`-O1` breaks compilation.** Produces `in=4` / `I-3276`, a defect unlike any other.
-  Confirmed: `in=4` appeared in both `-O1` arms and neither non-`-O1` arm, including
-  `trn2_O1`, so `-O1` caused it and `--target` did not.
-* **`-O3` does nothing.** 2x8 and 2x12 gave **byte-identical** instruction counts at
-  baseline and `-O3` (5,988,611 and 5,983,171). Optlevel is not a lever.
-* **Instruction count barely tracks tile size.** 2x8 761,856 px -> 5,988,611 and
-  2x12 634,880 px -> 5,983,171: a 17% pixel cut bought 0.09% fewer instructions. It is
-  dominated by fixed conv/U-Net structure.
-* **bf16 cuts it 13.5%** (2x8: 5,180,608) and still misses by 3.6%. The limit is partly
-  size-driven. Not shippable at 23.31 dB.
-* **Smaller halo does not requalify 2x8 or larger.** 2x8 at halo 32 is still 516,096 px,
-  above the 507,904 that failed. Shrinking halo cannot buy the ~2x it needs.
-* **`--target trn2` was wrong on a trn3 node** but removing it changed none of these
-  verdicts; 2x4 and 3x4 reproduced their operands to the digit.
-
-### Halo is the lever, and it is cheaper not dearer
-
-Padded size = valid extent + halo, so halo sets the operand directly. It also IS the
-overlap, so shrinking it cuts total pixel work at the same time:
-
-| 4x8 halo | max shape | px | total px vs 2x4 h128 |
-|---|---|---|---|
-| 128 | 704x768 | 540,672 | 1.56x |
-| 96 | 640x704 | 450,560 | 1.33x |
-| **64** | **576x640** | **368,640** | **1.13x** |
-| 32 | 512x576 | 294,912 | 0.93x |
-
-So the earlier "4x8 costs 1.56x" held only at halo 128. At halo 64 the fused arm has a
-13% penalty to beat, not 56%.
-
-**Why 64 and not 43.28**: `TILE_ALIGN = 32` quantises halo. Halo 44/45/48 all give the
-identical 544x640 shape; 50..64 all give 576x640. Setting 43.28 buys nothing over 48,
-and 64 is the largest halo in its step — maximum margin at zero cost.
-
-**The 43.28 px "requirement" is contested by this repo's own records**: REPRO_README
-says 43.28 px at 4K and 6.29 px at 992x1280; STATE.md said the 43.28 figure does not
-hold for this frame pair and measured 2.33 px; `--record-flow` measured 29.02 px. Three
-values for one quantity, and displacement is not the whole requirement — the conv
-receptive field also reads outside the tile and nobody has quantified it. Halo 64 clears
-the largest figure by ~48%.
-
-## Fusion is PER TILE, never the 4K frame
-
-Documented in `SINGLE_GRAPH_NCC_EBIR033.md`. The frame is never one graph at any tile
-size: `build_replicas()` builds one replica per core and a `ThreadPoolExecutor` runs
-them, so tiles are separate graphs on separate cores. `--compile whole` fuses ONE
-tile's forward. Graph count follows the number of distinct padded SHAPES, not tile
-count — 8 tiles at 2x4 reuse 2 shapes, so ~4 graphs (2 shapes x 2 triplet timestamps).
-
-The prize: an eager run caches **275 NEFFs**; fused would be ~4-8.
-
-## The op inventory, and a 4.2x contradiction
-
-One tile-forward, verified against the checkpoint (54 four-dim weight tensors,
-excluding 11 training-only `block_tea`; channel counts match including
-ConvTranspose2d's transposed layout):
-
-* **14 warps** — 6 at C=3 full-res (pyramid), 8 in Contextnet at C=16/32/64/128
-* **54 convs/deconvs** — 3 IFBlocks (conv0 x2 + convblock x8 + ConvTranspose2d, c =
-  240/150/90), Contextnet 4 levels x2, Unet 4 down + 4 up + final
-* ~14 `interpolate`, 3 `sigmoid`, blend, clamp
-* **188.35 GMAC per forward** at 992x1280
-
-**`warp_op_bench.py` measured 14 of ~68 ops — every resample, nothing else.** That
-leaves an unresolved contradiction:
-
-| | value |
+| config | result |
 |---|---|
-| sum of the 14 warp sites (measured active_us) | ~614 ms per tile-triplet |
-| README `--per-block`, resample = 62.1% of forward | ~2562 ms against 4125 ms |
+| 2x4, any halo | `in=17,776,640`. Valid extent alone is 884,736 px |
+| 2x8 | OOM at 600Gi, 1000Gi **and 1500Gi**, on the first arm with nothing else running |
+| 4x8 halo 128 | 3 of 4 shapes fuse, largest (704x768) rejects |
+| 4x8 halo 64 | 3 of 4 fuse, `512x576` rejects `in=23,040` |
+| 4x8 halo 48 | 0 of 3 fuse |
 
-**4.2x apart.** "The resample dominates" — the premise behind every kernel attempt
-here — rests on the larger figure. Suspected cause, unverified: warp numbers are
-`total_active_time` from a device profile (device-BUSY) while `--per-block` uses
-barriered host timers (WALL, eager only). `conv_op_bench.py` + `conv-bench-job.yaml`
-exist to settle it: `sum(convs) + sum(warps)` vs the wall.
+A frame needs **every distinct padded shape** to compile. Border tiles get their halo
+clipped, so a grid has several shapes. 3-of-4 is worth nothing: tiles of the rejected
+shape have no graph, so their pixels are never written and the run dies (`rc=139`).
 
-5.9 TFLOP of conv work per frame in 4125 ms implies ~1.43 TFLOP/s.
+**The error, read correctly:**
+
+```
+Number of elements in dimension 0 of InstDMACopy's input and dimension 0 of
+output AccessPatterns must MATCH, but got in=17776640 and out=128
+```
+
+"Match" means **equal**, not divide. I earlier called this a divisibility problem — that
+was wrong, 7 of the 8 rejecting operands divide 128 exactly. `out=128` is the SBUF
+partition count and is **constant across every rejection** (8 shapes, 3 operand forms).
+The input side is a **flat** pattern that was never tiled to partitions.
+
+**So the fault is in how the backend lowered the fused DMA, not in the tile shape.** That
+retires geometry as a lever and explains why halo sweeping gave incoherent results.
+
+Three operand forms, showing the backend fusing different numbers of resamples per shape:
+
+| form | shapes |
+|---|---|
+| `14 x px` | 992x1280, 704x1280, 832x736, 992x512, 704x768 |
+| `4 x px` | 480x608 |
+| `45 x h` — no width term, exact | 480x576 (21,600), 512x576 (23,040) |
+
+`45 = 5 x 9`, and the IFBlock `lastconv` emits exactly 5 channels
+(`ConvTranspose2d(c, 5, 4, 2, 1)` = flow 4 + mask 1). Plausible origin, unproven.
+
+## Dead — do not retry
+
+* **Geometry / halo sweeps.** Reason above. Two independent pods reproduced the halo-48
+  result byte-identically, so these are deterministic verdicts, not flaky runs.
+* **2x8.** OOM at 1500Gi on its own. Memory does not scale it: 600 -> 1000 -> 1500Gi all
+  died. Its non-OOM failure was the instruction cap, 5,988,611 vs 5,000,000.
+* **`-O1`** — causes a distinct `in=4` / `I-3276` rejection.
+* **`-O3`** — changed the instruction count by **exactly zero** on 2x8 and 2x12.
+* **Shrinking the tile to cut instructions** — 2x8 761,856 px gave 5,988,611 and 2x12
+  634,880 px gave 5,983,171: a 17% pixel cut bought 0.09% fewer instructions. The count
+  is fixed by conv/U-Net structure.
+* **bf16** — cut instructions 13.5% (5,180,608), still 3.6% over the cap, and fails the
+  quality gate at 23.31 dB.
+* **The NKI resample kernel (`shiftwarp`).** 1.16x at the op level with identical
+  accuracy (42,439 vs 49,278 us), then **229.72 LSB** in the model. `--record-flow`
+  measured real displacement at **29.02 px** across all 112 resample calls; the kernel
+  covers R px and silently clamps beyond it. Covering 29 px needs R=30 = 3,721 terms
+  against 49 at R=3. The design rested on a 2.33 px figure that was ONE call at ONE tile.
+  Code is still in the repo and selectable via `--warp shiftwarp`; do not use it.
+
+## Open
+
+* **`ccflag-fusion-job.yaml`** — compiler flags, the only axis never varied. Every run in
+  this repo and in `~/pave-unrolling` used `--model-type unet-inference` and nothing else.
+  Stage 0 dumps `neuronx-cc --help` so real flag names replace guesses; stage 1 sweeps
+  against `4x8 halo 64 tile 0` (`512x576`, `in=23,040`) because the other three shapes at
+  that halo already fuse, so one working flag completes the set.
+* **`prod-4x8-halo64-job.yaml`** — would time and score fused 4x8 halo 64. Currently
+  pointless: its `512x576` shape does not compile.
+* **Partial fusion (`--compile stages` / `halves`)** — not built. Smaller graphs never
+  trigger the 14-resample DMA. Would give ~10-20 graphs instead of 275 eager NEFFs, so
+  most of the dispatch win at much better odds of compiling. **This is the most likely
+  route to an actual number.**
 
 ## Files
 
-| file | what it is |
+| file | what |
 |---|---|
 | `repro_unrolling_trn2.py` | the model. Added `--warp shiftwarp`, `--record-flow`, `--shiftwarp-radius/-max-c` |
-| `nki_shift_warp.py` | the NKI kernel. Compiles and runs; wrong at real displacement |
-| `warp_op_bench.py` | one warp op at one shape. Added `--flow-smooth`, `--radius` |
-| `conv_op_bench.py` | **NEW** the 54 convs, `--list` prints the verified inventory |
+| `TILING_AND_GRAPH.md` | **read first.** Tiling algorithm, halo, quantisation, the full op graph, why the operand is `px x 14` |
+| `SINGLE_GRAPH_NCC_EBIR033.md` | the fusion walls, and that fusion is per TILE not per frame |
+| `METHOD.md` / `REPRO_README.md` | original bundle docs |
+| `warp_op_bench.py` | one warp op at one shape |
+| `conv_op_bench.py` | the 54 convs; `--list` prints the checkpoint-verified inventory |
 | `profile_roofline.py` | reads a `summary.json`, prints per-engine time and MFU |
-| `halo64-fusion-job.yaml` | **the live one.** 4x8/2x8/4x4 at halo 64, then time+score |
-| `conv-bench-job.yaml` | profiles all 54 convs, one NEFF each |
-| `fusion-threshold-job.yaml` | geometry + flag sweeps. History of every verdict above |
-| `single-graph-retest-job.yaml` | the NCC_EBIR033 reproducer |
 | `sweep-job.yaml` | the warp microbench sweep |
-| `repro-job.yaml` | whole model. Reverted to original hardcoded `nki` arms |
-| `fused-4x8-timing-job.yaml` | superseded by halo64; it timed halo-128 4x8 which cannot fuse |
-| `AB_RUN.md` | the shiftwarp A/B protocol |
-| `SINGLE_GRAPH_NCC_EBIR033.md` | the fusion walls, and the per-tile clarification |
-| `TILING_AND_GRAPH.md` | **read this first.** The tiling algorithm, halo, halo quantisation, the full op graph, graph-count-follows-shapes, and why the operand is `px x 14` |
+| `conv-bench-job.yaml` | profiles all 54 convs |
+| `ccflag-fusion-job.yaml` | the open experiment |
+| `prod-4x8-halo64-job.yaml` | fused timing, blocked |
+| `repro-job.yaml` | whole model, original hardcoded `nki` arms |
+| `nki_shift_warp.py` | the dead kernel, kept for the measured op-level result |
 
-## Next
+Deleted this session as dead ends: `profile-model-job.yaml`, `compile-modes-job.yaml`,
+`fused-4x8-timing-job.yaml`, `halo-shapeset-job.yaml`, `halo64-fusion-job.yaml`,
+`fusion-threshold-job.yaml`, `single-graph-retest-job.yaml`, `settle-2x8-job.yaml`,
+`AB_RUN.md`, `profile_hotspots.py`.
 
-1. **`univr-halo64-8cv22` is RUNNING.** 4x8 halo 64 already printed `FUSES` on tile 9
-   (`padded 576x640`). Waiting on 2x8/4x4 compiles, then the timed 8-core arms with
-   accuracy. **Read the accuracy gate first** — halo reduction is a correctness change
-   that fails silently as edge artefacts.
-2. **`conv-bench-job.yaml` has not been applied.** It settles the 4.2x.
-3. **The tile-0 accuracy failure is the real blocker.** 81.46 LSB on the documented
-   baseline config. Until it is explained there is no correct baseline, so no speed
-   result means anything.
+## Traps that cost runs
 
-## Traps that cost runs this session
-
-* **`kubectl apply` uses the YAML on disk; the pod clones the script from git.** A pod
-  can run new code with an old command block. Caught it when `arms this run` echoed a
-  stale arm list while `commit` showed the right SHA. Always grep the config echo lines,
-  not just the commit.
-* **`kubectl set env job/...` does not work.** A Job's `spec.template` is immutable;
-  the API server rejects the patch. `--dry-run=client` does NOT catch it, only
-  `--dry-run=server`. Edit the YAML and re-apply.
-* **`--only-tile 1` is not the largest tile.** Verified against the tiling code: tile 1
-  is largest for 2x8/2x12/2x16 but tile **10** for 3x9 and tile **9** for 4x8. Testing
-  tile 1 produced a false "4x8 FUSES" that stood for several runs. Both limits scale
-  with padded px, so the largest shape is the binding constraint.
-* **Seven pods OOM-killed** compiling fused graphs, at 600Gi and again at 1000Gi. Each
-  had built earlier arms first, so peak was the sum across arms. Run one arm per pod.
-* **The image tag lies.** `native-pytorch:...sdk2.31.0...` contains `neuronx-cc
-  2.26.6360.0` — the same version the original doc recorded. Use
-  `421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest`
-  everywhere; the old one keeps getting reintroduced by copying an existing YAML.
-* **`--per-block` requires `--compile none`.** So the block table is an EAGER
-  measurement and cannot be compared against compiled runs.
-* **`repro-job.yaml` never passes `--compile`**, so it defaults to `none` = eager. The
-  README's 3673.3 ms is an eager number. 275 NEFFs is what eager costs.
-* Never `git add -A` here: `.ntff` files are hundreds of MB and GitHub rejects at 100 MB.
-
-## Dead ends, recorded so they are not rebuilt
-
-* `profile_hotspots.py` (untracked) — per-instruction attribution from parquet. Blocked:
-  no capture in this repo sets `NEURON_RT_ENABLE_DGE_NOTIFICATIONS` or the XLA debug
-  vars, so `DmaPacket` tables are empty and `bir_debug_info_source_location` is NULL.
-  `neuron-explorer` is also absent locally.
-* `profile-model-job.yaml`, `compile-modes-job.yaml` — written, never run. The compile
-  ladder (`stages`/`halves`) was explicitly dropped.
-* The NEFF+NTFF pairs `sweep-job.yaml` saves have **never been read** by anything. No
-  code in the repo opens a `.ntff`; `profile_roofline.py` reads only the JSON. Every
-  profile conclusion here comes from `summary.json` aggregates.
-* Note on those aggregates: per-engine `*_active_time_percent` values **sum to well
-  over 100%** (one arm: gpsimd 87.9 + dma 21.6 + swdge 14.6 + vector 8.7 + hwdge 5.2 +
-  static 2.2). They are overlapping per-engine busy times against a wall denominator,
-  **not a partition of time**. Do not present them as a decomposition.
+* **`kubectl apply` uses the on-disk YAML; the pod clones the script from git.** A pod can
+  run new code with a stale command block. Grep the config echo lines, not just the commit.
+* **`kubectl set env job/...` cannot patch a Job** — `spec.template` is immutable.
+  `--dry-run=client` does NOT catch it; only `--dry-run=server`. Edit the YAML and re-apply.
+* **`backoffLimit` belongs on `Job.spec`**, not `spec.template.spec`, where it is silently
+  ignored.
+* **`--only-tile 1` is not the largest tile.** Tile 10 for 3x9, tile 9 for 4x8. Testing
+  tile 1 produced a false "4x8 FUSES" that stood for several runs.
+* **One arm per pod.** Each arm holds its compiled graph, so peak memory is the sum across
+  arms. A 2x8 arm killed the pod that would otherwise have timed 4x8.
+* **The image tag lies.** `native-pytorch:...sdk2.31.0...` contains `neuronx-cc 2.26.6360.0`.
+  Always use `421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest`.
+* **`--per-block` requires `--compile none`**, so that block table is an EAGER measurement
+  and is not comparable to compiled runs.
+* **`repro-job.yaml` never passes `--compile`**, so it defaults to eager. The README's
+  3673.3 ms is an eager number, and 275 NEFFs is what eager costs.
+* **Per-engine `*_active_time_percent` in `summary.json` sum past 100%** — they are
+  overlapping busy times, not a partition of time. Do not present them as a decomposition.
+* **The saved NEFF+NTFF pairs have never been read** by any code here; `profile_roofline.py`
+  reads only the JSON. Every profile conclusion comes from `summary.json` aggregates.
+* Never `git add -A`: `.ntff` files are hundreds of MB and GitHub rejects at 100 MB.
