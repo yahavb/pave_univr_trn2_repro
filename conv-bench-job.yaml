@@ -4,6 +4,7 @@ metadata:
   name: univr-conv-bench
   namespace: default
 spec:
+  backoffLimit: 1
   template:
     metadata:
       labels:

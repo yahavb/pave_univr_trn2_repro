@@ -4,6 +4,7 @@ metadata:
   name: univr-settle-2x8
   namespace: default
 spec:
+  backoffLimit: 1
   template:
     metadata:
       labels:
