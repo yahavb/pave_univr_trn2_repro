@@ -41,7 +41,7 @@ spec:
               # ============================================================================
               # FIND A WHOLE-GRAPH FUSED CONFIG THAT COMPILES
               # ============================================================================
-              # ONLY --compile whole. That is torch.compile(backend="neuron", dynamic=False,
+              # The script now ALWAYS compiles torch.compile(backend="neuron", dynamic=False,
               # fullgraph=True) applied to the entire model, ONE graph over the whole forward.
               # Verified at repro_unrolling_trn2.py:1414 that a single _CC
               # dict carries fullgraph=True, and at :1441 that `whole` returns
@@ -87,26 +87,24 @@ spec:
               # planner. 2x4 largest is tile 1 (992x1280); 4x8 halo 64 largest is tile 9 (576x640).
               # Testing tile 1 blindly is what produced a false "4x8 FUSES" verdict once already.
               GEOMS="${GEOMS:-2x4:128:1 4x8:64:9}"
-              MODES="${MODES:-whole}"
               WARPS="${WARPS:-gather nki-dyn}"
               echo "geoms: $GEOMS"
-              echo "mode: $MODES   torch.compile(backend=neuron, dynamic=False, fullgraph=True)"
+              echo "mode: torch.compile(backend=neuron, dynamic=False, fullgraph=True), always"
               echo "warps: $WARPS"
               echo ""
 
               for G in $GEOMS; do
                 GRID=$(echo "$G" | cut -d: -f1); HL=$(echo "$G" | cut -d: -f2); T=$(echo "$G" | cut -d: -f3)
-                for MD in $MODES; do
-                  for WP in $WARPS; do
-                    TAG="${GRID}_h${HL}_${MD}_${WP}"
-                    echo "---- $GRID halo $HL  --compile $MD  --warp $WP  tile $T ----"
+                for WP in $WARPS; do
+                  TAG="${GRID}_h${HL}_${WP}"
+                  echo "---- $GRID halo $HL  warp $WP  tile $T ----"
                     rm -rf /tmp/neff_cache; mkdir -p /tmp/neff_cache
                     set +e
                     NEURON_LAUNCH_BLOCKING=1 python -u repro_unrolling_trn2.py \
                         $FRAMES $REF \
                         --height 1728 --width 4096 --tiles "$GRID" --halo "$HL" --bar 3 \
                         --device neuron --cores 1 --only-tile "$T" \
-                        --warp "$WP" --dtype fp32 --compile "$MD" --iters 0 \
+                      --warp "$WP" --dtype fp32 --iters 0 \
                         2>&1 | tee "$OUT/${TAG}.log"
                     rc=${PIPESTATUS[0]}
                     set -e

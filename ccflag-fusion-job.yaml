@@ -129,7 +129,7 @@ spec:
                     $FRAMES $REF \
                     --height 1728 --width 4096 --tiles 4x8 --halo 64 --bar 3 \
                     --device neuron --cores 1 --only-tile 0 \
-                    --warp gather --dtype fp32 --compile whole --iters 0 \
+                    --warp gather --dtype fp32 --iters 0 \
                     2>&1 | tee "$OUT/f_${FN}.log"
                 rc=${PIPESTATUS[0]}
                 set -e

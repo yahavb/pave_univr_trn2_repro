@@ -667,7 +667,7 @@ class _StageFirst(nn.Module):
     """Pyramid stage 0: the IFBlock conv trunk AND its two full-resolution warps.
 
     The warps belong INSIDE this module, and that is the entire point of it rather than a tidiness
-    preference. The repo's NEFF_A0 is built the same way. When `--compile split` wrapped only
+    preference. The repo's NEFF_A0 is built the same way. When an earlier mode wrapped only
     `block0/1/2`, the six full-resolution warps live in IFNet_m.forward BETWEEN the blocks, so they
     sat outside every compiled region -- roughly 60% of the frame stayed eager and the mode bought
     nothing. Compiling a stage only helps if the stage owns its warps.
@@ -707,7 +707,7 @@ class _StageNext(nn.Module):
 
 
 class _Pyramid(nn.Module):
-    """All three pyramid stages in one module, so `--compile halves` gets ONE graph over the
+    """All three pyramid stages in one module. Retained for the structure it documents; the
     whole flow pyramid -- and therefore all six full-resolution warps. Wrapping the stages
     individually cannot express that: each torch.compile call is its own graph."""
 
@@ -763,12 +763,12 @@ class IFNet_m(nn.Module):
     def forward(self, x, timestep, scale=(4, 2, 1)):
         img0, img1 = x[:, :3], x[:, 3:6]
         merged, mask_list = [], []
-        # Stage granularity lives in _stages so `--compile stages` can swap each entry for a compiled
+        # Stage granularity lives in _stages. Kept because the per-block tags key off it and a compiled
         # graph that CONTAINS that stage's two warps. Per-block tags are unchanged (a0_conv/a0_warp
         # and so on), so the C28-keyed table still lines up. scale=(4,2,1) is baked into the wrappers
         # at construction; the argument survives only for signature compatibility with upstream.
         if getattr(self, "_pyramid", None) is not None:
-            # --compile halves: one graph for the pyramid, one for the refinement.
+            # Unused now that compilation is always whole-model; _pyramid stays None.
             (flow, m0, a0, b0, m1, a1, b1, mask, w0, w1) = self._pyramid(img0, img1, timestep)
             for mk, (aa, bb) in ((m0, (a0, b0)), (m1, (a1, b1)), (mask, (w0, w1))):
                 mask_list.append(torch.sigmoid(mk))
@@ -1239,7 +1239,7 @@ def main():
     ap.add_argument("--record-flow", action="store_true",
                     help="measure post-clamp displacement at every resample call and print a table. "
                          "Diagnostic: answers what radius a bounded-neighbourhood kernel needs. "
-                         "Forces eager (--compile none) and syncs to host, so do not time it")
+                         "cannot run: fullgraph=True cannot trace it")
     ap.add_argument("--shiftwarp-radius", type=int, default=3,
                     help="shiftwarp support radius; R covers |displacement| <= R px EXACTLY. R=3 is "
                          "the smallest that passes the gate on the real 2.33 px flow (R=2 measured "
@@ -1247,21 +1247,13 @@ def main():
     ap.add_argument("--shiftwarp-max-c", type=int, default=3,
                     help="shiftwarp handles sites with C <= this; larger C falls back to gather. "
                          "Default 3 = only the image-warp site, the one where the kernel is verified")
-    ap.add_argument("--compile", default="none", choices=("none", "one", "whole", "halves", "stages"),
-                    help="none = eager; one = compile ONLY --compile-only, rest eager; "
-                         "then coarsest first: whole = 1 graph; "
-                         "halves = pyramid + refinement; stages = a0/a1/a2 + ctx + unet. "
-                         "All compiled modes use fullgraph=True")
-    ap.add_argument("--compile-only", default="unet",
-                    choices=("a0", "a1", "a2", "contextnet", "unet", "pyramid", "refine"),
-                    help="with --compile one: the single module to compile")
     ap.add_argument("--per-block", action="store_true",
                     help="time each module (a0/a1/a2 conv+warp, ctx, unet) with a device barrier, "
                          "keyed to line up with the repo's C28 per-module table. Barriers serialise, "
                          "so figures are UPPER bounds; the report prints a sum-vs-total check")
     ap.add_argument("--neuron-prelu", action="store_true",
                     help="replace nn.PReLU with relu(x)-w*relu(-x) (bit-exact). REQUIRED for "
-                         "--compile: nn.PReLU cannot be legalised under torch.compile")
+                         "torch.compile: nn.PReLU cannot be legalised by the Neuron backend")
     ap.add_argument("--radius", type=int, default=2, help="--warp window radius R")
     ap.add_argument("--device", default="cpu", help="cpu | cuda | neuron")
     ap.add_argument("--dtype", default="fp32", choices=("fp32", "bf16"))
@@ -1325,30 +1317,32 @@ def main():
     global _NKI_DYN, _PRELU, _PROFILE_BLOCKS, _NKI_FN, _NKI_FN_DYN
     global _SHIFTWARP_FN, _SHIFTWARP_R, _SHIFTWARP_MAXC
     _NKI_DYN = (a.warp == "nki-dyn")
-    if a.per_block and a.compile != "none":
-        ap.error("--per-block needs --compile none: torch.compile dissolves the module boundaries "
-                 "the timers sit on, so the numbers would be meaningless")
+    if a.per_block:
+        ap.error("--per-block is incompatible with fullgraph=True: torch.compile dissolves the "
+                 "module boundaries the timers sit on, so the numbers would be meaningless. This "
+                 "script always compiles one fused graph, so --per-block can never apply.")
     _PROFILE_BLOCKS = a.per_block
     # Must be set BEFORE UniVR() is constructed, since conv()/deconv() read it at build time.
-    if a.neuron_prelu or a.compile != "none":
-        _PRELU = NeuronPReLU
-        if not a.neuron_prelu:
-            print("  NOTE --compile implies --neuron-prelu: nn.PReLU cannot be legalised under "
-                  "torch.compile")
+    # Unconditional: nn.PReLU cannot be legalised by the Neuron backend, and this script
+    # always compiles. NeuronPReLU is relu(x) - w*relu(-x), bit-exact, so nothing is traded.
+    _PRELU = NeuronPReLU
+    if not a.neuron_prelu:
+        print("  NOTE nn.PReLU replaced by NeuronPReLU: it cannot be legalised under torch.compile")
     _WARP = WARPS[a.warp]
     if a.warp == "window":
         _r = a.radius
         _WARP = lambda x, f: warp_window(x, f, radius=_r)   # noqa: E731
-    if a.record_flow and a.compile != "none":
-        ap.error("--record-flow needs --compile none: it appends to a list and syncs to host inside "
-                 "the warp, which fullgraph=True cannot trace")
+    if a.record_flow:
+        ap.error("--record-flow cannot run under fullgraph=True: it appends to a Python list and "
+                 "syncs to host inside the warp, which dynamo cannot trace. This script always "
+                 "compiles, so use an older commit if the displacement table is needed.")
     if a.warp == "shiftwarp":
         if a.device != "neuron":
             ap.error("--warp shiftwarp requires --device neuron")
         _SHIFTWARP_R = a.shiftwarp_radius
         _SHIFTWARP_MAXC = a.shiftwarp_max_c
         # Same eager-build reason as the nki path below: building the wrapper lazily on first use
-        # puts wrap_nki() inside a traced frame under --compile.
+        # puts wrap_nki() inside a traced frame.
         _SHIFTWARP_FN = _build_shiftwarp()
         print("shiftwarp     R=%d -> %d terms, covers |disp| <= %d px; sites with C > %d fall back "
               "to gather" % (_SHIFTWARP_R, (2 * _SHIFTWARP_R + 1) ** 2, _SHIFTWARP_R,
@@ -1357,7 +1351,7 @@ def main():
         ap.error("--warp %s requires --device neuron" % a.warp)
     if a.warp.startswith("nki"):
         # Build the NKI wrappers HERE, before anything is compiled. warp_nki() otherwise builds them
-        # lazily on first use, which under --compile puts wrap_nki() inside a traced frame. At the 4K
+        # lazily on first use, which puts wrap_nki() inside a traced frame. At the 4K
         # tile that surfaced as `torch._dynamo.exc.Unsupported: id() with unsupported args` -- and it
         # did NOT surface at 256x384, so it is the kind of failure that hides until the shape that
         # matters. Lazy global init inside a compiled region is fragile independently of that error.
@@ -1411,48 +1405,12 @@ def main():
     # Compiling is INDEPENDENT of tiling. It used to live inside `if tiled:`, so
     # --tiles 1x1 --cores 1 silently skipped it and ran eager: a whole shape sweep was
     # reported as compiled that way. One function, applied on both paths.
-    _CC = dict(backend="neuron", dynamic=False, fullgraph=True)
-
     def apply_compile(m, tag=""):
-        """Compile `m` in place per --compile. fullgraph=True so a dynamo break RAISES
-        rather than silently emitting a subgraph -- an unguarded break around the
-        view(torch.uint32) index bitcast in the warp corrupts which pixels get sampled."""
-        if a.compile == "none":
-            return m
-        print("  torch.compile[%s] mode=%s %s" % (tag or "model", a.compile, _CC))
-        u = m.UVR
-        if a.compile == "one":
-            tgt = a.compile_only
-            if tgt in ("a0", "a1", "a2"):
-                i = {"a0": 0, "a1": 1, "a2": 2}[tgt]
-                u._stages = list(u._stages)
-                u._stages[i] = torch.compile(u._stages[i], **_CC)
-            elif tgt in ("contextnet", "unet"):
-                setattr(u, tgt, torch.compile(getattr(u, tgt), **_CC))
-            elif tgt == "pyramid":
-                u._pyramid = torch.compile(_Pyramid(u._stages), **_CC)
-            elif tgt == "refine":
-                u._refine = torch.compile(_Refine(u.contextnet, u.unet), **_CC)
-            else:
-                raise SystemExit("--compile one needs --compile-only "
-                                 "{a0,a1,a2,contextnet,unet,pyramid,refine}")
-            print("    ONLY %s compiled, everything else eager" % tgt)
-            return m
-        if a.compile == "whole":
-            print("    1 graph over the whole forward")
-            return torch.compile(m, **_CC)
-        if a.compile == "halves":
-            u._pyramid = torch.compile(_Pyramid(u._stages), **_CC)
-            u._refine = torch.compile(_Refine(u.contextnet, u.unet), **_CC)
-            print("    2 graphs: pyramid (3 stages, 6 warps) + refinement")
-            return m
-        if a.compile == "stages":
-            u._stages = [torch.compile(st, **_CC) for st in u._stages]
-            for nm in ("contextnet", "unet"):
-                setattr(u, nm, torch.compile(getattr(u, nm), **_CC))
-            print("    5 graphs: a0/a1/a2 (each with its 2 warps) + contextnet + unet")
-            return m
-        raise SystemExit("unknown --compile %s" % a.compile)
+        """fullgraph=True so a dynamo break RAISES rather than silently emitting a subgraph:
+        an unguarded break around the view(torch.uint32) index bitcast in the warp corrupts
+        which pixels get sampled."""
+        print("  torch.compile[%s] fullgraph=True" % (tag or "model"))
+        return torch.compile(m, backend="neuron", dynamic=False, fullgraph=True)
 
     ny, nx = (int(v) for v in a.tiles.lower().split("x"))
     tiled = (ny * nx > 1) or a.cores > 1 or a.only_tile is not None
@@ -1501,11 +1459,12 @@ def main():
     # Descriptor accounting appends to a Python list from inside the warp. Under fullgraph=True that
     # is a graph break and dynamo raises instead of tracing, so the accounting is only collected on
     # the eager path. --report-only still produces the full table from shapes alone, with no device.
-    _RECORD = (a.compile == "none")
+    # Both recorders append to Python lists from inside the warp, which fullgraph=True cannot
+    # trace, so neither can ever be active now that compilation is unconditional.
+    _RECORD = False
     # Same graph-break reason as _RECORD: appending to a Python list and calling .item() inside the
     # warp cannot be traced, so this is eager-only. main() already errors if --record-flow is
-    # combined with --compile.
-    _RECORD_FLOW = a.record_flow and (a.compile == "none")
+    _RECORD_FLOW = False
     FLOW_STATS.clear()
     CALL_SITES.clear()
     t0 = time.perf_counter()
@@ -1656,11 +1615,11 @@ def main():
     if CALL_SITES:
         descriptor_report(CALL_SITES, itemsize, n_forwards=2 if real_triplet else 1)
     else:
-        # _RECORD is off under --compile (appending to a list from inside the warp is not
+        # _RECORD is always off now (appending to a list from inside the warp is not
         # traceable under fullgraph=True), so there is nothing to report. Printing the table
         # anyway emitted a page of zeros followed by hardcoded figures from other runs.
         print()
-        print("  (no descriptor accounting: --compile %s disables call-site recording)" % a.compile)
+        print("  (no descriptor accounting: fullgraph=True cannot trace call-site recording)")
 
     if a.gate:
         # THE PORT'S OWN GATE, and the one the docs quote: the same weights and the same inputs

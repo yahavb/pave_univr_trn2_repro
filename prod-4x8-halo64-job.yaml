@@ -75,8 +75,8 @@ spec:
               # tile 9. A single unfusable shape sinks the whole configuration, so this is checked
               # cheaply before the timed arms.
               #
-              # STAGE 2 runs both warps, fused, at 8 cores with 3 iters, and STAGE 3 is the eager
-              # 2x4 halo-128 baseline in the SAME pod so the comparison is not across hardware or
+              # STAGE 2 runs both warps at 8 cores with 3 iters; STAGE 3 does the same for 2x4
+              # halo 128 in the SAME pod, so the two geometries are compared on one machine and one
               # cache state.
               #
               # BOTH gather AND nki-dyn, because the 4x8 FUSES verdict was measured with gather and
@@ -109,7 +109,7 @@ spec:
                     $FRAMES $REF \
                     --height 1728 --width 4096 --tiles 4x8 --halo 64 --bar 3 \
                     --device neuron --cores 1 --only-tile "$T" \
-                    --warp gather --dtype fp32 --compile whole --iters 0 \
+                    --warp gather --dtype fp32 --iters 0 \
                     2>&1 | tee "$OUT/c_t${T}.log"
                 rc=${PIPESTATUS[0]}
                 set -e
@@ -137,7 +137,7 @@ spec:
                 python -u repro_unrolling_trn2.py $FRAMES $REF \
                     --height 1728 --width 4096 --tiles 4x8 --halo 64 --bar 3 \
                     --device neuron --cores 8 --warp "$WP" --dtype fp32 \
-                    --compile whole --iters 3 \
+                    --iters 3 \
                     2>&1 | tee "$OUT/t_${TAG}.log"
                 rc=${PIPESTATUS[0]}
                 set -e
@@ -149,16 +149,20 @@ spec:
               done
               echo ""
 
-              echo "=== [3/3] EAGER 2x4 halo 128 BASELINE, same pod, gather and nki-dyn ==="
+              echo "=== [3/3] 2x4 halo 128, fused, same pod, gather and nki-dyn ==="
+              # 2x4 is the production geometry. It is expected to reject with in=17,776,640 -- its
+              # valid extent alone is 884,736 px -- and it is run here as the reference point in the
+              # same pod, so a 4x8 result is not being compared across hardware or cache state.
+              # There is no eager arm because the script no longer has an eager path.
               for WP in gather nki-dyn; do
-                TAG="eager_2x4_h128_${WP}"
+                TAG="fused_2x4_h128_${WP}"
                 echo "---- $TAG ----"
                 B=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l || echo 0)
                 set +e
                 python -u repro_unrolling_trn2.py $FRAMES $REF \
                     --height 1728 --width 4096 --tiles 2x4 --halo 128 --bar 3 \
                     --device neuron --cores 8 --warp "$WP" --dtype fp32 \
-                    --compile none --iters 3 \
+                    --iters 3 \
                     2>&1 | tee "$OUT/t_${TAG}.log"
                 rc=${PIPESTATUS[0]}
                 set -e
@@ -170,7 +174,7 @@ spec:
               done
               echo ""
 
-              echo "################ FUSED 4x8 halo64 vs EAGER 2x4 halo128"
+              echo "################ FUSED 4x8 halo64 vs FUSED 2x4 halo128"
               printf "  %-28s %5s %11s %7s %9s %6s %s\n" arm rc median_ms neffs max_LSB gate graphs
               for f in "$OUT"/t_*.log; do
                 [ -f "$f" ] || continue
@@ -186,23 +190,21 @@ spec:
               done
               echo ""
               echo "  HOW TO READ IT, comparing like warp against like warp:"
-              echo "  * fused faster AND gate PASS -> the result. Fusion beats eager despite 1.13x"
-              echo "    the pixel work, and the lever is dispatch count as the conv bench implied."
-              echo "  * fused slower -> 271 fewer dispatches do not pay for 13% more pixel work."
-              echo "    That closes the fusion line, and it is a real answer, not a failure."
-              echo "  * fused FAILS the gate while eager PASSES -> halo 64 is too small. Next rung is"
-              echo "    halo 96 (largest shape 640x704 = 450,560 px, marginal against the 442,368"
-              echo "    known-good / 507,904 known-bad DMA bracket), not abandoning the approach."
-              echo "  * BOTH fail the gate -> the defect is upstream of halo and fusion. The eager"
-              echo "    2x4 halo-128 arm last measured 81.46 LSB on the DOCUMENTED configuration,"
-              echo "    localised to tile 0 and independent of the warp, so this is likely."
-              echo "  * nki-dyn rejects where gather fuses -> every fusion verdict in STATE.md applies"
-              echo "    only to the gather path, not to production. That would need saying loudly."
+              echo "  * any row with a median -> a fused config RAN. That is the first end-to-end"
+              echo "    number for fullgraph=True on this model. Read its gate before its speed."
+              echo "  * 4x8 h64 has a median and 2x4 h128 does not -> the smaller tile is what makes"
+              echo "    fusion viable, and 4x8 halo 64 is the configuration to build on."
+              echo "  * a median with gate FAIL -> halo 64 is too small and is corrupting tile edges."
+              echo "    Next rung is halo 96 (largest shape 640x704 = 450,560 px, marginal against the"
+              echo "    442,368 known-good / 507,904 known-bad DMA bracket)."
+              echo "  * stage 1 shows a shape REJECTED -> that shape has no graph, so tiles of that"
+              echo "    size never get written and the 8-core arms cannot produce a frame. Fix the"
+              echo "    shape before reading any timing."
               echo ""
-              echo "  reference: README documents eager 2x4 --warp nki at 3673.3 ms / 0.64 LSB PASS,"
-              echo "  never reproduced (a rerun gave 4125.5 ms / 81.46 LSB FAIL). The internal"
-              echo "  fused-vs-eager delta in the table above is the result; the absolute is not"
-              echo "  comparable to that figure since neither arm here uses full nki."
+              echo "  For reference, from earlier runs and NOT reproducible here now that the eager"
+              echo "  path is gone: eager 2x4 halo 128 --warp nki measured 4125.5 ms / 81.46 LSB FAIL"
+              echo "  in this image, against 3673.3 ms / 0.64 LSB PASS documented in the README. Any"
+              echo "  fused number below is a like-for-like only against the other fused rows."
               echo ""
 
               ARCHIVE=/tmp/univr_p48_$(date -u +%Y%m%d_%H%M%S).tar.gz
