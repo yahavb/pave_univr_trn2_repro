@@ -44,59 +44,63 @@ spec:
               echo ""
 
               # ============================================================================
-              # LARGEST TILES, WITHOUT --model-type unet-inference
+              # 4x8 halo 64: compile ALL FOUR shapes, without --model-type unet-inference
               # ============================================================================
-              # MEASURED: dropping --model-type made a rejecting shape compile. Same tile, same
-              # geometry, same fullgraph=True, one flag apart:
-              #     --lnc 1 --model-type unet-inference   4x8 h64 tile 0 (512x576)  in=23,040 REJECT
-              #     --lnc 1                               4x8 h64 tile 0 (512x576)  FUSES
-              # Confirmed in the log: "1 graph over the whole forward", padded 512x576, ran to
-              # "forward complete". That flag was inherited from ~/pave-unrolling, never varied
-              # there either, and carried unquestioned into every run in this repo -- including all
-              # the geometry and halo sweeps. So those sweeps were varying tile shape while the
-              # actual cause sat in the flags, which is why the operand values looked incoherent.
+              # This job originally swept the LARGEST tiles on the theory that the flag was the
+              # only blocker. It OOM-killed on its first compile (2x4 h64, 928x1088, 147 min at
+              # 1500Gi) which showed there is a second, independent constraint. Both are now
+              # pinned, and together they select exactly one config -- see the CONFIGS block below
+              # for the measurements.
               #
-              # THEREFORE EVERY GEOMETRY REJECTION ON RECORD IS SUSPECT. All of them were measured
-              # with the flag. Re-testing the LARGEST tiles first, because larger tiles mean fewer
-              # tiles, less halo re-read, and fewer distinct shapes to compile:
+              # Short version: the flag caused the DMA rejection and is gone; tile SIZE causes an
+              # OOM that memory does not fix; 4x8 is the only grid entirely under that size ceiling.
               #
-              #   grid  tiles halo  largest    maxpx     totpx  shapes  prior verdict WITH flag
-              #   2x4     8    64   928x1152  1,069,056  0.86x    2     NEVER TESTED
-              #   3x4    12    64   704x1152    811,008  0.92x    4     never tested at h64
-              #   2x8    16    64   928x640     593,920  0.96x    2     OOM x3 at 600/1000/1500Gi
-              #   2x4     8   128   992x1280  1,269,760  1.00x    2     in=17,776,640
-              #   4x8    32    64   576x640     368,640  1.13x    4     3 of 4 fuse, 4th now fuses
+              # ALL FOUR SHAPES, not one tile. A frame needs every distinct padded shape to
+              # compile -- tiles of a rejected shape have no graph, their pixels are never written,
+              # and the 8-core run dies (observed rc=139). Testing one tile and generalising is
+              # what produced a false "4x8 FUSES" verdict that stood for several runs.
               #
-              # 2x4 halo 64 is the standout and has never been run: 0.86x the total pixel work of
-              # the production 2x4 halo 128 baseline -- LESS work, not more -- with only 2 distinct
-              # shapes, so the fewest graphs of any candidate. Ordered largest-tile-first so the
-              # first success is the best available configuration.
-              #
-              # ALL SHAPES, NOT ONE TILE. A frame needs every distinct padded shape to compile;
-              # tiles of a rejected shape have no graph, their pixels are never written, and the run
-              # dies (observed rc=139). Testing one tile and generalising produced a false
-              # "4x8 FUSES" verdict that stood for several runs. Tile indices below are one per
-              # distinct shape, taken from plan_tiles directly.
-              #
-              # Compile-only. Steady-state latency is the critical path and compile is a one-off
-              # that the NEFF cache absorbs, so this job spends its time establishing WHICH
-              # configuration is viable and leaves timing to a follow-up that runs 8 cores with
-              # accuracy scored.
+              # Compile-only. Steady-state latency is the critical path; compile is a one-off the
+              # NEFF cache absorbs. Timing is a follow-up at 8 cores with the accuracy gate.
 
               OUT=/tmp/univr_bt_out; mkdir -p "$OUT"
               FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
 
-              # grid:halo:tile,tile,...  -- one tile per distinct padded shape, from the planner.
-              # DEFAULT IS THE TWO BEST CANDIDATES ONLY, 4 compiles. A single fused compile took
-              # 118 minutes in the flag sweep, so a 14-compile sweep would run for over a day and
-              # most of it on configs that only matter if the first two fail. 2x4 h64 is the
-              # standout (0.86x pixel work, 2 shapes, never tested) and 2x4 h128 is the production
-              # geometry itself. Override CONFIGS to reach the rest:
-              #   3x4:64:0,1,4,5   0.92x, 4 shapes
-              #   2x8:64:0,1       0.96x, 2 shapes, previously OOM x3
-              #   4x8:64:0,1,8,9   1.13x, 4 shapes, 3 already fuse and the 4th now fuses
-              CONFIGS="${CONFIGS:-2x4:64:0,1 2x4:128:0,1}"
+              # grid:halo:tile,tile,... -- one tile per distinct padded shape, from the planner.
+              #
+              # 4x8 halo 64 ONLY, all four shapes. There are two INDEPENDENT constraints and both
+              # are now pinned, which is what selects this config and rules out everything larger:
+              #
+              # 1. DMA rejection -- caused by --model-type unet-inference. FIXED. Measured on
+              #    4x8 h64 tile 0 (512x576): every arm carrying unet-inference rejected with the
+              #    identical in=23,040, and --lnc 1 alone, --model-type transformer and
+              #    --model-type generic all FUSED. Perfect separation across 7 arms, so it is the
+              #    flag and --lnc is irrelevant to it. This job uses --lnc 1.
+              #
+              # 2. Compiler HOST MEMORY -- a function of tile size, and the flag does not touch it:
+              #      4x8 h64  512x576    294,912 px  FUSES (118 min)
+              #      4x8 h128 576x768    442,368 px  FUSES
+              #      2x8 h64  928x640    593,920 px  OOM at 600, 1000 AND 1500Gi
+              #      2x4 h64  928x1088 1,009,664 px  OOM at 1500Gi, WITHOUT the flag, after 147 min
+              #    So the ceiling sits between ~442k and ~594k padded px, and raising memory does
+              #    not move it -- 2x8 died at all three levels. 2x4 (1.0M px) and 2x8 (594k px) are
+              #    both above it regardless of flags, which is why the previous run of this job
+              #    OOM-killed on its very first compile.
+              #
+              # 4x8 is the only grid whose every shape fits under that ceiling (294k-450k px), and
+              # it is already 3/4 proven: three of its four shapes fused even WITH the bad flag, and
+              # the fourth (512x576) fuses without it. So all four plausibly compile now.
+              #
+              # Cost: ~2h per compile, ~8h for the set. That is acceptable because compile is a
+              # one-off the NEFF cache absorbs and steady-state latency is the critical path.
+              #
+              # Larger grids are NOT included. They are above the memory ceiling, not merely
+              # untested:
+              #   2x4:64:0,1       1,009,664 px  OOM measured
+              #   2x8:64:0,1         593,920 px  OOM measured x3
+              #   3x4:64:0,1,4,5     811,008 px  above the ceiling, expect OOM
+              CONFIGS="${CONFIGS:-4x8:64:0,1,8,9}"
               echo "configs (largest tile first): $CONFIGS"
               echo ""
 
@@ -159,20 +163,19 @@ spec:
               done
               echo ""
               echo "  HOW TO READ IT:"
-              echo "  * the FIRST complete config in this ordering is the best one -- they are"
-              echo "    ordered by ascending total pixel work, so 2x4 h64 (0.86x) beats 2x8 h64"
-              echo "    (0.96x) beats 2x4 h128 (1.00x) beats 4x8 h64 (1.13x)."
-              echo "  * 2x4 halo 64 complete -> 8 tiles, 2 shapes, LESS pixel work than the"
-              echo "    production baseline. Nothing further to search; go straight to timing."
-              echo "  * 2x4 h128 complete -> the production geometry itself fuses, and the whole"
-              echo "    halo question was an artefact of the flag."
-              echo "  * a config that rejects with the SAME in= as it did with the flag -> that"
-              echo "    rejection is real and independent of --model-type."
-              echo "  * 2x8 rejects or OOMs again -> its failure was never about the flag."
+              echo "  * ALL SHAPES FUSE = 1 -> the first fully fusable configuration. 4x8 halo 64,"
+              echo "    32 tiles, 4 shapes, 1.13x the total pixel work of the 2x4 halo-128 baseline."
+              echo "    Next: populate the NEFF cache once, then 8 cores --iters 3, and read the"
+              echo "    steady-state median WITH the accuracy gate. That is the number."
+              echo "  * one shape REJECTED -> record its in= operand. If it differs from 23,040 it is"
+              echo "    a different fault from the one the flag caused, and it is that shape that"
+              echo "    needs attention, not the geometry."
+              echo "  * a shape OOMs -> unexpected here, since every 4x8 halo-64 shape is 294k-450k"
+              echo "    px and both known-good compiles sit in that range. It would mean the memory"
+              echo "    ceiling is lower than the ~442k-594k bracket currently measured."
               echo ""
-              echo "  Next step for any complete config: populate the NEFF cache once, then run"
-              echo "  8 cores with --iters 3 and read the steady-state median plus the accuracy gate."
-              echo "  Compile time is a one-off and is NOT the critical path."
+              echo "  Compile time is NOT the critical path. ~2h per shape is a one-off absorbed by"
+              echo "  the NEFF cache; only steady-state latency matters."
               echo ""
 
               ARCHIVE=/tmp/univr_bt_$(date -u +%Y%m%d_%H%M%S).tar.gz
