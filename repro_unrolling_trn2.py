@@ -55,6 +55,22 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Dynamo's recompile cap, raised because this model legitimately needs more graphs than the
+# default allows. A tiled frame has several distinct PADDED shapes -- 4 at 4x8 (512x576,
+# 512x640, 576x576, 576x640) -- and a triplet runs 2 timestamps, so ~8 traces of the same
+# forward. The default cache_size_limit is 8, and under fullgraph=True exceeding it is a HARD
+# error rather than a fall back to eager:
+#     torch._dynamo.exc.FailOnRecompileLimitHit: Hard failure due to fullgraph=True
+# That killed both timed arms of the 8-core run after compiling only 2 graphs, with the
+# single-tile guard passing in the same job -- one graph never trips it.
+#
+# This is a host-side trace counter, unrelated to NeuronCores or device memory. Raising it is
+# the right fix rather than reducing --cores: the recompiles are legitimate, and halving cores
+# would roughly double wall clock (the README measures sum/wall 7.57 at 8 cores), producing a
+# latency not comparable to the baseline.
+torch._dynamo.config.cache_size_limit = 64
+torch._dynamo.config.accumulated_cache_size_limit = 256
+
 # NKI MUST be imported at MODULE level, not inside the builder function. NKI's parser frontend
 # resolves names through the kernel's __globals__ and NOT through its closure, so importing
 # `nki.language as nl` inside a function makes `nl` a closure variable and every reference to it
