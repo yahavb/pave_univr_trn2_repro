@@ -167,8 +167,11 @@ spec:
               value: "1"
             - name: NEURON_RT_VISIBLE_CORES
               value: "0"
+            # No --model-type unet-inference: measured as the sole cause of the NCC_EBIR033 DMA
+            # rejection. 8 arms on one shape, every arm with it rejected at in=23,040, every arm
+            # without it fused. --target dropped too: the node is trn3 and the compiler detects it.
             - name: NEURON_CC_FLAGS
-              value: "--target trn3 --lnc 1 --model-type unet-inference"
+              value: "--lnc 1"
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
               value: "/tmp/neff_cache"
             - name: OMP_NUM_THREADS

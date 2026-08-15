@@ -187,8 +187,11 @@ spec:
               value: "0-7"
             # No --target (node is trn3), no -O1 (causes the in=4 / I-3276 rejection), no -O3
             # (measured to change the instruction count by exactly zero on 2x8 and 2x12).
+            # No --model-type unet-inference: measured as the sole cause of the NCC_EBIR033 DMA
+            # rejection. 8 arms on one shape, every arm with it rejected at in=23,040, every arm
+            # without it fused. --target dropped too: the node is trn3 and the compiler detects it.
             - name: NEURON_CC_FLAGS
-              value: "--lnc 1 --model-type unet-inference"
+              value: "--lnc 1"
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
               value: "/tmp/neff_cache"
             - name: OMP_NUM_THREADS
