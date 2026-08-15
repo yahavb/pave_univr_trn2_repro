@@ -1,0 +1,218 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: univr-accuracy-triage
+  namespace: default
+spec:
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: univr-accuracy-triage
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+        # Pinned: the S3 add-on backing /var/mdl only works on this node. Elsewhere the pod
+        # sits Pending on "MountVolume.SetUp failed ... DeadlineExceeded".
+        kubernetes.io/hostname: ip-192-168-192-189.us-east-2.compute.internal
+      containers:
+        - name: repro
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-exc"
+            - |
+              set -euo pipefail
+
+              cd /tmp
+              git clone -b main https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
+              cd REPRO
+
+              echo "┌── PROVENANCE ──"
+              echo "│ commit : $(git rev-parse HEAD)"
+              echo "│ subject: $(git log -1 --pretty=%s)"
+              echo "└────────────────"
+              echo "neuronx-cc: $(neuronx-cc --version 2>&1 | head -1 || true)"
+              echo "NEURON_CC_FLAGS: ${NEURON_CC_FLAGS:-<unset>}"
+              echo ""
+
+              # ============================================================================
+              # WHY DOES THE FUSED FRAME FAIL ACCURACY? Three arms, one pod.
+              # ============================================================================
+              # The fused config RUNS. Measured, job univr-prod-4x8-h64-vggks, 4x8 halo 64,
+              # 8 cores, --iters 3, NEURON_CC_FLAGS="--lnc 1":
+              #     gather   median 3900.5 ms   max_diff 92.56 LSB   PSNR 48.74 dB   +7 NEFFs
+              #     nki-dyn  median 3820.4 ms   max_diff 92.56 LSB   PSNR 48.74 dB   +8 NEFFs
+              #
+              # THE ACCURACY IS BIT-IDENTICAL ACROSS TWO DIFFERENT RESAMPLE IMPLEMENTATIONS.
+              # 92.56 LSB and 48.74 dB to every digit, from plain-torch indirect gather and from
+              # an NKI indirect-DMA kernel. Whatever is wrong is in code they SHARE, not in either
+              # warp. That is the single most useful fact available and it is what these arms build
+              # on.
+              #
+              # It is also not halo starvation at tile edges, which is what shrinking halo to 64
+              # from the production 128 would be expected to cause. The spatial breakdown puts the
+              # worst error in the INTERIOR:
+              #     merge seam +/-4 rows   max 28.82
+              #     top border 32 rows     max 17.37
+              #     bottom border 32 rows  max 43.15
+              #     interior (128 cut)     max 92.56   <-- worst
+              # And it is sparse rather than systematic: p50 0.14 LSB, mean 0.356, only 1.49% of
+              # pixels above 3 LSB, cosine 0.999968. Isolated pixels going badly wrong.
+              #
+              # ARM 1  --warp gridsample, 4x8 halo 64.
+              #   gridsample is F.grid_sample, the REFERENCE implementation the other two are
+              #   scored against. If it also reports ~92.56 LSB the resample is fully exonerated
+              #   and the fault is in the fused graph itself -- a conv, interpolate or PReLU
+              #   lowering difference. If it PASSES, then both indirect-gather forms are wrong in
+              #   the same way under fusion, which is a much narrower and more actionable bug.
+              #   Cheapest arm: shares the cached NEFFs from the run above.
+              #
+              # ARM 2  --warp gather, 4x8 halo 128.
+              #   Tests whether halo 64 contributes at all. Its largest shape is 704x768 =
+              #   540,672 px, which is inside the measured ~442k-594k compiler memory ceiling
+              #   bracket, so this may OOM rather than answer. Worth one attempt: if it compiles
+              #   and still fails near 92 LSB, halo is ruled out completely; if it PASSES, halo 64
+              #   is the cause after all and the fix is halo 96.
+              #
+              # ARM 3  --warp gridsample, 4x8 halo 128.
+              #   The corner that separates the two variables. Only meaningful if arm 2 compiles.
+              #
+              # NO EAGER ARM IS POSSIBLE. --compile was removed from the script; it is always
+              # torch.compile(fullgraph=True). The historical eager figures -- 3673.3 ms / 0.64 LSB
+              # PASS in the README with --warp nki, and 4125.5 ms / 81.46 LSB FAIL for the same
+              # command re-run in this image -- cannot be reproduced here. Note the second one:
+              # 81.46 LSB was ALREADY failing before any fusion or halo change, which is why arm 1
+              # matters more than arm 2. The defect may predate both.
+
+              OUT=/tmp/univr_at_out; mkdir -p "$OUT"
+              FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
+              REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
+
+              # halo:warp
+              ARMS="${ARMS:-64:gridsample 128:gather 128:gridsample}"
+              echo "arms: $ARMS"
+              echo "reference from univr-prod-4x8-h64-vggks: gather 92.56 LSB, nki-dyn 92.56 LSB"
+              echo ""
+
+              for A in $ARMS; do
+                HL=${A%%:*}; WP=${A##*:}
+                TAG="4x8_h${HL}_${WP}"
+                echo "================================================================"
+                echo "=== 4x8 halo $HL  warp $WP  8 cores  3 iters"
+                echo "================================================================"
+                B=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l || echo 0)
+                set +e
+                python -u repro_unrolling_trn2.py $FRAMES $REF \
+                    --height 1728 --width 4096 --tiles 4x8 --halo "$HL" --bar 3 \
+                    --device neuron --cores 8 --warp "$WP" --dtype fp32 \
+                    --iters 3 \
+                    2>&1 | tee "$OUT/${TAG}.log"
+                rc=${PIPESTATUS[0]}
+                set -e
+                A2=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l || echo 0)
+                echo "$rc" > "$OUT/rc_${TAG}.txt"; echo "$((A2-B))" > "$OUT/nf_${TAG}.txt"
+                echo "  rc=$rc  NEFFs +$((A2-B))"
+                if [ "$rc" != "0" ]; then
+                  grep -aoE "got in=[0-9]+ and out=[0-9]+|FailOnRecompileLimitHit|Instructions generated by compiler [0-9]+ exceeds the typical limit of [0-9]+" \
+                    "$OUT/${TAG}.log" | head -2 | sed 's/^/    /'
+                fi
+                echo ""
+                for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                sleep 5
+              done
+
+              echo "################ ACCURACY TRIAGE"
+              printf "  %-22s %5s %11s %10s %9s %6s\n" arm rc median_ms max_LSB PSNR gate
+              for f in "$OUT"/4x8_*.log; do
+                [ -f "$f" ] || continue
+                TAG=$(basename "$f" .log)
+                rc=$(cat "$OUT/rc_${TAG}.txt" 2>/dev/null || echo '?')
+                MS=$(grep -aoE "steady state: median [0-9.]+ ms" "$f" | head -1 | awk '{print $4}' || true)
+                LSB=$(grep -aoE "max_diff +[0-9.]+ LSB" "$f" | tail -1 | awk '{print $2}' || true)
+                PS=$(grep -aoE "PSNR +[0-9.]+ dB" "$f" | tail -1 | awk '{print $2}' || true)
+                GT=$(grep -aoE "\[(PASS|FAIL) vs the shipped bar" "$f" | tail -1 | tr -d '[' | awk '{print $1}' || true)
+                printf "  %-22s %5s %11s %10s %9s %6s\n" \
+                  "$TAG" "$rc" "${MS:--}" "${LSB:--}" "${PS:--}" "${GT:--}"
+              done
+              echo ""
+              echo "  measured already: 4x8_h64_gather 3900.5 ms 92.56 LSB / 4x8_h64_nki-dyn 3820.4 ms 92.56 LSB"
+              echo ""
+              echo "  HOW TO READ IT:"
+              echo "  * h64_gridsample also ~92.56 -> the resample is exonerated. All three forms"
+              echo "    agree, so the error is in the fused graph's conv / interpolate / PReLU"
+              echo "    lowering. Next step is a per-stage numeric diff, not more warp work."
+              echo "  * h64_gridsample PASSES -> both indirect-gather forms are wrong the same way"
+              echo "    under fusion. Narrow and actionable: suspect the uint32 index bitcast, which"
+              echo "    the code comments already flag as corrupting sampling if a guard breaks."
+              echo "  * h128 arms PASS -> halo 64 was the cause despite the interior-worst spatial"
+              echo "    profile, and the fix is halo 96 (largest shape 640x704 = 450,560 px)."
+              echo "  * h128 arms OOM or reject -> expected, 704x768 = 540,672 px sits inside the"
+              echo "    measured ~442k-594k memory ceiling. Then only arm 1 is informative."
+              echo "  * every arm ~92.56 regardless of halo AND warp -> the defect is upstream of"
+              echo "    both. The eager 2x4 gather run in this image already measured 81.46 LSB, so"
+              echo "    this may be a container regression that predates all fusion work."
+              echo ""
+
+              ARCHIVE=/tmp/univr_at_$(date -u +%Y%m%d_%H%M%S).tar.gz
+              tar -czf "$ARCHIVE" -C /tmp univr_at_out
+              mkdir -p /var/mdl/univr_neuron
+              cp "$ARCHIVE" /var/mdl/univr_neuron/
+              echo "Saved: /var/mdl/univr_neuron/$(basename "$ARCHIVE") ($(du -h "$ARCHIVE" | cut -f1))"
+              echo "Done."
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 48
+              memory: 248Gi
+            limits:
+              cpu: 150
+              memory: 1500Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_NUM_CORES
+              value: "8"
+            - name: NEURON_RT_VISIBLE_CORES
+              value: "0-7"
+            # MUST NOT contain --model-type unet-inference: it is the sole cause of the
+            # NCC_EBIR033 rejection. 8 arms on one shape, every arm with it rejected at the
+            # identical in=23,040, every arm without it fused.
+            - name: NEURON_CC_FLAGS
+              value: "--lnc 1"
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: hf-token
+                  key: HF_TOKEN
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
