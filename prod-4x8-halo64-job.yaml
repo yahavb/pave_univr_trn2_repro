@@ -205,8 +205,8 @@ spec:
               cpu: 48
               memory: 248Gi
             limits:
-              cpu: 150
-              memory: 1500Gi
+              cpu: 160
+              memory: 1800Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm

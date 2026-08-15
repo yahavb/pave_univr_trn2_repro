@@ -4,6 +4,7 @@ import math
 import os
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 SHAPES = [
@@ -96,10 +97,6 @@ def warp_shiftmatmul(x, flow, radius=2, bulk=(0, 0)):
     sy = (gy + flow[:, 1:2].float()).clamp(0.0, H - 1.0)
     rx = sx - gx - float(bx)
     ry = sy - gy - float(by)
-    # Roll ONLY the dims with a nonzero shift. A shift of 0 lowers to
-    # concatenate(x[-0:], x[:-0]), and -0 == 0 in Python, so both slices are the
-    # WHOLE tensor and the concat infers 2H (1984 = 2x992) instead of H. by/bx are
-    # host ints baked in as constants, so this branch costs nothing at trace time.
     base = x.float()
     roll_shifts = tuple(s for s in (by, bx) if s != 0)
     roll_dims = tuple(d for s, d in ((by, 2), (bx, 3)) if s != 0)
@@ -172,32 +169,161 @@ def roofline(C, H, W, itemsize=4):
     }
 
 
+_C = 16
+
+
+def _prelu(o):
+    class P(nn.Module):
+        def __init__(self, n):
+            super().__init__()
+            self.weight = nn.Parameter(torch.full((n,), 0.25))
+
+        def forward(self, x):
+            w = self.weight.view(1, -1, *([1] * (x.dim() - 2)))
+            return F.relu(x) - w * F.relu(-x)
+    return P(o)
+
+
+def conv_inventory(H, W):
+    C = _C
+    ops = []
+    for name, inp, c, sc in (("a0", 7, 240, 4), ("a1", 18, 150, 2), ("a2", 18, 90, 1)):
+        h, w = H // sc, W // sc
+        ops.append((name + "_conv0a", "ifblock", inp, c // 2, h, w, 2))
+        ops.append((name + "_conv0b", "ifblock", c // 2, c, h // 2, w // 2, 2))
+        h2, w2 = h // 4, w // 4
+        for i in range(8):
+            ops.append(("%s_cb%d" % (name, i), "ifblock", c, c, h2, w2, 1))
+        ops.append((name + "_lastconv", "ifblock", c, 5, h2, w2, -2))
+    h, w = H, W
+    for lvl, (i, o) in enumerate(((3, C), (C, 2 * C), (2 * C, 4 * C), (4 * C, 8 * C)), start=1):
+        ops.append(("ctx%d_c1" % lvl, "ctx", i, o, h, w, 2))
+        h, w = h // 2, w // 2
+        ops.append(("ctx%d_c2" % lvl, "ctx", o, o, h, w, 1))
+    h, w = H, W
+    for n, i, o in (("down0", 17, 2 * C), ("down1", 4 * C, 4 * C),
+                    ("down2", 8 * C, 8 * C), ("down3", 16 * C, 16 * C)):
+        ops.append(("u_%s_c1" % n, "unet", i, o, h, w, 2))
+        h, w = h // 2, w // 2
+        ops.append(("u_%s_c2" % n, "unet", o, o, h, w, 1))
+    for n, i, o in (("up0", 32 * C, 8 * C), ("up1", 16 * C, 4 * C),
+                    ("up2", 8 * C, 2 * C), ("up3", 4 * C, C)):
+        ops.append(("u_%s" % n, "unet", i, o, h, w, -2))
+        h, w = h * 2, w * 2
+    ops.append(("u_final", "unet", C, 3, h, w, 1))
+    return ops
+
+
+def conv_macs(i, o, ih, iw, s):
+    oh, ow = (ih * 2, iw * 2) if s < 0 else (ih // s, iw // s)
+    return i * o * 9 * oh * ow
+
+
+def build_conv(i, o, s):
+    if s < 0:
+        return nn.Sequential(nn.ConvTranspose2d(i, o, 4, 2, 1, bias=True), _prelu(o))
+    return nn.Sequential(nn.Conv2d(i, o, 3, s, 1, bias=True), _prelu(o))
+
+
+FUSED_4x8_H64_SHAPES = ["512,576", "512,640", "576,576", "576,640"]
+
+
+def run_conv(name, group, i, o, ih, iw, st, a):
+    dt = torch.bfloat16 if a.dtype == "bf16" else torch.float32
+    torch.manual_seed(0)
+    m = build_conv(i, o, st).to(dt)
+    x = torch.rand(1, i, ih, iw, dtype=dt)
+    oh, ow = (ih * 2, iw * 2) if st < 0 else (ih // st, iw // st)
+    macs = conv_macs(i, o, ih, iw, st)
+
+    print("op            %s" % name)
+    print("group         %s" % group)
+    print("in            1x%dx%dx%d  dtype=%s" % (i, ih, iw, a.dtype))
+    print("out           1x%dx%dx%d" % (o, oh, ow))
+    print("stride        %d%s" % (st, "  (ConvTranspose2d 4,2,1)" if st < 0 else ""))
+    print("MMAC          %.1f" % (macs / 1e6))
+    print("MFLOP         %.1f   (2 x MACs)" % (2 * macs / 1e6))
+
+    with torch.no_grad():
+        ref = m(x).float()
+
+    print("torch.compile fullgraph=True")
+    md = m.to(a.device)
+    xd = x.to(a.device)
+    fn_ = torch.compile(md, backend="neuron", dynamic=False, fullgraph=True)
+    with torch.no_grad():
+        got = fn_(xd).float().cpu()
+    print("ran           output %s" % (tuple(got.shape),))
+
+    if got.shape != ref.shape:
+        print("ACCURACY      n/a: device %s vs cpu %s" % (tuple(got.shape), tuple(ref.shape)))
+        return 1
+    diff = (ref - got).abs()
+    amax = diff.max().item()
+    rel = amax / max(ref.abs().max().item(), 1e-12)
+    mse = (diff ** 2).mean().item()
+    psnr = float("inf") if mse == 0 else 10.0 * math.log10(
+        max(ref.abs().max().item() ** 2, 1e-12) / mse)
+    cos = torch.nn.functional.cosine_similarity(
+        ref.flatten().double(), got.flatten().double(), dim=0).item()
+    ok = rel <= 1e-3
+    print("ACCURACY      max_abs %.3e  rel %.3e  PSNR %.2f dB  cos %.8f  [%s vs rel 1e-3]"
+          % (amax, rel, psnr, cos, "PASS" if ok else "FAIL"))
+    print()
+    return 0 if ok else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--op", required=True, choices=sorted(OPS))
-    ap.add_argument("--shape", required=True, help="C,H,W")
+    ap.add_argument("--op", required=True)
+    ap.add_argument("--shape")
+    ap.add_argument("--list-convs", action="store_true")
+    ap.add_argument("--fused-shapes", action="store_true")
     ap.add_argument("--device", default="neuron")
     ap.add_argument("--flow-mag", type=float, default=8.0)
-    # Uniform random flow is NOT a valid accuracy test. At mag 2 it still has ~4 px
-    # neighbour-to-neighbour jumps, so a bounded-radius kernel is scored against
-    # displacement it never claimed to support. Real optical flow is smooth: the
-    # model's measured field is max 2.33 px with 0.04 px neighbour jumps. --flow-smooth
-    # upsamples a coarse control grid to get that property. METHOD.md section 5.
-    ap.add_argument("--flow-smooth", action="store_true",
-                    help="smooth (bicubic-upsampled) flow instead of uniform random")
-    # Support radius for the bounded-neighbourhood arms. R covers displacement up to
-    # EXACTLY R px, not R.xx: measured on CPU, the gate passes at 2.00 px and fails at
-    # 2.10 (19 LSB) and 2.33 (75 LSB). The model's real flow is 2.33 px max, so R=3 is
-    # the smallest radius that can pass. Kept a flag, not hardcoded, so the cliff stays
-    # testable and the ctx sites can be swept.
-    ap.add_argument("--radius", type=int, default=3,
-                    help="support radius for nkishift/shiftmatmul; (2R+1)^2 terms")
+    ap.add_argument("--flow-smooth", action="store_true")
+    ap.add_argument("--radius", type=int, default=3)
     ap.add_argument("--dtype", default="fp32", choices=("fp32", "bf16"))
     ap.add_argument("--int-flow", action="store_true")
     a = ap.parse_args()
 
+    if a.list_convs:
+        H, W = (int(v) for v in (a.shape or "576,640").split(","))
+        inv = conv_inventory(H, W)
+        tot = sum(conv_macs(i, o, ih, iw, st) for _n, _g, i, o, ih, iw, st in inv)
+        ctx = sum(conv_macs(i, o, ih, iw, st) for _n, g, i, o, ih, iw, st in inv if g == "ctx")
+        print("%-16s %-8s %6s %6s %11s %7s %12s" %
+              ("op", "group", "in_ch", "out_ch", "in_hxw", "stride", "MMAC"))
+        for n, g, i, o, ih, iw, st in inv:
+            print("%-16s %-8s %6d %6d %11s %7d %12.1f"
+                  % (n, g, i, o, "%dx%d" % (ih, iw), st, conv_macs(i, o, ih, iw, st) / 1e6))
+        print()
+        print("ops %d   MACs single pass %.2f G   per forward (ctx x2) %.2f G"
+              % (len(inv), tot / 1e9, (tot + ctx) / 1e9))
+        return 0
+
+    if not a.shape and not a.fused_shapes:
+        ap.error("need --shape, or --fused-shapes to sweep the 4x8 halo-64 shapes")
+
     if a.device == "neuron":
         import torch_neuronx  # noqa: F401
+
+    if a.op.startswith("conv:") or any(a.op == n for n, *_ in conv_inventory(576, 640)):
+        shapes = FUSED_4x8_H64_SHAPES if a.fused_shapes else [a.shape]
+        rcs = 0
+        for sh in shapes:
+            H, W = (int(v) for v in sh.split(","))
+            inv = conv_inventory(H, W)
+            if a.op.startswith("conv:"):
+                grp = a.op.split(":", 1)[1]
+                sel = [o for o in inv if o[1] == grp]
+                if not sel:
+                    ap.error("no conv group %r; groups are ifblock, ctx, unet" % grp)
+            else:
+                sel = [o for o in inv if o[0] == a.op]
+            for n, g, i, o, ih, iw, st in sel:
+                rcs |= run_conv(n, g, i, o, ih, iw, st, a)
+        return rcs
 
     C, H, W = (int(v) for v in a.shape.split(","))
     dt = torch.bfloat16 if a.dtype == "bf16" else torch.float32
@@ -205,12 +331,6 @@ def main():
     torch.manual_seed(0)
     x = torch.rand(1, C, H, W, dtype=dt)
     if a.flow_smooth:
-        # Coarse control grid upsampled: smooth like real optical flow. Rescaled after
-        # interpolation because bicubic overshoots and would exceed flow_mag.
-        # Control grid ~1/16 of the output, so the upsample ratio (and hence smoothness)
-        # is scale-invariant. A fixed 8x10 grid is NOT smooth when the output is itself
-        # small -- at 8x10 out it gives a 4.28 px neighbour jump, at 992x1280 it gives
-        # 0.03 px. Clamped to >=2 so interpolate always has something to work with.
         ch, cw = max(2, H // 16), max(2, W // 16)
         ctrl = (torch.rand(1, 2, ch, cw) * 2 - 1)
         flow = F.interpolate(ctrl, size=(H, W), mode="bicubic", align_corners=True)
@@ -250,8 +370,7 @@ def main():
         bulk = (by, bx)
         print("bulk_shift    (dy=%d, dx=%d)  computed on host, baked as a constant" % bulk)
 
-    cc = dict(backend="neuron", dynamic=False, fullgraph=True)
-    print("torch.compile %s" % cc)
+    print("torch.compile fullgraph=True")
     op = OPS[a.op]
     if a.op == "shiftmatmul":
         _b = bulk
@@ -260,7 +379,7 @@ def main():
     elif a.op == "nkishift":
         _r = a.radius
         op = lambda t, f: warp_nkishift(t, f, radius=_r)
-    fn = torch.compile(op, **cc)
+    fn = torch.compile(op, backend="neuron", dynamic=False, fullgraph=True)
 
     with torch.no_grad():
         out = fn(x, flow)

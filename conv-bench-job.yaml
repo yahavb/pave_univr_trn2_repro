@@ -40,41 +40,23 @@ spec:
               echo "neuronx-cc: $(neuronx-cc --version 2>&1 | head -1 || true)"
               echo ""
 
-              # ============================================================================
-              # THE 54 CONVS: the half of the model that was never benchmarked
-              # ============================================================================
-              # warp_op_bench.py measured 14 of the model's ~68 ops -- every resample, nothing else.
-              # That leaves a contradiction nobody has resolved:
-              #     sum of the 14 warp sites, from measured active_us   ~614 ms per tile-triplet
-              #     README --per-block, resample = 62.1% of a forward   ~2562 ms against 4125 ms
-              # 4.2x apart. One is wrong, and "the resample dominates" -- the premise behind every
-              # kernel attempt in this repo, including the shiftwarp work that failed -- rests on
-              # the larger figure. It cannot be settled without the other 54 ops, because only then
-              # is sum(convs) + sum(warps) checkable against the wall clock.
+              # One script, warp_op_bench.py, covers both halves of the model: the 14 resamples and
+              # the 54 convs. Every conv is scored against the same module on CPU, which the old
+              # standalone conv bench never did.
               #
-              # Suspected cause of the disagreement, unverified: the warp numbers are
-              # total_active_time from a device profile (device-BUSY) while --per-block uses
-              # barriered host timers (WALL, and only under --compile none). This job uses the same
-              # profile path as the warp bench so the two sums are commensurable.
+              # TILE defaults to 576,640 -- the largest padded shape of 4x8 halo 64, the only
+              # geometry whose whole forward compiles fused. Every earlier number used 992x1280,
+              # the 2x4 halo-128 tile the fused path does not use.
               #
-              # THE INVENTORY IS VERIFIED, NOT ASSUMED. conv_op_bench.py derives it from the model
-              # source and it matches the checkpoint exactly: 54 four-dimensional weight tensors
-              # excluding the 11 training-only block_tea ones (33 IFBlock + 8 Contextnet + 13 Unet),
-              # and spot-checked channel counts agree including ConvTranspose2d's transposed
-              # (in,out) layout. 188.35 GMAC per forward at the 992x1280 tile.
-              #
-              # WHAT TO LOOK FOR: tensor_engine share and mfu_max_achievable per op. The frame does
-              # 5.9 TFLOP of conv work in 4125 ms, which implies ~1.43 TFLOP/s. If MFU is low and
-              # the convs are landing on the wrong engine or are DMA-bound, that is where the
-              # missing time is -- and it is the case Trainium should be good at, unlike the
-              # descriptor-bound resample.
+              # NEURON_CC_FLAGS must not carry --model-type unet-inference: it is the sole cause of
+              # the NCC_EBIR033 DMA rejection.
 
               OUT=/tmp/univr_cb_out; mkdir -p "$OUT"
               POUT="$OUT/perneff"; mkdir -p "$POUT"
-              TILE="${TILE:-992,1280}"
+              TILE="${TILE:-576,640}"
 
               echo "=== INVENTORY at tile $TILE ==="
-              python3 conv_op_bench.py --list --tile "$TILE" 2>&1 | tee "$OUT/0_inventory.txt"
+              python3 warp_op_bench.py --op x --list-convs --shape "$TILE" 2>&1 | tee "$OUT/0_inventory.txt"
               echo ""
 
               # One op per invocation, each in its own process, so the new NEFF is unambiguous and
@@ -84,7 +66,7 @@ spec:
               # of the row rather than on keywords keeps the trailing prose in --list out: a line
               # like "that is where the unexplained 4.2x ... lives" otherwise parses as an op named
               # "that", which is how a 55th op appeared in a 54-op inventory.
-              OPS=$(python3 conv_op_bench.py --list --tile "$TILE" \
+              OPS=$(python3 warp_op_bench.py --op x --list-convs --shape "$TILE" \
                     | awk '$6 ~ /^-?[0-9]+$/ && $7 ~ /^[0-9.]+$/ {print $1"|"$7}' || true)
               N=$(echo "$OPS" | grep -c . || echo 0)
               echo "=== PROFILING $N conv ops, one NEFF each ==="
@@ -95,14 +77,14 @@ spec:
                 echo "---- $OP  ($MMAC MMAC) ----"
                 BEFORE=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | sort || true)
                 set +e
-                python -u conv_op_bench.py --op "$OP" --tile "$TILE" --device neuron \
+                python -u warp_op_bench.py --op "$OP" --shape "$TILE" --device neuron \
                     --dtype fp32 2>&1 | tee "$OUT/$OP.log"
                 rc=${PIPESTATUS[0]}
                 set -e
                 if [ "$rc" != "0" ]; then
                   echo "  RUN FAILED rc=$rc"; tail -12 "$OUT/$OP.log" | sed 's/^/    /'; continue
                 fi
-                for i in $(seq 1 30); do pgrep -f conv_op_bench.py >/dev/null || break; sleep 2; done
+                for i in $(seq 1 30); do pgrep -f warp_op_bench.py >/dev/null || break; sleep 2; done
                 sleep 5
                 AFTER=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | sort || true)
                 NEW=$(comm -13 <(echo "$BEFORE") <(echo "$AFTER") || true)
@@ -183,7 +165,7 @@ spec:
             - name: NEURON_RT_VISIBLE_CORES
               value: "0-7"
             - name: NEURON_CC_FLAGS
-              value: "--lnc 1 --model-type unet-inference"
+              value: "--lnc 1"
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
               value: "/tmp/neff_cache"
             - name: OMP_NUM_THREADS
