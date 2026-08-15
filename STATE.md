@@ -1,6 +1,6 @@
 # Session state
 
-HEAD `7061814`, `main`, pushed. Local `~/pave_univr_trn2_repro`.
+HEAD `c9399d3`, `main`, pushed. Local `~/pave_univr_trn2_repro`.
 Origin repo for reference only: `~/pave-unrolling`.
 
 ## The goal
@@ -93,16 +93,51 @@ predates every change this session. It also died outright in this image three ti
 script entirely, so it cannot be reproduced here at all. Fused numbers are comparable only
 to other fused numbers.
 
-## Next step: the actual number
+## MEASURED: fused latency, and it fails accuracy
 
-4x8 halo 64 compiles. What has never been produced is a latency or accuracy figure for it.
-Run 8 cores, `--iters 3`, `NEURON_CC_FLAGS="--lnc 1"`, and read the steady-state median
-WITH the accuracy gate. `prod-4x8-halo64-job.yaml` is close to this but predates the
---compile removal and the flag finding; check its flags before using it.
+`univr-prod-4x8-h64-vggks`, 4x8 halo 64, 8 cores, `--iters 3`, `NEURON_CC_FLAGS="--lnc 1"`:
 
-Accuracy is not optional: halo 64 is a correctness change (the production halo is 128) and
-too little halo fails SILENTLY as edge artefacts that look plausible while disagreeing with
-the untiled reference.
+| arm | median | max_diff | PSNR | NEFFs |
+|---|---|---|---|---|
+| gather | **3900.5 ms** (3871.4-3946.7) | 92.56 LSB | 48.74 dB | +7 |
+| nki-dyn | **3820.4 ms** (3801.4-3836.4) | 92.56 LSB | 48.74 dB | +8 |
+
+Against 3673.3 ms in the README and 4125.5 ms for the same command re-run here. So fusion
+RUNS and sits between them -- not a win yet, not a disaster. Both fail the 3-LSB gate.
+
+**The accuracy is bit-identical across two different resample implementations** -- 92.56 LSB
+and 48.74 dB to every digit, from plain-torch indirect gather and from an NKI indirect-DMA
+kernel. The fault is in code they SHARE, not in either warp.
+
+**And it is not halo starvation**, which is what dropping halo 128 -> 64 would predict. The
+spatial breakdown puts the worst error in the INTERIOR:
+
+```
+merge seam +/-4 rows   max 28.82
+top border 32 rows     max 17.37
+bottom border 32 rows  max 43.15
+interior (128 cut)     max 92.56   <-- worst
+```
+
+Sparse rather than systematic: p50 0.14 LSB, mean 0.356, 1.49% of pixels above 3 LSB,
+cosine 0.999968. Isolated pixels going badly wrong throughout the frame.
+
+Note also `d2h` was **91.4%** of the summed per-core time (22,498 ms of 24,627) against `dev`
+at 4.4%. The script's own caveat says `dev+d2h` is reliable as a sum and the split only
+indicative, but device work is clearly a small fraction of that wall clock.
+
+**`gridsample` cannot compile fused.** OOM-killed at 169 min and again at 94 min at 1500Gi,
+on the same geometry where gather and nki-dyn both compile. Consistent with the
+microbenchmark: it issues 3-205x more DMA descriptors than gather (3.0 pkt/px at C=3 rising
+to 205 at C=128), so its fused graph is far larger. It cannot serve as the reference
+implementation under fusion.
+
+Two other host-side caps found along the way, both fixed:
+* `FailOnRecompileLimitHit` -- dynamo's `cache_size_limit` defaults to **8**, and this model
+  needs exactly 8 graphs (4 padded shapes x 2 triplet timestamps), so it sat on the limit.
+  One tile never trips it; 8 cores always does. Now 64 / 256, set at import.
+* `backoffLimit` under `spec.template.spec` -- the API server rejects the manifest outright
+  in one job and **silently ignores it** in another. It belongs on `Job.spec`.
 
 ## The rejection history, ALL of it measured WITH `--model-type unet-inference`
 
@@ -178,27 +213,38 @@ deterministic compiler verdicts rather than flaky runs.
 
 ## Open
 
-* **Time and score fused 4x8 halo 64.** The only thing left before there is a result. 8
-  cores, `--iters 3`, `NEURON_CC_FLAGS="--lnc 1"`, steady-state median plus the accuracy
-  gate. `prod-4x8-halo64-job.yaml` is the closest job but predates both the `--compile`
-  removal and the flag finding -- check its flags first.
-* **Whether the OTHER grids fuse without the flag.** Not worth chasing: they are above the
-  memory ceiling (2x4 1.0M px, 3x4 811k, 2x8 594k) and OOM regardless. Only worth
-  revisiting if the compiler's memory behaviour changes.
-* **Whether `--model-type transformer` or `generic` is better than dropping it.** All three
-  fuse. Untested for output correctness or speed -- `--model-type` may affect scheduling,
-  so a fused-and-fast result under `--lnc 1` alone should still be checked against one of
-  the others before anyone concludes the flag is purely harmful.
-* **`ip-192-168-192-40` S3 mount is broken**, and it is a cluster-owner problem, not a
-  kubectl one. The Mountpoint pod and the CSI node driver never complete their
-  `/comm/mount.sock` handshake -- the pod waits exactly 120 s, times out, restarts. The
-  driver DOES request the mount and the Mountpoint pod IS created, so it is neither a
-  missing daemon nor IAM. `.40` differs from the working `.189` in nodegroup
-  (`trn3-dev1-48xl-efa` vs `cr1-no-efa`), launch template, AMI, `CAPACITY_BLOCK` capacity
-  type, and it lacks the `alpha.eksctl.io/*` labels entirely. Most likely a host
-  filesystem or mount-propagation difference on that AMI. The `s3-csi-controller` TLS
-  handshake error in its `--previous` log is dated 20 h earlier and is NOT the current
-  fault. **Every job is pinned to `.189` as a result** -- see the nodeSelector.
+* **Why the fused frame fails accuracy at 92.56 LSB.** The live question.
+  `accuracy-triage-job.yaml` runs `gather` at halo 128 -- the only remaining variable, since
+  gridsample cannot compile fused and the two warps already agree to every digit. Its largest
+  shape is 704x768 = 540,672 px, inside the ~442k-594k memory ceiling, so it may OOM rather
+  than answer. That job also produces the system-profile bundle.
+* **The system-profile bundle for Neuron Explorer.** `accuracy-triage-job.yaml` stages 2-3
+  build the directory-upload format: `trace_info.pb` (required), the host `.pb` files,
+  `.neff`, `.ntff` with a backfill, plus the source and a PROVENANCE.txt. `trace_info.pb`
+  comes from the runtime INSPECT env vars, NOT from a capture command -- capture only ever
+  emits `.ntff`. Expect the `.ntff` slot to need the backfill: the forward dispatches async
+  and the runtime device-profiler emits nothing for async workloads.
+* **Re-measure the microbenchmark at the fused shapes.** Every existing per-op number --
+  49,278 us for gather, ~38 ns/descriptor, 2.0 packets/pixel -- was taken at 992x1280 under
+  `--model-type unet-inference`. Both are now wrong for the running config: the fused shapes
+  are 294k-368k px, and the flag is gone. `microbench-job.yaml` defaults to the four fused
+  shapes. **Whether the flag changed single-op numbers is untested** -- it demonstrably
+  changes DMA lowering at whole-graph scale. One arm settles it: `gather` at one shape, flag
+  on vs flag off, compare descriptor counts. Same means the old numbers stand; different
+  means they are void.
+* **`--model-type transformer` / `generic` also fuse.** Untested for correctness or speed.
+  Worth one check before concluding the flag is purely harmful, since it may affect scheduling.
+* **The other grids under the memory ceiling.** Not worth chasing: 2x4 1.0M px, 3x4 811k,
+  2x8 594k all OOM regardless of flags, and 2x8 died at 600, 1000 AND 1500Gi.
+* **`ip-192-168-192-40` S3 mount is broken** -- a cluster-owner problem, not a kubectl one.
+  The Mountpoint pod and the CSI node driver never complete their `/comm/mount.sock`
+  handshake: the pod waits exactly 120 s, times out, restarts. The driver DOES request the
+  mount and the Mountpoint pod IS created, so it is neither a missing daemon nor IAM. `.40`
+  differs from the working `.189` in nodegroup (`trn3-dev1-48xl-efa` vs `cr1-no-efa`), launch
+  template, AMI, `CAPACITY_BLOCK` capacity type, and lacks the `alpha.eksctl.io/*` labels.
+  Most likely a host filesystem or mount-propagation difference on that AMI. The
+  `s3-csi-controller` TLS error in its `--previous` log is 20 h stale and NOT the cause.
+  **Every job is pinned to `.189`** -- `s3-mount-test-pod.yaml` checks a node in 85 s.
 
 ## Files
 
@@ -210,12 +256,13 @@ deterministic compiler verdicts rather than flaky runs.
 | `METHOD.md` / `REPRO_README.md` | original bundle docs |
 | `microbench.py` | the microbenchmark: 14 resamples + 54 convs, one op per invocation, each scored against a CPU reference |
 | `profile_roofline.py` | reads a `summary.json`, prints per-engine time and MFU |
-| `sweep-job.yaml` | runs it. `SET=warps|convs|both`, defaults to the four 4x8 halo-64 shapes |
+| `microbench-job.yaml` | runs it. `SET=warps|convs|both`, defaults to the four 4x8 halo-64 shapes |
 | `ccflag-fusion-job.yaml` | the flag sweep that found `--model-type unet-inference`. Done |
-| `prod-4x8-halo64-job.yaml` | fused timing. Predates the `--compile` removal and the flag finding -- check its flags |
+| `prod-4x8-halo64-job.yaml` | the fused timing run that produced 3900.5 / 3820.4 ms |
 | `repro-job.yaml` | whole model, original hardcoded `nki` arms |
 | `bigtile-noflag-job.yaml` | the job that proved 4x8 halo 64 fuses on all four shapes |
-| `fused-config-search-job.yaml` | geometry x warp under fullgraph. Superseded by the above |
+| `fused-config-search-job.yaml` | geometry x warp under fullgraph. Superseded |
+| `accuracy-triage-job.yaml` | **the live job.** gather at halo 128, then the Neuron Explorer system-profile bundle |
 | `s3-mount-test-pod.yaml` | 85-second PVC mount check on a chosen node |
 | `nki_shift_warp.py` | the dead kernel, kept for the measured op-level result |
 
@@ -237,7 +284,18 @@ Deleted this session as dead ends: `profile-model-job.yaml`, `compile-modes-job.
 * **`--compile` no longer exists.** The script is always
   `torch.compile(m, backend="neuron", dynamic=False, fullgraph=True)`. There is no eager
   path, no `whole`/`halves`/`stages`. `--per-block` and `--record-flow` now error
-  unconditionally because neither is traceable under fullgraph.
+  unconditionally because neither is traceable under fullgraph. Consequence: the eager
+  figures (3673.3 ms README, 4125.5 ms re-run) can no longer be reproduced here at all, so
+  fused numbers are comparable only to other fused numbers.
+* **Dynamo's `cache_size_limit` defaults to 8** and this model needs exactly 8 graphs
+  (4 padded shapes x 2 triplet timestamps), so it sat on the limit -- one tile never trips it,
+  8 cores always does, and under fullgraph it is a hard error. Set to 64 / 256 at import.
+  It is a HOST trace counter: unrelated to cores or device memory, and reducing `--cores`
+  would only double wall clock.
+* **Names drifted from what the files do**, twice. `warp_op_bench.py` benchmarked warps AND
+  convs; `sweep-job.yaml` ran the whole microbenchmark. Now `microbench.py` and
+  `microbench-job.yaml`. `conv_op_bench.py` and `conv-bench-job.yaml` are deleted -- they
+  differed from the sweep only in which op list they looped over.
 * **`NEURON_CC_FLAGS` must NOT contain `--model-type unet-inference`.** It is the single
   cause of the DMA rejection. Use `--lnc 1`.
 * **Pin every job to `ip-192-168-192-189`.** `node-type=trn3-dev1` matches more than one

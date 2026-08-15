@@ -185,12 +185,12 @@ requires NKI, where descriptors are under direct control.
 ## 8. Reproduce
 
 ```bash
-kubectl delete job univr-sweep --ignore-not-found
-kubectl apply -f sweep-job.yaml
-kubectl logs -f job/univr-sweep
+kubectl delete job univr-microbench --ignore-not-found
+kubectl apply -f microbench-job.yaml
+kubectl logs -f job/univr-microbench
 ```
 
-Results archive to `/var/mdl/univr_neuron/univr_sweep_<ts>.tar.gz`, which is
+Results archive to `/var/mdl/univr_neuron/univr_microbench_<ts>.tar.gz`, which is
 `s3://621547421844-ap-southeast-4/univr_neuron/`. Re-read any captured profile with:
 
 ```bash

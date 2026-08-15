@@ -1,14 +1,14 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: univr-sweep
+  name: univr-microbench
   namespace: default
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: univr-sweep
+        app: univr-microbench
     spec:
       restartPolicy: Never
       nodeSelector:
@@ -43,21 +43,6 @@ spec:
               PAIRS="$OUT/pairs"; mkdir -p "$PAIRS"
               POUT=/tmp/perneff; mkdir -p "$POUT"
 
-              # ONE job for the whole microbenchmark. sweep-job and conv-bench were separate only
-              # because they looped over different op lists; both called the same script, captured
-              # NEFFs the same way and ran profile_roofline.py. 116 and 115 lines of near-duplicate.
-              #
-              # SET selects which ops run:
-              #   warps  the 14 resample sites, at the fused 4x8 halo-64 shapes
-              #   convs  all 54 convs, at one shape
-              #   both   everything
-              #   or pass SPECS directly to override
-              #
-              # SHAPES defaults to the four padded shapes of 4x8 halo 64 -- the only geometry whose
-              # whole forward compiles fused. Every earlier microbenchmark number was taken at
-              # 992x1280, the 2x4 halo-128 tile the fused path does not use: 1,269,760 px against a
-              # largest fused shape of 368,640, a 3.4x difference. So none of those numbers describe
-              # the geometry now running.
               SET="${SET:-both}"
               SHAPES="${SHAPES:-512,576 512,640 576,576 576,640}"
 
@@ -134,7 +119,7 @@ spec:
                 cp "$BIG" "$PD/$hash.neff"; cp "$ntff" "$PD/$hash.ntff"; cp "$json" "$PD/summary.json"
               done
 
-              echo "################ SUMMARY -- production tile 992x1280"
+              echo "################ MICROBENCH SUMMARY"
               printf "  %-22s %12s %10s %12s %10s %10s %6s\n" op_shape active_us gpsimd% sw_packets pkt_per_px max_LSB gate
               for f in "$OUT"/roofline_*.txt; do
                 [ -f "$f" ] || continue
@@ -149,7 +134,7 @@ spec:
               done
               echo ""
 
-              ARCHIVE=/tmp/univr_sweep_$(date -u +%Y%m%d_%H%M%S).tar.gz
+              ARCHIVE=/tmp/univr_microbench_$(date -u +%Y%m%d_%H%M%S).tar.gz
               tar -czf "$ARCHIVE" -C /tmp mb
               mkdir -p /var/mdl/univr_neuron
               cp "$ARCHIVE" /var/mdl/univr_neuron/
