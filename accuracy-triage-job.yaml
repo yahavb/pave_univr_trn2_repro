@@ -252,7 +252,7 @@ spec:
               # The upload tool takes the source too, and a trace is much less useful without the
               # exact code that produced it. Commit SHA is recorded so the bundle is unambiguous.
               SRC="$SYSTRACE/source"; mkdir -p "$SRC"
-              cp repro_unrolling_trn2.py nki_shift_warp.py warp_op_bench.py conv_op_bench.py \
+              cp repro_unrolling_trn2.py nki_shift_warp.py microbench.py conv_op_bench.py \
                  profile_roofline.py "$SRC/" 2>/dev/null || true
               cp STATE.md TILING_AND_GRAPH.md SINGLE_GRAPH_NCC_EBIR033.md METHOD.md "$SRC/" 2>/dev/null || true
               cp accuracy-triage-job.yaml "$SRC/" 2>/dev/null || true

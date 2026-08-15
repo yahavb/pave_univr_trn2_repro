@@ -10,7 +10,7 @@ UNMEASURED.
 per forward. A profile of that cannot say what the resample costs, so it cannot guide
 a kernel.
 
-`warp_op_bench.py` runs ONE op at ONE shape under
+`microbench.py` runs ONE op at ONE shape under
 `torch.compile(backend="neuron", dynamic=False, fullgraph=True)`. Each invocation
 produces one NEFF attributable to that op and shape. No NKI kernels: `gather` is
 `index_select`, `gridsample` is `F.grid_sample`, the rest are `roll`/slice/`stack`.

@@ -10,7 +10,7 @@ never reproduced). g6e L40S is 351.1 ms measured, 161 ms with ONNX+TRT.
 
 ## Where the time goes — MEASURED, and it is not where the kernel work assumed
 
-Per tile-triplet, device-active, from `conv-bench-job.yaml` and the warp sweep:
+Per tile-triplet, device-active, from the microbenchmark:
 
 | | ms | share of device-active |
 |---|---|---|
@@ -208,11 +208,9 @@ deterministic compiler verdicts rather than flaky runs.
 | `TILING_AND_GRAPH.md` | **read first.** Tiling algorithm, halo, quantisation, the full op graph, why the operand is `px x 14` |
 | `SINGLE_GRAPH_NCC_EBIR033.md` | the fusion walls, and that fusion is per TILE not per frame |
 | `METHOD.md` / `REPRO_README.md` | original bundle docs |
-| `warp_op_bench.py` | one warp op at one shape |
-| `conv_op_bench.py` | the 54 convs; `--list` prints the checkpoint-verified inventory |
+| `microbench.py` | the microbenchmark: 14 resamples + 54 convs, one op per invocation, each scored against a CPU reference |
 | `profile_roofline.py` | reads a `summary.json`, prints per-engine time and MFU |
-| `sweep-job.yaml` | the warp microbench sweep |
-| `conv-bench-job.yaml` | profiles all 54 convs |
+| `sweep-job.yaml` | runs it. `SET=warps|convs|both`, defaults to the four 4x8 halo-64 shapes |
 | `ccflag-fusion-job.yaml` | the flag sweep that found `--model-type unet-inference`. Done |
 | `prod-4x8-halo64-job.yaml` | fused timing. Predates the `--compile` removal and the flag finding -- check its flags |
 | `repro-job.yaml` | whole model, original hardcoded `nki` arms |

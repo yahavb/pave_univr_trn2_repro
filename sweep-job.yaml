@@ -43,37 +43,49 @@ spec:
               PAIRS="$OUT/pairs"; mkdir -p "$PAIRS"
               POUT=/tmp/perneff; mkdir -p "$POUT"
 
-              SPECS=""
-              for S in 3,992,1280 16,496,640 32,248,320 64,124,160 128,62,80; do
-                SPECS="$SPECS gather:$S"
-                SPECS="$SPECS gridsample:$S"
-              done
-              SPECS="$SPECS transpose:3,992,1280"
-              SPECS="$SPECS shift:3,992,1280"
-              SPECS="$SPECS window1:3,992,1280"
-              SPECS="$SPECS window2:3,992,1280"
-              # shiftmatmul is dropped: measured 160,422 us at R=2, bit-identical to
-              # window2 (same packets, same LSB) because the bulk shift is (0,0). It is
-              # 3.3x worse than the gather at C=3, and its cost scales as terms x C x px
-              # while the gather is descriptor-bound and nearly flat in C, so the gap
-              # only widens at the ctx sites. R=3 would double its terms. Nothing left
-              # to learn; window2 already covers the dense-torch cost probe.
-              # Both radii: R=3 is the verdict run (smallest radius that covers the real
-              # 2.33 px flow), R=2 is the cost control. R=2 is KNOWN to fail accuracy at
-              # 2.33 px (78 LSB, verified on CPU) and is here only to price the extra 24
-              # terms against the 39,477 us already measured at R=2 -- otherwise a slower
-              # R=3 could not be attributed to term count vs anything else.
-              SPECS="$SPECS nkishift/3:3,992,1280"
-              SPECS="$SPECS nkishift/2:3,992,1280"
-              for T in 1728,2176 1728,1152 992,2176 992,640 704,1152 576,1152 576,640 576,384; do
-                SPECS="$SPECS gather:3,$T"
-              done
+              # ONE job for the whole microbenchmark. sweep-job and conv-bench were separate only
+              # because they looped over different op lists; both called the same script, captured
+              # NEFFs the same way and ran profile_roofline.py. 116 and 115 lines of near-duplicate.
+              #
+              # SET selects which ops run:
+              #   warps  the 14 resample sites, at the fused 4x8 halo-64 shapes
+              #   convs  all 54 convs, at one shape
+              #   both   everything
+              #   or pass SPECS directly to override
+              #
+              # SHAPES defaults to the four padded shapes of 4x8 halo 64 -- the only geometry whose
+              # whole forward compiles fused. Every earlier microbenchmark number was taken at
+              # 992x1280, the 2x4 halo-128 tile the fused path does not use: 1,269,760 px against a
+              # largest fused shape of 368,640, a 3.4x difference. So none of those numbers describe
+              # the geometry now running.
+              SET="${SET:-both}"
+              SHAPES="${SHAPES:-512,576 512,640 576,576 576,640}"
 
-              # Accuracy is scored against REAL flow: smooth, 2.33 px max, which is what
-              # the model produces. Uniform random flow at the old default of 8 px is
-              # outside every bounded-radius arm's support and made the gate
-              # uninformative -- nkishift and the window arms all reported ~254 LSB
-              # regardless of whether they were correct. METHOD.md section 5.
+              SPECS="${SPECS:-}"
+              if [ -z "$SPECS" ]; then
+                case "$SET" in
+                  warps|both)
+                    for S in $SHAPES; do
+                      SPECS="$SPECS gather:3,$S"
+                      SPECS="$SPECS gridsample:3,$S"
+                      SPECS="$SPECS nkishift/3:3,$S"
+                    done
+                    ;;
+                esac
+                case "$SET" in
+                  convs|both)
+                    CS=$(echo $SHAPES | awk '{print $NF}')
+                    for OP in $(python3 microbench.py --op x --list-convs --shape "$CS" \
+                                | awk '$6 ~ /^-?[0-9]+$/ && $7 ~ /^[0-9.]+$/ {print $1}'); do
+                      SPECS="$SPECS $OP:$CS"
+                    done
+                    ;;
+                esac
+              fi
+              echo "SET=$SET  SHAPES=$SHAPES"
+              echo "arms: $(echo $SPECS | wc -w)"
+              echo ""
+
               FLOW="--flow-smooth --flow-mag 2.33"
 
               for SPEC in $SPECS; do
@@ -92,7 +104,7 @@ spec:
                 echo "################ $TAG"
                 BEFORE=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | sort || true)
                 set +e
-                python -u warp_op_bench.py --op "$OP" --shape "$SHP" --device neuron \
+                python -u microbench.py --op "$OP" --shape "$SHP" --device neuron \
                     $FLOW $RAD 2>&1 | tee "$OUT/$TAG.log"
                 rc=${PIPESTATUS[0]}
                 set -e
@@ -101,7 +113,7 @@ spec:
                 fi
                 PX=$(grep -oE "^output_px +[0-9]+" "$OUT/$TAG.log" | awk '{print $2}' || true)
                 TB=$(grep -oE "^tap_bytes +[0-9]+" "$OUT/$TAG.log" | awk '{print $2}' || true)
-                for i in $(seq 1 30); do pgrep -f warp_op_bench.py >/dev/null || break; sleep 2; done
+                for i in $(seq 1 30); do pgrep -f microbench.py >/dev/null || break; sleep 2; done
                 sleep 8
                 AFTER=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | sort || true)
                 NEW=$(comm -13 <(echo "$BEFORE") <(echo "$AFTER") || true)
