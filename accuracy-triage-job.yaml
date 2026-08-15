@@ -93,6 +93,7 @@ spec:
 
               # halo:warp
               ARMS="${ARMS:-64:gridsample 128:gather 128:gridsample}"
+              echo "=== [1/2] TIMED + SCORED ARMS ==="
               echo "arms: $ARMS"
               echo "reference from univr-prod-4x8-h64-vggks: gather 92.56 LSB, nki-dyn 92.56 LSB"
               echo ""
@@ -156,6 +157,112 @@ spec:
               echo "    this may be a container regression that predates all fusion work."
               echo ""
 
+              # ============================================================================
+              # NEFF + NTFF PAIRS FOR NEURON EXPLORER
+              # ============================================================================
+              # Captured AFTER the timed arms on purpose: neuron-explorer capture perturbs
+              # execution and the steady-state median is the number those arms exist to produce.
+              #
+              # The env block sets the debug vars the profile-querying skill requires, and they must
+              # be present at COMPILE time, not just at capture time -- that is why they are on the
+              # container rather than exported here:
+              #   XLA_IR_DEBUG / XLA_HLO_DEBUG    HLO-level debug info baked into the NEFF
+              #   NEURON_FRAMEWORK_DEBUG          framework-level source attribution
+              #   NEURON_RT_INSPECT_DEVICE_PROFILE  device-level profiling
+              # Without them Instruction.bir_debug_info_source_location is NULL for every row, so
+              # there is no way to attribute a hot instruction back to a source line. Every capture
+              # in this repo so far ran without them, which is why no per-instruction question has
+              # ever been answerable -- and why nothing here has ever read a .ntff.
+              #
+              # NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 is set on the capture command itself, per the
+              # skill: "Do NOT rely on the CLI flag -- use the env var directly". It populates the
+              # DmaPacket and DmaPacketAggregated tables. Those are the descriptor-level tables, and
+              # descriptors are the whole reason this model is slow, so a capture without them
+              # cannot answer the question it is being taken for.
+              #
+              # --profile-nth-exec=2 profiles the SECOND execution, skipping first-call warmup. Note
+              # the output filename becomes <name>_exec_2.ntff, not <name>.ntff.
+              #
+              # NTFFs are NOT deleted here. conv-bench-job.yaml deleted them to save space and that
+              # is exactly why its data could never be re-examined. They are hundreds of MB each,
+              # which is why the pair directory is reported per-file below and the archive size is
+              # printed -- if it is too large for the PVC round-trip, copy pairs individually.
+              echo "=== [2/2] CAPTURE NEFF+NTFF PAIRS FOR NEURON EXPLORER ==="
+              # The skill says to use neuron-explorer, not neuron-profile. But neuron-explorer has
+              # never been invoked in this image -- every capture in this repo used neuron-profile --
+              # so probe for it and fall back rather than losing the whole stage to a missing binary.
+              # Both write a compatible NEFF+NTFF pair; neuron-explorer additionally understands
+              # --profile-nth-exec.
+              if command -v neuron-explorer >/dev/null 2>&1; then
+                CAPTOOL=neuron-explorer
+                echo "  capture tool: neuron-explorer $(neuron-explorer --version 2>&1 | head -1)"
+              else
+                CAPTOOL=neuron-profile
+                echo "  capture tool: neuron-profile (neuron-explorer NOT PRESENT in this image)"
+                echo "  NOTE --profile-nth-exec is neuron-explorer-only; neuron-profile gets"
+                echo "  --single-io instead, so the pair covers the first execution rather than the"
+                echo "  second and includes warmup."
+              fi
+              PAIRS="$OUT/pairs"; mkdir -p "$PAIRS"
+              mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)
+              echo "  ${#NEFFS[@]} NEFFs in the cache after the arms above"
+              ok=0; fail=0
+              for f in "${NEFFS[@]}"; do
+                hash=$(basename "$f" .neff)
+                sz=$(stat -c%s "$f")
+                PD="$PAIRS/$hash"; mkdir -p "$PD"
+                echo "  --- $hash ($sz B) ---"
+                set +e
+                if [ "$CAPTOOL" = "neuron-explorer" ]; then
+                  NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 3600 \
+                    neuron-explorer capture -n "$f" -s "$PD/profile.ntff" --profile-nth-exec=2 \
+                    > "$PD/capture.log" 2>&1
+                else
+                  NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 3600 \
+                    neuron-profile capture --single-io -n "$f" -s "$PD/profile.ntff" \
+                    > "$PD/capture.log" 2>&1
+                fi
+                crc=$?
+                set -e
+                # --profile-nth-exec=2 renames the output; accept either form.
+                NT=$(find "$PD" -name '*.ntff' | head -1)
+                if [ -z "$NT" ]; then
+                  fail=$((fail+1)); echo "    CAPTURE FAILED rc=$crc"
+                  tail -6 "$PD/capture.log" | sed 's/^/      /'
+                  continue
+                fi
+                cp "$f" "$PD/$hash.neff"
+                # summary-json alongside, so the pair is usable without ingesting first.
+                timeout 900 "$CAPTOOL" view -n "$f" -s "$NT" \
+                  --output-format summary-json > "$PD/summary.json" 2>/dev/null || true
+                ok=$((ok+1))
+                echo "    OK  neff $(basename "$PD/$hash.neff")  ntff $(basename "$NT") $(stat -c%s "$NT") B"
+              done
+              echo "  pairs captured OK $ok, failed $fail"
+              echo ""
+              echo "  MANIFEST (what to upload to neuron-explorer):"
+              printf "    %-36s %14s %14s %s\n" hash neff_bytes ntff_bytes summary
+              for d in "$PAIRS"/*/; do
+                [ -d "$d" ] || continue
+                h=$(basename "$d")
+                nb=$(stat -c%s "$d/$h.neff" 2>/dev/null || echo 0)
+                nt=$(find "$d" -name '*.ntff' | head -1)
+                tb=$(stat -c%s "$nt" 2>/dev/null || echo 0)
+                sj=$([ -s "$d/summary.json" ] && echo yes || echo NO)
+                printf "    %-36s %14s %14s %s\n" "$h" "$nb" "$tb" "$sj"
+              done
+              echo ""
+              echo "  TO QUERY, per the profile-querying skill:"
+              echo "    neuron-explorer view -n <hash>.neff -s <profile>_exec_2.ntff \\"
+              echo "      --data-path ~/.local/share/neuron-profile --display-name <name> --disable-ui &"
+              echo "    curl -s -X POST http://localhost:3002/api/v1/db/<name>/_search \\"
+              echo "      -H 'Content-Type: application/json' \\"
+              echo "      -d '{\"type\":\"databaseExplorerQuery\",\"tableName\":\"DmaPacket\",\"query\":\"SELECT COUNT(*) FROM DmaPacket\"}'"
+              echo "  If that COUNT is 0 the DGE env var did not take effect and the descriptor"
+              echo "  tables are empty. If Instruction.bir_debug_info_source_location is NULL on"
+              echo "  every row, the NEFF was built without the XLA/framework debug vars."
+              echo ""
+
               ARCHIVE=/tmp/univr_at_$(date -u +%Y%m%d_%H%M%S).tar.gz
               tar -czf "$ARCHIVE" -C /tmp univr_at_out
               mkdir -p /var/mdl/univr_neuron
@@ -190,6 +297,22 @@ spec:
             # identical in=23,040, every arm without it fused.
             - name: NEURON_CC_FLAGS
               value: "--lnc 1"
+            # Debug vars the profile-querying skill requires. They must be set at COMPILE time,
+            # not only at capture time, or Instruction.bir_debug_info_source_location is NULL on
+            # every row and a hot instruction cannot be traced back to a source line. Every capture
+            # in this repo so far ran without them.
+            - name: XLA_IR_DEBUG
+              value: "1"
+            - name: XLA_HLO_DEBUG
+              value: "1"
+            - name: NEURON_FRAMEWORK_DEBUG
+              value: "1"
+            - name: NEURON_RT_INSPECT_ENABLE
+              value: "1"
+            - name: NEURON_RT_INSPECT_DEVICE_PROFILE
+              value: "1"
+            - name: NEURON_RT_INSPECT_SYSTEM_PROFILE
+              value: "0"
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
               value: "/tmp/neff_cache"
             - name: OMP_NUM_THREADS
