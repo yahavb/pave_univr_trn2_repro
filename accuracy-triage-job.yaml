@@ -93,7 +93,7 @@ spec:
 
               # halo:warp
               ARMS="${ARMS:-64:gridsample 128:gather 128:gridsample}"
-              echo "=== [1/2] TIMED + SCORED ARMS ==="
+              echo "=== [1/3] TIMED + SCORED ARMS ==="
               echo "arms: $ARMS"
               echo "reference from univr-prod-4x8-h64-vggks: gather 92.56 LSB, nki-dyn 92.56 LSB"
               echo ""
@@ -158,112 +158,110 @@ spec:
               echo ""
 
               # ============================================================================
-              # NEFF + NTFF PAIRS FOR NEURON EXPLORER
+              # SYSTEM-PROFILE BUNDLE for Neuron Explorer's directory upload
               # ============================================================================
-              # Captured AFTER the timed arms on purpose: neuron-explorer capture perturbs
-              # execution and the steady-state median is the number those arms exist to produce.
+              # The upload tool wants a DIRECTORY, not a NEFF+NTFF pair:
+              #   trace_info.pb  REQUIRED   system-level trace events
+              #   *.pb           optional   additional trace data (ntrace, cpu_util, host_mem)
+              #   *.ntff         optional   device execution trace
+              #   *.neff         optional   compiled model, for instruction-level analysis
+              # plus the source that produced it.
               #
-              # The env block sets the debug vars the profile-querying skill requires, and they must
-              # be present at COMPILE time, not just at capture time -- that is why they are on the
-              # container rather than exported here:
-              #   XLA_IR_DEBUG / XLA_HLO_DEBUG    HLO-level debug info baked into the NEFF
-              #   NEURON_FRAMEWORK_DEBUG          framework-level source attribution
-              #   NEURON_RT_INSPECT_DEVICE_PROFILE  device-level profiling
-              # Without them Instruction.bir_debug_info_source_location is NULL for every row, so
-              # there is no way to attribute a hot instruction back to a source line. Every capture
-              # in this repo so far ran without them, which is why no per-instruction question has
-              # ever been answerable -- and why nothing here has ever read a .ntff.
+              # trace_info.pb comes from the RUNTIME INSPECT path, not from a capture command --
+              # neuron-profile/neuron-explorer capture only ever emit .ntff. The env vars point at
+              # an output dir and the runtime writes one i-<instance>_pid_<pid>/ directory per rank
+              # with the whole file set:
+              #   NEURON_RT_INSPECT_ENABLE=1         -> system profile, i.e. trace_info.pb
+              #   NEURON_RT_INSPECT_SYSTEM_PROFILE=1 -> the host-side .pb files
+              #   NEURON_RT_INSPECT_DEVICE_PROFILE=1 -> also emit .ntff + .neff
+              # This is the recipe from ~/pave-unrolling/unrolling-job.yaml, which produced working
+              # bundles, rather than something assembled from the docs.
               #
-              # NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 is set on the capture command itself, per the
-              # skill: "Do NOT rely on the CLI flag -- use the env var directly". It populates the
-              # DmaPacket and DmaPacketAggregated tables. Those are the descriptor-level tables, and
-              # descriptors are the whole reason this model is slow, so a capture without them
-              # cannot answer the question it is being taken for.
+              # SYSTEM_PROFILE=0 is set on the container for the timed arms above, deliberately:
+              # inspect writes trace data on every dispatch and would distort the steady-state
+              # median. It is enabled only for this stage, on its own short run.
               #
-              # --profile-nth-exec=2 profiles the SECOND execution, skipping first-call warmup. Note
-              # the output filename becomes <name>_exec_2.ntff, not <name>.ntff.
-              #
-              # NTFFs are NOT deleted here. conv-bench-job.yaml deleted them to save space and that
-              # is exactly why its data could never be re-examined. They are hundreds of MB each,
-              # which is why the pair directory is reported per-file below and the archive size is
-              # printed -- if it is too large for the PVC round-trip, copy pairs individually.
-              echo "=== [2/2] CAPTURE NEFF+NTFF PAIRS FOR NEURON EXPLORER ==="
-              # The skill says to use neuron-explorer, not neuron-profile. But neuron-explorer has
-              # never been invoked in this image -- every capture in this repo used neuron-profile --
-              # so probe for it and fall back rather than losing the whole stage to a missing binary.
-              # Both write a compatible NEFF+NTFF pair; neuron-explorer additionally understands
-              # --profile-nth-exec.
-              if command -v neuron-explorer >/dev/null 2>&1; then
-                CAPTOOL=neuron-explorer
-                echo "  capture tool: neuron-explorer $(neuron-explorer --version 2>&1 | head -1)"
+              # THE .ntff SLOT USUALLY COMES BACK EMPTY, and the origin repo hit this too: the
+              # forward dispatches the device ASYNC and the runtime device-profiler emits no NTFF for
+              # async workloads (their run 40 got 0 .ntff). trace_info.pb, the .pb files and .neff
+              # are written regardless. So step 2b backfills .ntff beside each .neff using the
+              # neuron-profile --single-io path that is known to work in this image -- same directory,
+              # same basename, which is exactly the layout the upload tool expects.
+              echo "=== [2/3] SYSTEM-PROFILE BUNDLE (trace_info.pb) ==="
+              SYSTRACE=/tmp/systrace; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
+              # One arm only, and the cheapest: 4x8 halo 64 gather at 8 cores with --iters 1. The
+              # bundle is about WHERE time goes, not how fast, and iters 1 keeps the trace small.
+              set +e
+              NEURON_RT_INSPECT_ENABLE=1 \
+              NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
+              NEURON_RT_INSPECT_DEVICE_PROFILE=1 \
+              NEURON_RT_INSPECT_OUTPUT_DIR="$SYSTRACE" \
+              python -u repro_unrolling_trn2.py $FRAMES $REF \
+                  --height 1728 --width 4096 --tiles 4x8 --halo 64 --bar 3 \
+                  --device neuron --cores 8 --warp gather --dtype fp32 \
+                  --iters 1 \
+                  2>&1 | tee "$OUT/systrace_run.log"
+              src=${PIPESTATUS[0]}
+              set -e
+              echo "  systrace run rc=$src"
+              echo ""
+
+              echo "--- [2b] backfill the optional .ntff beside each .neff ---"
+              NT_OK=0; NT_TRY=0
+              while IFS= read -r neff; do
+                NT_TRY=$((NT_TRY+1))
+                out="${neff%.neff}.ntff"
+                [ -f "$out" ] && { NT_OK=$((NT_OK+1)); continue; }
+                NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 900 \
+                  neuron-profile capture --single-io -n "$neff" -s "$out" >/dev/null 2>&1 || true
+                [ -f "$out" ] && NT_OK=$((NT_OK+1))
+              done < <(find "$SYSTRACE" -name '*.neff')
+              echo "  .ntff present: $NT_OK / $NT_TRY NEFFs"
+              echo ""
+
+              echo "=== [3/3] BUNDLE THE SOURCE ALONGSIDE THE TRACES ==="
+              # The upload tool takes the source too, and a trace is much less useful without the
+              # exact code that produced it. Commit SHA is recorded so the bundle is unambiguous.
+              SRC="$SYSTRACE/source"; mkdir -p "$SRC"
+              cp repro_unrolling_trn2.py nki_shift_warp.py warp_op_bench.py conv_op_bench.py \
+                 profile_roofline.py "$SRC/" 2>/dev/null || true
+              cp STATE.md TILING_AND_GRAPH.md SINGLE_GRAPH_NCC_EBIR033.md METHOD.md "$SRC/" 2>/dev/null || true
+              cp accuracy-triage-job.yaml "$SRC/" 2>/dev/null || true
+              {
+                echo "commit      : $(git rev-parse HEAD)"
+                echo "subject     : $(git log -1 --pretty=%s)"
+                echo "neuronx-cc  : $(neuronx-cc --version 2>&1 | head -1)"
+                echo "CC flags    : ${NEURON_CC_FLAGS:-<unset>}"
+                echo "config      : 4x8 halo 64, 8 cores, fp32, warp=gather, fullgraph=True"
+                echo "measured    : gather 3900.5 ms / 92.56 LSB, nki-dyn 3820.4 ms / 92.56 LSB"
+                echo "              (job univr-prod-4x8-h64-vggks, --iters 3)"
+                echo "open question: identical accuracy across two different resample kernels, so"
+                echo "              the error is in shared code; worst error is INTERIOR not seams."
+              } > "$SRC/PROVENANCE.txt"
+              echo "  source files: $(ls -1 "$SRC" | wc -l)"
+              echo ""
+
+              echo "--- bundle contents ($SYSTRACE) ---"
+              find "$SYSTRACE" -type f | sed 's|^|  |' | head -60
+              echo "--- file-type breakdown ---"
+              find "$SYSTRACE" -type f -printf '%f\n' 2>/dev/null | sed 's/.*\.//' \
+                | sort | uniq -c | sort -rn | sed 's/^/  /'
+              echo "--- the REQUIRED file ---"
+              if find "$SYSTRACE" -name 'trace_info.pb' | grep -q .; then
+                find "$SYSTRACE" -name 'trace_info.pb' -exec ls -la {} \; | sed 's/^/  /'
+                echo "  UPLOAD-READY: trace_info.pb present"
               else
-                CAPTOOL=neuron-profile
-                echo "  capture tool: neuron-profile (neuron-explorer NOT PRESENT in this image)"
-                echo "  NOTE --profile-nth-exec is neuron-explorer-only; neuron-profile gets"
-                echo "  --single-io instead, so the pair covers the first execution rather than the"
-                echo "  second and includes warmup."
+                echo "  MISSING trace_info.pb -- the bundle will be REJECTED by the upload tool."
+                echo "  Check systrace_run.log: if the run failed there is no trace to write, and if"
+                echo "  it succeeded then NEURON_RT_INSPECT_ENABLE did not take effect."
               fi
-              PAIRS="$OUT/pairs"; mkdir -p "$PAIRS"
-              mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)
-              echo "  ${#NEFFS[@]} NEFFs in the cache after the arms above"
-              ok=0; fail=0
-              for f in "${NEFFS[@]}"; do
-                hash=$(basename "$f" .neff)
-                sz=$(stat -c%s "$f")
-                PD="$PAIRS/$hash"; mkdir -p "$PD"
-                echo "  --- $hash ($sz B) ---"
-                set +e
-                if [ "$CAPTOOL" = "neuron-explorer" ]; then
-                  NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 3600 \
-                    neuron-explorer capture -n "$f" -s "$PD/profile.ntff" --profile-nth-exec=2 \
-                    > "$PD/capture.log" 2>&1
-                else
-                  NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 3600 \
-                    neuron-profile capture --single-io -n "$f" -s "$PD/profile.ntff" \
-                    > "$PD/capture.log" 2>&1
-                fi
-                crc=$?
-                set -e
-                # --profile-nth-exec=2 renames the output; accept either form.
-                NT=$(find "$PD" -name '*.ntff' | head -1)
-                if [ -z "$NT" ]; then
-                  fail=$((fail+1)); echo "    CAPTURE FAILED rc=$crc"
-                  tail -6 "$PD/capture.log" | sed 's/^/      /'
-                  continue
-                fi
-                cp "$f" "$PD/$hash.neff"
-                # summary-json alongside, so the pair is usable without ingesting first.
-                timeout 900 "$CAPTOOL" view -n "$f" -s "$NT" \
-                  --output-format summary-json > "$PD/summary.json" 2>/dev/null || true
-                ok=$((ok+1))
-                echo "    OK  neff $(basename "$PD/$hash.neff")  ntff $(basename "$NT") $(stat -c%s "$NT") B"
-              done
-              echo "  pairs captured OK $ok, failed $fail"
               echo ""
-              echo "  MANIFEST (what to upload to neuron-explorer):"
-              printf "    %-36s %14s %14s %s\n" hash neff_bytes ntff_bytes summary
-              for d in "$PAIRS"/*/; do
-                [ -d "$d" ] || continue
-                h=$(basename "$d")
-                nb=$(stat -c%s "$d/$h.neff" 2>/dev/null || echo 0)
-                nt=$(find "$d" -name '*.ntff' | head -1)
-                tb=$(stat -c%s "$nt" 2>/dev/null || echo 0)
-                sj=$([ -s "$d/summary.json" ] && echo yes || echo NO)
-                printf "    %-36s %14s %14s %s\n" "$h" "$nb" "$tb" "$sj"
-              done
-              echo ""
-              echo "  TO QUERY, per the profile-querying skill:"
-              echo "    neuron-explorer view -n <hash>.neff -s <profile>_exec_2.ntff \\"
-              echo "      --data-path ~/.local/share/neuron-profile --display-name <name> --disable-ui &"
-              echo "    curl -s -X POST http://localhost:3002/api/v1/db/<name>/_search \\"
-              echo "      -H 'Content-Type: application/json' \\"
-              echo "      -d '{\"type\":\"databaseExplorerQuery\",\"tableName\":\"DmaPacket\",\"query\":\"SELECT COUNT(*) FROM DmaPacket\"}'"
-              echo "  If that COUNT is 0 the DGE env var did not take effect and the descriptor"
-              echo "  tables are empty. If Instruction.bir_debug_info_source_location is NULL on"
-              echo "  every row, the NEFF was built without the XLA/framework debug vars."
+              echo "  The bundle is archived below as univr_at_*.tar.gz under /var/mdl/univr_neuron."
+              echo "  Untar it and point the directory upload at the i-*_pid_*/ directory inside."
               echo ""
 
               ARCHIVE=/tmp/univr_at_$(date -u +%Y%m%d_%H%M%S).tar.gz
+              cp -r "$SYSTRACE" "$OUT/systrace" 2>/dev/null || true
               tar -czf "$ARCHIVE" -C /tmp univr_at_out
               mkdir -p /var/mdl/univr_neuron
               cp "$ARCHIVE" /var/mdl/univr_neuron/
@@ -307,12 +305,10 @@ spec:
               value: "1"
             - name: NEURON_FRAMEWORK_DEBUG
               value: "1"
-            - name: NEURON_RT_INSPECT_ENABLE
-              value: "1"
-            - name: NEURON_RT_INSPECT_DEVICE_PROFILE
-              value: "1"
-            - name: NEURON_RT_INSPECT_SYSTEM_PROFILE
-              value: "0"
+            # NEURON_RT_INSPECT_* are deliberately NOT set here. The runtime writes trace data on
+            # every dispatch when INSPECT_ENABLE=1, which would distort the steady-state medians the
+            # timed arms exist to measure. The bundle stage exports all three itself, on its own
+            # short --iters 1 run.
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
               value: "/tmp/neff_cache"
             - name: OMP_NUM_THREADS
