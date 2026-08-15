@@ -100,7 +100,25 @@ spec:
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
 
               # halo:warp
-              ARMS="${ARMS:-64:gridsample 128:gather 128:gridsample}"
+              #
+              # ONE ARM: gather at halo 128. gridsample is DROPPED -- it OOM-killed at 169 min and
+              # again at 94 min on 4x8 halo 64 at 1500Gi, the same geometry where gather and nki-dyn
+              # both compile. That is consistent with the microbenchmark: gridsample issues 3-205x
+              # more DMA descriptors than gather (3.0 pkt/px at C=3 up to 205 at C=128), so its fused
+              # graph is far larger and exceeds compiler memory. It cannot serve as the reference
+              # implementation here, so both gridsample arms are removed rather than retried.
+              #
+              # Losing gridsample does not leave the accuracy question blind. The strongest evidence
+              # is already measured and does not need it: gather and nki-dyn produced 92.56 LSB and
+              # 48.74 dB TO EVERY DIGIT -- two structurally different resample implementations,
+              # identical error -- so the fault is in code they share, not in the resample.
+              #
+              # What gather at halo 128 tests is the remaining variable: whether halo 64 is
+              # implicated at all. Largest shape is 704x768 = 540,672 px, inside the measured
+              # ~442k-594k px compiler memory ceiling, so this may OOM rather than answer. Worth one
+              # attempt: a PASS means halo 64 was the cause despite the interior-worst error profile
+              # and the fix is halo 96; ~92 LSB again rules halo out completely.
+              ARMS="${ARMS:-128:gather}"
               echo "=== [1/3] TIMED + SCORED ARMS ==="
               echo "arms: $ARMS"
               echo "reference from univr-prod-4x8-h64-vggks: gather 92.56 LSB, nki-dyn 92.56 LSB"
@@ -150,19 +168,22 @@ spec:
               echo "  measured already: 4x8_h64_gather 3900.5 ms 92.56 LSB / 4x8_h64_nki-dyn 3820.4 ms 92.56 LSB"
               echo ""
               echo "  HOW TO READ IT:"
-              echo "  * h64_gridsample also ~92.56 -> the resample is exonerated. All three forms"
-              echo "    agree, so the error is in the fused graph's conv / interpolate / PReLU"
-              echo "    lowering. Next step is a per-stage numeric diff, not more warp work."
-              echo "  * h64_gridsample PASSES -> both indirect-gather forms are wrong the same way"
-              echo "    under fusion. Narrow and actionable: suspect the uint32 index bitcast, which"
-              echo "    the code comments already flag as corrupting sampling if a guard breaks."
-              echo "  * h128 arms PASS -> halo 64 was the cause despite the interior-worst spatial"
-              echo "    profile, and the fix is halo 96 (largest shape 640x704 = 450,560 px)."
-              echo "  * h128 arms OOM or reject -> expected, 704x768 = 540,672 px sits inside the"
-              echo "    measured ~442k-594k memory ceiling. Then only arm 1 is informative."
-              echo "  * every arm ~92.56 regardless of halo AND warp -> the defect is upstream of"
-              echo "    both. The eager 2x4 gather run in this image already measured 81.46 LSB, so"
-              echo "    this may be a container regression that predates all fusion work."
+              echo "  * ~92.56 LSB again -> halo is NOT the cause. Combined with gather and nki-dyn"
+              echo "    already agreeing to every digit at halo 64, the defect is in shared code and"
+              echo "    independent of both the resample and the halo. Next step is the system-profile"
+              echo "    bundle below plus a per-stage numeric diff, not more sweeps."
+              echo "  * PASS -> halo 64 WAS the cause, despite the interior-worst error profile that"
+              echo "    argued against it. Fix is halo 96: largest shape 640x704 = 450,560 px, just"
+              echo "    above the 442,368 px known to fuse."
+              echo "  * OOM or reject -> expected. 704x768 = 540,672 px sits inside the measured"
+              echo "    ~442k-594k px memory ceiling, and gridsample already OOM-killed twice on the"
+              echo "    smaller halo-64 geometry. Then halo stays untested and the bundle is the"
+              echo "    only thing this job delivers."
+              echo ""
+              echo "  Already measured, 4x8 halo 64, 8 cores, --iters 3, --lnc 1:"
+              echo "    gather      3900.5 ms   92.56 LSB   48.74 dB   +7 NEFFs"
+              echo "    nki-dyn     3820.4 ms   92.56 LSB   48.74 dB   +8 NEFFs"
+              echo "    gridsample  OOMKilled at 169 min and again at 94 min"
               echo ""
 
               # ============================================================================
