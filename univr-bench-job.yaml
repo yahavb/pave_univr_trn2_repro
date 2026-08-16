@@ -1,0 +1,498 @@
+# UniVR 4K unrolling -- Neuron 3-run benchmark, adopting /neuron-3run-benchmark.
+#
+# Replaces the ad-hoc accuracy-triage/prod/bigtile jobs with the skill's mandatory flow and
+# its archive layout. Three things this buys that the old jobs did not have:
+#
+#   1. THE NEFF CACHE SURVIVES THE POD. Every previous job kept it at /tmp/neff_cache on the
+#      container's ephemeral layer, so it died with the pod -- univr-accuracy-triage-gmnpq lost
+#      ~3.5 h of 704x768 compiles that way, and every earlier run threw its compiles away too.
+#      Here the cache is restored from ONE tar object on the PVC and re-archived after EVERY
+#      successful compile, so a pod death costs one tile, not the set.
+#   2. A CLEAN latency number separate from a profiled one. The skill's rule: never report a
+#      profiled run's wall clock. Run 2 is the latency; run 3 is the breakdown.
+#   3. An archive split BY CONSUMER, so each artifact is one action for a human.
+#
+# S3-FUSE IS NOT POSIX. /var/mdl is Mountpoint-for-S3: every file open is a separate S3 GET, so
+# `cp -r`, `tar` over a directory, `find` or a glob on the mount stalls for minutes to hours with
+# no error. Every input and output crosses the mount as ONE tar object, extracted locally.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: univr-bench
+  namespace: default
+spec:
+  # backoffLimit belongs HERE, on Job.spec. Under spec.template.spec the API server rejected one
+  # manifest outright and SILENTLY ignored it in another, so the retry simply did not exist.
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: univr-bench
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        # No kubernetes.io/hostname pin. Two consequences, both real:
+        #   * ip-192-168-192-40 cannot mount this PVC (the Mountpoint pod and the CSI node driver
+        #     never finish their /comm/mount.sock handshake; the pod waits 120 s and restarts). A
+        #     job landing there sits Pending on MountVolume.SetUp indefinitely.
+        #   * the image is :latest with IfNotPresent, so a different node can hold a DIFFERENT
+        #     neuronx-cc. Observed: 2.26.6360.0 on .189 vs 2.27.2878.0 elsewhere. The provenance
+        #     block prints the version -- read it before comparing any number to a past run.
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neurons
+          resourceClaimTemplateName: s-lnc1
+      containers:
+        - name: bench
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+
+              BRANCH="${BRANCH:-main}"
+              cd /tmp
+              git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
+              cd REPRO
+
+              # ── PROVENANCE part 1: which code ──
+              # A run that does not say what it ran is unfalsifiable. git clone does not echo the
+              # branch and a cold compile only proves the cache was not stale.
+              GIT_SHA=$(git rev-parse HEAD); GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+              echo "┌── PROVENANCE ──"
+              echo "│ branch : $GIT_BRANCH (requested: $BRANCH)"
+              echo "│ commit : $GIT_SHA"
+              echo "│ subject: $(git log -1 --pretty=%s)"
+              echo "│ cc     : $(neuronx-cc --version 2>&1 | head -1 || true)"
+              echo "│ ccflags: ${NEURON_CC_FLAGS:-<unset>}"
+              echo "└────────────────"
+
+              # ── PROVENANCE part 2: feature confirmation ──
+              # Proves the dynamo recompile-limit fix is in the code that ran. This model needs
+              # exactly 8 graphs and dynamo's cache_size_limit defaults to 8, so it sat ON the
+              # limit and died with FailOnRecompileLimitHit under fullgraph. One tile never trips
+              # it; 8 cores always does. If these print 8/64 instead of 64/256, STOP.
+              PROBE='import torch,repro_unrolling_trn2; print("cache_size_limit="+str(torch._dynamo.config.cache_size_limit), "accumulated="+str(torch._dynamo.config.accumulated_cache_size_limit))'
+              echo "PROVENANCE FEATURE: $(python3 -c "$PROBE" 2>&1 | tail -1)"
+              echo ""
+
+              # ============================ configuration ============================
+              GRID="${GRID:-4x8}"; HALO="${HALO:-128}"; WARP="${WARP:-gather}"
+              CORES="${CORES:-8}"; ITERS="${ITERS:-5}"
+              # The 8 (padded shape x triplet timestamp) slots a frame needs, one representative
+              # tile each, LARGEST FIRST. run_tiled picks the pass per tile from the merge seam --
+              # need_f = (oy+vy) > H/2, need_b = oy < H/2 -- and H/2 = 864 lands exactly on the
+              # row1/row2 boundary (4 rows x 432), so no tile needs both and each compiles exactly
+              # ONE graph. Verified against plan_tiles(1728,4096,4,8,128); measured +1 NEFF/tile.
+              #   9 /17  704x768  540,672 px      8 /16  704x640  450,560 px
+              #   1 /25  576x768  442,368 px      0 /24  576x640  368,640 px
+              # Largest first so an unfusable shape is found in ~1 h instead of after 8: a frame
+              # needs EVERY shape, so one missing graph makes the whole set worthless.
+              PREWARM_TILES="${PREWARM_TILES:-9 17 8 16 1 25 0 24}"
+              TOPN="${TOPN:-5}"
+              REFERENCE="README trn2 eager 3673.3 ms / 0.64 LSB; g6e L40S 351.1 ms (161 ms ONNX+TRT)"
+
+              CFG="${GRID}_h${HALO}"
+              TS=$(date -u +%Y%m%d_%H%M%S)
+              RUN="exp_univr-${CFG}-${WARP}_${TS}"
+              PVC=/var/mdl/univr
+              RUNDIR="$PVC/runs/$RUN"
+              CACHE_TGZ="$PVC/neff_cache_${CFG}.tar.gz"
+
+              # Local scratch. EVERYTHING is generated here and crosses the mount as one object.
+              R=/tmp/results; rm -rf "$R"; mkdir -p "$R/explorer" "$R/perfetto" "$R/pairs"
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
+              mkdir -p /tmp/neff_cache
+
+              echo "════════════ NEURON 3-RUN BENCHMARK -- UniVR 4K unrolling ════════════"
+              echo "  config    : $GRID halo $HALO warp $WARP  ${CORES} cores  ${ITERS} iters  fp32"
+              echo "  reference : $REFERENCE"
+              echo "  run dir   : $RUNDIR"
+              echo "══════════════════════════════════════════════════════════════════════"
+              echo ""
+
+              # ── publish helper: ONE object across the mount, verified by size, never 0 bytes ──
+              # wc -c not stat -c%s: stat -c is GNU-only and its absent-fallback makes a
+              # SUCCESSFUL copy report a mismatch.
+              mkdir -p "$RUNDIR/explorer" "$RUNDIR/perfetto" || true
+              publish() {
+                local src="$1" dst="$2"
+                [ -f "$src" ] || { echo "  publish SKIP (absent): $(basename "$src")"; return 0; }
+                local n; n=$(wc -c < "$src")
+                [ "$n" -gt 0 ] || { echo "  publish REFUSED (0 bytes): $(basename "$src")"; return 0; }
+                cp "$src" "$dst" || { echo "  publish FAILED: $(basename "$src")"; return 0; }
+                local m; m=$(wc -c < "$dst" 2>/dev/null || echo 0)
+                if [ "$m" = "$n" ]; then
+                  echo "  published $(basename "$dst")  $(( n / 1048576 )) MB  OK"
+                else
+                  echo "  publish SIZE MISMATCH $(basename "$dst"): $n -> $m"
+                fi
+              }
+
+              # Archive the cache as ONE object. Called after EVERY successful compile, which is
+              # the whole point: gmnpq died holding ~3.5 h of uncommitted compiles.
+              archive_cache() {
+                local n; n=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
+                [ "$n" -gt 0 ] || return 0
+                tar -czf /tmp/neff_cache.tar.gz -C /tmp neff_cache 2>/dev/null || return 0
+                publish /tmp/neff_cache.tar.gz "$CACHE_TGZ"
+                echo "  cache archived: $n NEFFs -> $CACHE_TGZ"
+              }
+
+              # The archive MUST be a trap, not the last block: under set -euo pipefail any earlier
+              # failure skips a trailing archive and takes every artifact with it. Observed
+              # elsewhere: an unguarded glob over an empty pairs/ exited 2, pipefail propagated,
+              # and a 3.9 GB trace died with the pod.
+              finalize() {
+                echo ""
+                echo "=== FINALIZE (trap EXIT -- runs even on failure) ==="
+                archive_cache
+                tar -czf "/tmp/univr_results_${TS}.tar.gz" -C /tmp results 2>/dev/null || true
+                publish "/tmp/univr_results_${TS}.tar.gz" "$RUNDIR/univr_results_${TS}.tar.gz"
+                echo "  layout: $RUNDIR"
+                ls -la "$RUNDIR" 2>/dev/null | sed 's/^/    /' || true
+              }
+              trap finalize EXIT
+
+              # ─────────────── [1/3] BUILD/LOAD: restore cache, then compile what is missing ──────
+              echo "┌────────────── NEFF CACHE ──────────────"
+              if [ -f "$CACHE_TGZ" ]; then
+                # Single object off the mount, extracted LOCALLY. Never tar/extract in place on S3.
+                cp "$CACHE_TGZ" /tmp/restore.tar.gz && tar -xzf /tmp/restore.tar.gz -C /tmp \
+                  || echo "│ WARNING: restore failed"
+                echo "│ SOURCE : $CACHE_TGZ ($(du -h "$CACHE_TGZ" | cut -f1))"
+              else
+                echo "│ SOURCE : (none) -- cold compile expected, ~75 min per 704x768 shape"
+              fi
+              CACHE_BEFORE=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
+              echo "│ LOADED : $CACHE_BEFORE prebuilt NEFFs"
+              echo "└─────────────────────────────────────────"
+              echo ""
+
+              FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
+              REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
+              BASE="--height 1728 --width 4096 --tiles $GRID --halo $HALO --bar 3 --device neuron --dtype fp32"
+
+              echo "=== [1/3] BUILD/LOAD -- serial compile probe, ONE graph at a time (not timed) ==="
+              echo "tiles (largest shape first): $PREWARM_TILES"
+              # SERIAL IS LOAD-BEARING. torch.compile is LAZY: neuronx-cc does not run until first
+              # call, inside run_tiled's ThreadPoolExecutor(max_workers=ncore). So --cores 8 on a
+              # cold cache runs EIGHT CONCURRENT compiles and peaks at the sum of eight -- that is
+              # what OOMKilled univr-accuracy-triage-rh7rz (8 h) and -jcbd4 (5 h32m), NOT the tile
+              # shape. Every FUSES verdict on record was taken one compile at a time.
+              PW_ALL=1
+              for T in $PREWARM_TILES; do
+                TAG="pw_${CFG}_t${T}"
+                B=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
+                S=$(date -u +%s)
+                set +e
+                NEURON_LAUNCH_BLOCKING=1 \
+                python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \
+                    --cores 1 --only-tile "$T" --warp "$WARP" --iters 0 \
+                    2>&1 | tee "$R/${TAG}.log"
+                rc=${PIPESTATUS[0]}
+                set -e
+                MIN=$(( ($(date -u +%s) - S) / 60 ))
+                A2=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
+                SH=$(grep -aoE "padded [0-9]+x[0-9]+" "$R/${TAG}.log" | head -1 | awk '{print $2}' || true)
+                printf "%s %s %s %s\n" "$T" "${SH:--}" "$rc" "$MIN" >> "$R/probe_table.txt"
+                if [ "$rc" = "0" ]; then
+                  echo "  tile $T  ${SH:--}  FUSES  ${MIN} min  NEFFs +$((A2-B))  cache=$A2"
+                  archive_cache
+                else
+                  PW_ALL=0
+                  echo "  tile $T  ${SH:--}  FAILED rc=$rc  ${MIN} min  cache=$A2"
+                  # || true is REQUIRED: under pipefail a grep that matches nothing exits 1 and
+                  # set -e would kill the job right before the artifacts get published. An OOM
+                  # leaves no in=/out= operand, so no-match is the EXPECTED case here.
+                  { grep -aoE "got in=[0-9]+ and out=[0-9]+|Instructions generated by compiler [0-9]+ exceeds the typical limit of [0-9]+|MemoryError|Killed" \
+                    "$R/${TAG}.log" || true; } | head -2 | sed 's/^/      /'
+                  echo "  ==> a required graph is missing; abandoning the remaining probe tiles"
+                  break
+                fi
+                for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                sleep 5
+              done
+              echo "  ==> ALL 8 GRAPHS COMPILE = $PW_ALL  (cache holds $(find /tmp/neff_cache -name '*.neff' | wc -l) NEFFs)"
+              echo ""
+
+              T_CLEAN=""; LSB=""; PSNR=""; GATE=""
+              if [ "$PW_ALL" != "1" ]; then
+                echo "=== [2/3] and [3/3] SKIPPED: a required graph is missing ==="
+                echo "  A frame needs every distinct (shape x timestamp). Tiles of a missing shape"
+                echo "  are never written and the run dies with uncovered pixels (rc=139)."
+                echo "  rc=137/Killed above is a REAL per-compile OOM at a named shape -- the"
+                echo "  serial ceiling result the two concurrent-compile OOMs could not establish."
+              else
+
+              # ─────────────── [2/3] CLEAN RUN -- THE latency. No profiler, no INSPECT. ───────────
+              echo "=== [2/3] CLEAN RUN (NO profiler) -- median of $ITERS = THE REAL LATENCY ==="
+              # --save-ref is the output-correctness gate: latency on a model producing garbage is
+              # worthless, and a faster config is often faster because it computes less. It writes
+              # npy + PNG preview + a sha256 provenance manifest.
+              set +e
+              python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \
+                  --cores "$CORES" --warp "$WARP" --iters "$ITERS" \
+                  --save-ref "$R/frame_${CFG}_${WARP}.npy" \
+                  2>&1 | tee "$R/clean.log"
+              crc=${PIPESTATUS[0]}
+              set -e
+              T_CLEAN=$(grep -aoE "steady state: median [0-9.]+ ms" "$R/clean.log" | head -1 | awk '{print $4}' || true)
+              LSB=$(grep -aoE "max_diff +[0-9.]+ LSB" "$R/clean.log" | tail -1 | awk '{print $2}' || true)
+              PSNR=$(grep -aoE "PSNR +[0-9.]+ dB" "$R/clean.log" | tail -1 | awk '{print $2}' || true)
+              GATE=$(grep -aoE "(PASS|FAIL) vs the shipped bar" "$R/clean.log" | tail -1 | awk '{print $1}' || true)
+              NEW=$(find /tmp/neff_cache -name '*.neff' | wc -l)
+              echo "  rc=$crc  median=${T_CLEAN:--} ms  max_diff=${LSB:--} LSB  PSNR=${PSNR:--} dB  gate=${GATE:--}"
+              echo "  NEFFs now $NEW (was $CACHE_BEFORE at entry, expected +0 after the probe --"
+              echo "  any increase means the probe missed a slot and compiles ran CONCURRENTLY here)"
+              archive_cache
+              # Publish the artifact the MOMENT it exists: the profiling stages run longer than the
+              # workload and fail more often, and a frame that finished should not be hostage.
+              publish "$R/frame_${CFG}_${WARP}.png" "$RUNDIR/frame_${CFG}_${WARP}.png"
+              publish "$R/frame_${CFG}_${WARP}.json" "$RUNDIR/frame_${CFG}_${WARP}.json"
+              echo ""
+              echo "  ##################################################################"
+              echo "  #  VALIDATE THE OUTPUT before trusting any number above.         #"
+              echo "  #  kubectl cp <pod>:$R/frame_${CFG}_${WARP}.png ./f.png && open ./f.png"
+              echo "  #  provenance: $GIT_BRANCH@$GIT_SHA                              #"
+              echo "  ##################################################################"
+              echo ""
+
+              # ─────────────── [3/3] PROFILED RUNS -- overhead delta + the two bundles ───────────
+              echo "=== [3/3a] PROFILED RUN -- runtime system trace (trace_info.pb) ==="
+              # trace_info.pb comes from the RUNTIME, not from neuron-profile capture (capture only
+              # ever emits .ntff). If OUTPUT_DIR is unset the runtime writes to ./output and it is
+              # lost with the pod, so it is always set explicitly.
+              SYSTRACE=/tmp/systrace; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
+              set +e
+              NEURON_RT_INSPECT_ENABLE=1 \
+              NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
+              NEURON_RT_INSPECT_DEVICE_PROFILE=1 \
+              NEURON_RT_INSPECT_OUTPUT_DIR="$SYSTRACE" \
+              python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \
+                  --cores "$CORES" --warp "$WARP" --iters 1 \
+                  2>&1 | tee "$R/profiled.log"
+              set -e
+              T_PROF=$(grep -aoE "steady state: median [0-9.]+ ms" "$R/profiled.log" | head -1 | awk '{print $4}' || true)
+              echo "  trace_info.pb count: $(find "$SYSTRACE" -name 'trace_info.pb' | wc -l)"
+              echo "  rank subdirs       : $(find "$SYSTRACE" -maxdepth 1 -type d -name 'i-*' | wc -l)"
+              echo ""
+
+              echo "=== [3/3b] PROFILED RUN -- torch.profiler -> perfetto (names the Python line) ==="
+              set +e
+              python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \
+                  --cores "$CORES" --warp "$WARP" --iters 1 \
+                  --perfetto "$R/perfetto/trace_rank0.json" \
+                  2>&1 | tee "$R/perfetto.log" | grep -aiE "perfetto|median|FAILED" || true
+              set -e
+              publish "$R/perfetto/trace_rank0.json.gz" "$RUNDIR/perfetto/trace_rank0.json.gz"
+              echo ""
+
+              # ─────────────── [4] per-NEFF: capture -> summary-json -> rank by FIXABILITY ───────
+              echo "=== [4] per-NEFF engine breakdown + fixability ranking ==="
+              # neuron-profile CLI ONLY. NEVER the neuron-explorer view SERVER (--ingest-only, the
+              # :3001/:3002/:8086 UI, SQL-over-curl) -- it hangs on big DMA NEFFs on this image.
+              # Only summary-json and summary-text work; --output-format json returns EMPTY.
+              POUT=/tmp/perneff; rm -rf "$POUT"; mkdir -p "$POUT"
+              mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)
+              echo "  NEFFs in cache: ${#NEFFS[@]}"
+              OK=0
+              for neff in "${NEFFS[@]}"; do
+                hash=$(basename "$neff" .neff)
+                NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 900 \
+                  neuron-profile capture --single-io -n "$neff" -s "$POUT/${hash}.ntff" >/dev/null 2>&1 || continue
+                [ -f "$POUT/${hash}.ntff" ] || continue
+                timeout 300 neuron-profile view -n "$neff" -s "$POUT/${hash}.ntff" \
+                  --output-format summary-json > "$POUT/${hash}.json" 2>/dev/null || true
+                [ -s "$POUT/${hash}.json" ] && OK=$((OK+1))
+              done
+              echo "  captured+viewed OK: $OK / ${#NEFFS[@]}"
+              # 0 / N is EXPECTED on a collective-bearing model (--single-io deadlocks the
+              # multi-rank bootstrap). It costs the pairs/, not the system bundle, which is why
+              # [3/3a] runs first.
+              python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$R/perneff_breakdown.txt" || true
+              # Rank by FIXABILITY (time-weighted idle), not wall time, with the engine-mix gate:
+              # a NEFF with matmul>0 and tensor%>~40 is REAL COMPUTE and is not fixable no matter
+              # what its source line looks like.
+              python3 scripts/neuron/rank_neffs.py "$POUT" 2>&1 | tee "$R/neff_ranking.txt" || true
+              publish "$R/neff_ranking.txt" "$RUNDIR/neff_ranking.txt"
+
+              echo ""
+              echo "=== [4b] dominant-NEFF metric dump (summary-text) ==="
+              BIGHASH=$(python3 scripts/neuron/pick_neffs.py "$POUT" /tmp/neff_cache 2>/dev/null | head -1 || true)
+              if [ -n "${BIGHASH:-}" ] && [ -f "$POUT/${BIGHASH}.ntff" ]; then
+                BIGNEFF=$(find /tmp/neff_cache -name "${BIGHASH}.neff" | head -1)
+                timeout 300 neuron-profile view -n "$BIGNEFF" -s "$POUT/${BIGHASH}.ntff" \
+                  --output-format summary-text 2>/dev/null | tee "$R/hotspots_${BIGHASH}.txt" || true
+              else
+                echo "  no dominant NEFF (capture sweep returned nothing) -- skip"
+              fi
+
+              # ─────────────── [5] pairs/: pre-joined, rank-ordered. NEVER split a pair. ─────────
+              echo ""
+              echo "=== [5] preserve top-$TOPN heavy NEFF+NTFF pairs, PRE-JOINED ==="
+              # The .neff and its .ntff must never land in different dirs -- that join is the
+              # atomic unit of per-NEFF analysis, and reconstructing it by filename stem is where
+              # wrong attribution creeps in. Use ONLY the no-suffix <hash>.ntff: the per-rank
+              # profiler also emits <hash>_rank_0..N.ntff decoys on the same stem.
+              i=0
+              for hash in $(python3 scripts/neuron/top_neffs.py "$POUT" "$TOPN" 2>/dev/null || true); do
+                i=$((i+1))
+                src_neff=$(find /tmp/neff_cache -name "${hash}.neff" | head -1)
+                [ -n "$src_neff" ] && [ -f "$POUT/${hash}.ntff" ] || continue
+                MB=$(( $(wc -c < "$src_neff") / 1048576 ))
+                d="$R/pairs/$(printf 'rank%02d' $i)_${hash:0:8}__${MB}MB"
+                mkdir -p "$d"
+                cp "$src_neff" "$d/" && cp "$POUT/${hash}.ntff" "$d/"
+                [ -f "$POUT/${hash}.json" ] && cp "$POUT/${hash}.json" "$d/summary.json"
+                echo "  $(basename "$d"): $(ls "$d" | tr '\n' ' ')"
+              done
+              [ "$i" = "0" ] && echo "  pairs/ EMPTY -- expected if the capture sweep returned 0/N"
+
+              # ─────────────── [6] explorer/: one-rank upload bundle + the raw all-rank tar ──────
+              echo ""
+              echo "=== [6] explorer bundles ==="
+              # ONE rank, not all of them: an SPMD model runs the identical graph on every rank, so
+              # one rank's trace IS the trace (a 32-rank tree measured 5409 files / ~3.9 GB). Pick
+              # the LARGEST trace_info.pb -- size tracks event count and the default 3M buffer
+              # drops events on a deep model, so the largest is the least truncated.
+              BEST=$(find "$SYSTRACE" -name 'trace_info.pb' -printf '%s %h\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}' || true)
+              if [ -n "${BEST:-}" ]; then
+                UP=/tmp/upload_bundle; rm -rf "$UP"; mkdir -p "$UP"
+                cp "$BEST"/* "$UP/" 2>/dev/null || true
+                # The Directory Upload mode requires trace_info.pb and OPTIONALLY accepts *.pb,
+                # .ntff and .neff -- include them so one upload also serves device- and
+                # instruction-level analysis. Pair by content hash: the cache is
+                # content-addressed, so a hash names its NEFF exactly. Reading a .ntff against the
+                # WRONG .neff yields attribution that is confidently wrong, worse than none.
+                for nt in "$UP"/*.ntff; do
+                  [ -f "$nt" ] || continue
+                  h=$(basename "$nt" .ntff); h=${h%%_rank_*}
+                  f=$(find /tmp/neff_cache -name "${h}.neff" | head -1)
+                  [ -n "$f" ] && cp "$f" "$UP/" 2>/dev/null || true
+                done
+                echo "  upload_bundle: $(ls "$UP" | wc -l) files, trace_info.pb $(ls -la "$UP/trace_info.pb" 2>/dev/null | awk '{print $5}' || echo MISSING) bytes"
+                tar -czf /tmp/upload_bundle.tar.gz -C "$UP" . 2>/dev/null || true
+                publish /tmp/upload_bundle.tar.gz "$RUNDIR/explorer/upload_bundle.tar.gz"
+              else
+                echo "  MISSING trace_info.pb -- the Directory Upload will be REJECTED."
+                echo "  Check profiled.log: a failed run has no trace to write; a successful one"
+                echo "  means NEURON_RT_INSPECT_ENABLE did not take effect."
+              fi
+              tar -czf /tmp/systrace_bundle.tar.gz -C "$SYSTRACE" . 2>/dev/null || true
+              publish /tmp/systrace_bundle.tar.gz "$RUNDIR/explorer/systrace_bundle.tar.gz"
+
+              fi   # end PW_ALL guard
+
+              # ─────────────── the report ───────────────
+              echo ""
+              echo "################ UNIVR BENCH -- $RUN"
+              echo "  provenance   : $GIT_BRANCH@${GIT_SHA:0:8}   cc $(neuronx-cc --version 2>&1 | head -1 | awk '{print $NF}')"
+              echo "  config       : $GRID halo $HALO warp $WARP ${CORES} cores fp32 fullgraph"
+              echo ""
+              printf "  %-34s %s\n" "CLEAN median (THE latency)" "${T_CLEAN:--} ms"
+              printf "  %-34s %s\n" "profiled median (overhead)" "${T_PROF:--} ms"
+              printf "  %-34s %s\n" "max_diff / bar 3" "${LSB:--} LSB  ${GATE:--}"
+              printf "  %-34s %s\n" "PSNR" "${PSNR:--} dB"
+              printf "  %-34s %s\n" "reference" "$REFERENCE"
+              echo ""
+              echo "  probe (serial, one graph at a time):"
+              printf "    %-6s %-10s %9s %5s %6s\n" tile padded px rc min
+              # Guard the redirect: an absent probe_table.txt would make set -e abort the report.
+              if [ -f "$R/probe_table.txt" ]; then
+                while read -r t sh rc mn; do
+                  px=$(echo "$sh" | awk -Fx 'NF==2{print $1*$2}')
+                  printf "    %-6s %-10s %9s %5s %6s\n" "$t" "$sh" "${px:--}" "$rc" "$mn"
+                done < "$R/probe_table.txt"
+              else
+                echo "    (no probe rows)"
+              fi
+              echo ""
+              echo "  HOW TO OPEN EACH ARTIFACT (one action each, nothing to reconcile):"
+              echo "   * explorer/upload_bundle.tar.gz -> untar, then neuron-explorer"
+              echo "     'Directory Upload For System Profile'. WHEN ops run + inter-NEFF gaps."
+              echo "   * perfetto/trace_rank0.json.gz  -> drag into ui.perfetto.dev, still gzipped."
+              echo "     The ONLY artifact that names the Python line behind a copy or DMA."
+              echo "   * pairs/rankNN_*/              -> 'Individual Files': the .neff and .ntff in"
+              echo "     that folder are the only two files there. WHAT op inside a hot NEFF."
+              echo "   * neff_ranking.txt             -> start analysis HERE, not from a wall of hashes."
+              echo "   * frame_*.png                  -> eyeball it. No latency number counts until you do."
+              echo ""
+              echo "  CAVEATS that decide whether these numbers are comparable:"
+              echo "   * engine SHARES are stable across runs; absolute single-io us are NOISE (a"
+              echo "     NEFF measured 535,000 us in one capture and vanished in the next)."
+              echo "   * latency comes from run [2/3] ONLY. Never quote [3/3]'s wall clock."
+              echo "   * the eager baseline (3673.3 ms / 0.64 LSB) CANNOT be reproduced here: the"
+              echo "     eager path was removed from the script. Fused compares only to fused."
+              echo "   * check the cc version against the run you are comparing to. :latest differs"
+              echo "     per node (2.26.6360.0 vs 2.27.2878.0 observed)."
+              echo "Done."
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 48
+              memory: 248Gi
+            limits:
+              cpu: 150
+              # 1800Gi, matching prod-4x8-halo64 -- the only 8-core run that ever completed. The
+              # serial probe should keep compile memory well under this, but there is no reason to
+              # run below the one level known to work.
+              memory: 1800Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: BRANCH
+              value: "main"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_NUM_CORES
+              value: "8"
+            - name: NEURON_RT_VISIBLE_CORES
+              value: "0-7"
+            # MUST NOT contain --model-type unet-inference: it is the single cause of the
+            # NCC_EBIR033 DMA rejection. 8 arms on one fixed shape, every arm carrying it rejected
+            # at the identical in=23,040 and every arm without it fused. The VALUE is what matters
+            # -- transformer and generic both work; --lnc is irrelevant to it.
+            - name: NEURON_CC_FLAGS
+              value: "--lnc 1"
+            # Required at COMPILE time, not just at capture time, or
+            # Instruction.bir_debug_info_source_location is NULL on every row and step [5] cannot
+            # trace a hot instruction back to a source line.
+            - name: XLA_IR_DEBUG
+              value: "1"
+            - name: XLA_HLO_DEBUG
+              value: "1"
+            - name: NEURON_FRAMEWORK_DEBUG
+              value: "1"
+            # NEURON_RT_INSPECT_* are deliberately NOT set here. Inspect writes trace data on every
+            # dispatch, which would distort the [2/3] median that is the whole point. Stage [3/3a]
+            # exports them itself, on its own short run.
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc

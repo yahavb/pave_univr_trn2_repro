@@ -290,6 +290,8 @@ deterministic compiler verdicts rather than flaky runs.
 | `bigtile-noflag-job.yaml` | the job that proved 4x8 halo 64 fuses on all four shapes |
 | `fused-config-search-job.yaml` | geometry x warp under fullgraph. Superseded |
 | `accuracy-triage-job.yaml` | **the live job.** 4 stages: serial 8-graph compile probe, then the gated 8-core scored arm, then the Neuron Explorer system-profile bundle |
+| `univr-bench-job.yaml` | **the job to use from now on.** Adopts `/neuron-3run-benchmark`: persistent NEFF cache, 3-run methodology, consumer-split archive |
+| `scripts/neuron/` | the skill's helpers, committed so the pod's clone has them: `rank_neffs.py` (fixability + engine-mix gate), `profile_all_neffs.py`, `pick_neffs.py`, `top_neffs.py`, `pq_*.py`, `run_dma_analysis.sh` |
 | `s3-mount-test-pod.yaml` | 85-second PVC mount check on a chosen node |
 | `nki_shift_warp.py` | the dead kernel, kept for the measured op-level result |
 
@@ -297,6 +299,50 @@ Deleted this session as dead ends: `profile-model-job.yaml`, `compile-modes-job.
 `fused-4x8-timing-job.yaml`, `halo-shapeset-job.yaml`, `halo64-fusion-job.yaml`,
 `fusion-threshold-job.yaml`, `single-graph-retest-job.yaml`, `settle-2x8-job.yaml`,
 `AB_RUN.md`, `profile_hotspots.py`.
+
+## The benchmark harness: `univr-bench-job.yaml`
+
+Adopts `/neuron-3run-benchmark`. Three things no earlier job in this repo had:
+
+**1. The NEFF cache survives the pod.** Every previous job kept it at `/tmp/neff_cache`, the
+container's ephemeral layer, so it died with the pod. `univr-accuracy-triage-gmnpq` lost ~3.5 h
+of 704x768 compiles that way and every earlier run silently threw its compiles away. The new job
+restores from ONE tar object on the PVC and **re-archives after every successful compile**, so a
+pod death costs one tile.
+
+**2. The 3-run methodology.** `[1/3]` build/load (the serial probe, not timed), `[2/3]` clean run
+with no profiler -- **the only number that is the latency** -- `[3/3]` profiled runs for the
+breakdown. Never quote a profiled run's wall clock. Engine **shares** are stable across runs;
+absolute single-io µs are noise.
+
+**3. Archive split by CONSUMER, at `/var/mdl/univr/runs/exp_univr-<cfg>-<warp>_<TS>/`:**
+
+```
+explorer/upload_bundle.tar.gz    trace_info.pb + .pb + .ntff + PAIRED .neff -> Directory Upload
+explorer/systrace_bundle.tar.gz  all ranks, raw
+perfetto/trace_rank0.json.gz     -> drag into ui.perfetto.dev
+pairs/rankNN_<hash8>__<MB>MB/    ONE .neff + ONE .ntff + summary.json, pre-joined
+neff_ranking.txt                 fixability-ranked; START ANALYSIS HERE
+frame_<cfg>_<warp>.png/.json     the output artifact -- the correctness gate
+univr_results_<TS>.tar.gz        everything else
+```
+
+* **Never split a `.neff` from its `.ntff`.** That pair is the atomic unit of per-NEFF analysis
+  and rebuilding the join by filename stem is where wrong attribution creeps in. Use only the
+  no-suffix `<hash>.ntff`; the profiler also emits `<hash>_rank_0..N.ntff` decoys on the same stem.
+* **`/var/mdl` is Mountpoint-for-S3, not posix.** Every file open is a separate S3 GET, so
+  `cp -r`, `tar` over a directory, `find` or a glob on the mount stalls for minutes to hours with
+  no error. Everything crosses as ONE tar object, extracted locally. Writes go through a
+  `publish()` that verifies with `wc -c` and refuses 0 bytes (`stat -c` is GNU-only and its
+  absent-fallback reports a successful copy as a mismatch).
+* **The archive runs in `trap ... EXIT`,** not as the last block: under `set -euo pipefail` any
+  earlier failure would skip a trailing archive and take every artifact with it.
+* **`rank_neffs.py` applies the ENGINE-MIX GATE.** A NEFF is a fixable copy only if
+  `matmul≈0` AND `tensor% < ~15` AND DMA dominates. `matmul > 0` with `tensor% > ~40` is REAL
+  COMPUTE and is not fixable however much its source line looks like a `cat`/`pad`. Never rank
+  fixability by wall time -- rank-1 by wall time is usually an honest GEMM.
+* Latency needs an **output-correctness gate**: `--save-ref` writes npy + PNG + a sha256
+  manifest, and a faster config is often faster because it computes less.
 
 ## Traps that cost runs
 

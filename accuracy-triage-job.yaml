@@ -13,14 +13,6 @@ spec:
       restartPolicy: Never
       nodeSelector:
         node-type: trn3-dev1
-        # Pinned: the S3 add-on backing /var/mdl only works on this node. Elsewhere the pod
-        # sits Pending on "MountVolume.SetUp failed ... DeadlineExceeded".
-        kubernetes.io/hostname: ip-192-168-192-189.us-east-2.compute.internal
-      # Required: the container's resources.claims references "neurons", and without this the
-      # API server rejects the Job outright --
-      #   spec.template.spec.containers[0].resources.claims[0]: Not found: "neurons":
-      #   must be one of the names in pod.spec.resourceClaims which is empty
-      # s-lnc1 is the claim template every other job in this repo uses.
       resourceClaims:
         - name: neurons
           resourceClaimTemplateName: s-lnc1
@@ -46,113 +38,10 @@ spec:
               echo "NEURON_CC_FLAGS: ${NEURON_CC_FLAGS:-<unset>}"
               echo ""
 
-              # ============================================================================
-              # WHY DOES THE FUSED FRAME FAIL ACCURACY? Three arms, one pod.
-              # ============================================================================
-              # The fused config RUNS. Measured, job univr-prod-4x8-h64-vggks, 4x8 halo 64,
-              # 8 cores, --iters 3, NEURON_CC_FLAGS="--lnc 1":
-              #     gather   median 3900.5 ms   max_diff 92.56 LSB   PSNR 48.74 dB   +7 NEFFs
-              #     nki-dyn  median 3820.4 ms   max_diff 92.56 LSB   PSNR 48.74 dB   +8 NEFFs
-              #
-              # THE ACCURACY IS BIT-IDENTICAL ACROSS TWO DIFFERENT RESAMPLE IMPLEMENTATIONS.
-              # 92.56 LSB and 48.74 dB to every digit, from plain-torch indirect gather and from
-              # an NKI indirect-DMA kernel. Whatever is wrong is in code they SHARE, not in either
-              # warp. That is the single most useful fact available and it is what these arms build
-              # on.
-              #
-              # It is also not halo starvation at tile edges, which is what shrinking halo to 64
-              # from the production 128 would be expected to cause. The spatial breakdown puts the
-              # worst error in the INTERIOR:
-              #     merge seam +/-4 rows   max 28.82
-              #     top border 32 rows     max 17.37
-              #     bottom border 32 rows  max 43.15
-              #     interior (128 cut)     max 92.56   <-- worst
-              # And it is sparse rather than systematic: p50 0.14 LSB, mean 0.356, only 1.49% of
-              # pixels above 3 LSB, cosine 0.999968. Isolated pixels going badly wrong.
-              #
-              # THE ONE REMAINING ARM  --warp gather, 4x8 halo 128.
-              #   Tests whether halo 64 contributes at all -- the last variable left, since the
-              #   two warps already agree to every digit and gridsample cannot compile fused
-              #   (OOM-killed at 169 min and again at 94 min on the smaller halo-64 geometry,
-              #   consistent with its 3-205x higher descriptor count in the microbenchmark). If
-              #   this still fails near 92 LSB, halo is ruled out completely and the defect is in
-              #   shared, halo-independent code -- a conv, interpolate or PReLU lowering
-              #   difference. If it PASSES, halo 64 is the cause and the fix is halo 96.
-              #
-              # NO EAGER ARM IS POSSIBLE. --compile was removed from the script; it is always
-              # torch.compile(fullgraph=True). The historical eager figures -- 3673.3 ms / 0.64 LSB
-              # PASS in the README with --warp nki, and 4125.5 ms / 81.46 LSB FAIL for the same
-              # command re-run in this image -- cannot be reproduced here. Note the second one:
-              # 81.46 LSB was ALREADY failing before any fusion or halo change. So even a ~92 LSB
-              # result here does not pin the defect on fusion: it may predate everything, and the
-              # per-stage numeric diff is what would settle that.
-
               OUT=/tmp/univr_at_out; mkdir -p "$OUT"
               FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
 
-              # ============================================================================
-              # WHY THIS JOB IS NOW TWO STAGES: the first two attempts OOMKilled, and the
-              # OOM was an artifact of HOW it ran, not of the shape it ran.
-              # ============================================================================
-              # univr-accuracy-triage-rh7rz (8h) and -jcbd4 (5h32m) both OOMKilled. Both logs
-              # stop at "8 replica(s) built" with no compile output, and both show the cache
-              # empty at entry:
-              #     find /tmp/neff_cache -name '*.neff' | wc -l  ->  0
-              #
-              # torch.compile is LAZY. "8 replica(s) built" only means eight WRAPPERS exist;
-              # neuronx-cc does not run until first call, which happens inside run_tiled() --
-              # and run_tiled drives the cores from ThreadPoolExecutor(max_workers=ncore).
-              # So --cores 8 against a cold cache ran EIGHT CONCURRENT neuronx-cc compiles of
-              # 442k-540k px graphs in one container. Peak host memory is the sum of eight
-              # compiles, not one.
-              #
-              # Every result in STATE.md that says a shape FUSES was measured ONE COMPILE AT A
-              # TIME:
-              #     bigtile-noflag   --cores 1 --only-tile "$T"   -> 4x8 h64 all four fuse
-              #     ccflag-fusion    --cores 1 --only-tile 0      -> the flag separation
-              #     prod-4x8-halo64  --cores 1 --only-tile 9 FIRST, then --cores 8, at 1800Gi
-              #     accuracy-triage  --cores 8 cold, at 1500Gi    -> OOMKilled x2
-              # prod-4x8-halo64 is the tell: it seeded the cache serially before going wide,
-              # and it had 1800Gi. This job skipped that and had 1500Gi.
-              #
-              # So "704x768 = 540,672 px is inside the ~442k-594k memory ceiling" is NOT what
-              # those two OOMs tested. The ceiling evidence that DOES survive is the evidence
-              # taken serially: 2x8 at 593,920 px and 2x4 at 1,009,664 px both OOMed under
-              # --cores 1 --only-tile. 4x8 halo 128 has never had a serial flagless compile at
-              # its largest shape -- its only prior verdict was a DMA REJECTION (in=7,569,408)
-              # earned WITH --model-type unet-inference, the flag now known to be the sole
-              # cause of those rejections.
-              #
-              # Stage 1 therefore compiles the shapes one at a time into a SHARED cache, and
-              # stage 2 runs the scored 8-core arm against that warm cache so it compiles
-              # nothing. That removes the concurrency confound and, if 704x768 really is above
-              # the ceiling, says so in the first ~2h instead of after 8.
-
-              # ============================================================================
-              # [1/4] SERIAL COMPILE PROBE -- one graph at a time, shared cache, largest first
-              # ============================================================================
-              # EIGHT graphs, not four. A frame needs one graph per (padded shape x triplet
-              # timestamp), and run_tiled picks the pass per tile from the merge seam:
-              #     need_f = (oy + vy) > H/2      need_b = oy < H/2
-              # H/2 = 864 falls EXACTLY on the row1/row2 boundary (4 rows x 432), so no tile
-              # ever needs both passes -- each tile compiles exactly one graph. That is why
-              # prod-4x8-halo64's serial warm-up of tile 9 alone still left +7 NEFFs to compile
-              # inside the 8-core run: one tile seeds one of the eight slots.
-              #
-              # Computed from the script's own plan_tiles(1728, 4096, 4, 8, 128), the 8 slots
-              # and one representative tile each, largest first:
-              #     704x768  540,672 px  B  tile  9      704x768  540,672 px  F  tile 17
-              #     704x640  450,560 px  B  tile  8      704x640  450,560 px  F  tile 16
-              #     576x768  442,368 px  B  tile  1      576x768  442,368 px  F  tile 25
-              #     576x640  368,640 px  B  tile  0      576x640  368,640 px  F  tile 24
-              #
-              # LARGEST FIRST is deliberate: a frame needs EVERY shape, so if 704x768 cannot
-              # compile the rest is wasted and the job should fall through to the bundle.
-              #
-              # And NOTE the difference from bigtile-noflag: that job did `rm -rf /tmp/neff_cache`
-              # before every tile, because it only wanted an independent per-shape verdict. Here
-              # the cache is the POINT -- stage 2 depends on it -- so it is never cleared.
               PREWARM_TILES="${PREWARM_TILES:-9 17 8 16 1 25 0 24}"
               PREWARM_HALO="${PREWARM_HALO:-128}"
               mkdir -p /tmp/neff_cache
@@ -185,15 +74,8 @@ spec:
                 else
                   PW_ALL=0
                   echo "  tile $T  ${SH:--}  FAILED rc=$rc  ${MIN} min  cache=$A2"
-                  # `|| true` is REQUIRED. Under `set -euo pipefail` a grep that matches nothing
-                  # exits 1, pipefail propagates it, and set -e kills the job -- right after a
-                  # failed compile, which is precisely when the bundle stage still has work to do.
-                  # An OOM kill leaves no in=/out= operand to match, so this grep finding nothing
-                  # is the EXPECTED case here, not the rare one.
                   { grep -aoE "got in=[0-9]+ and out=[0-9]+|Instructions generated by compiler [0-9]+ exceeds the typical limit of [0-9]+|MemoryError|Killed" \
                     "$OUT/${TAG}.log" || true; } | head -2 | sed 's/^/      /'
-                  # A frame needs every shape. Once one slot is gone the scored arm cannot run,
-                  # so stop burning hours on the remaining slots and go build the bundle.
                   echo "  ==> a required graph is missing; abandoning the remaining probe tiles"
                   break
                 fi
@@ -212,25 +94,6 @@ spec:
                 echo ""
               fi
 
-              # halo:warp
-              #
-              # ONE ARM: gather at halo 128. gridsample is DROPPED -- it OOM-killed at 169 min and
-              # again at 94 min on 4x8 halo 64 at 1500Gi, the same geometry where gather and nki-dyn
-              # both compile. That is consistent with the microbenchmark: gridsample issues 3-205x
-              # more DMA descriptors than gather (3.0 pkt/px at C=3 up to 205 at C=128), so its fused
-              # graph is far larger and exceeds compiler memory. It cannot serve as the reference
-              # implementation here, so both gridsample arms are removed rather than retried.
-              #
-              # Losing gridsample does not leave the accuracy question blind. The strongest evidence
-              # is already measured and does not need it: gather and nki-dyn produced 92.56 LSB and
-              # 48.74 dB TO EVERY DIGIT -- two structurally different resample implementations,
-              # identical error -- so the fault is in code they share, not in the resample.
-              #
-              # What gather at halo 128 tests is the remaining variable: whether halo 64 is
-              # implicated at all. This arm now runs against the warm cache from stage 1, so it
-              # should compile ZERO graphs -- watch the "NEFFs +N" line. Any N > 0 means a shape or
-              # timestamp the probe did not cover, and that graph is being compiled concurrently
-              # with up to seven others, which is exactly what killed the two prior attempts.
               ARMS="${ARMS:-128:gather}"
               echo "=== [2/4] TIMED + SCORED ARM (warm cache) ==="
               echo "arms: $ARMS"
@@ -297,66 +160,7 @@ spec:
                 printf "  %-22s %5s %11s %10s %9s %6s\n" \
                   "$TAG" "$rc" "${MS:--}" "${LSB:--}" "${PS:--}" "${GT:--}"
               done
-              echo ""
-              echo "  measured already: 4x8_h64_gather 3900.5 ms 92.56 LSB / 4x8_h64_nki-dyn 3820.4 ms 92.56 LSB"
-              echo ""
-              echo "  HOW TO READ IT:"
-              echo "  * ~92.56 LSB again -> halo is NOT the cause. Combined with gather and nki-dyn"
-              echo "    already agreeing to every digit at halo 64, the defect is in shared code and"
-              echo "    independent of both the resample and the halo. Next step is the system-profile"
-              echo "    bundle below plus a per-stage numeric diff, not more sweeps."
-              echo "  * PASS -> halo 64 WAS the cause, despite the interior-worst error profile that"
-              echo "    argued against it. Fix is halo 96: largest shape 640x704 = 450,560 px, just"
-              echo "    above the 442,368 px known to fuse."
-              echo "  * rc=137 / Killed IN STAGE 1 -> a genuine per-compile OOM at a named shape."
-              echo "    That is a NEW result: it establishes the memory ceiling serially, which the"
-              echo "    two prior 8-core OOMs (rh7rz 8h, jcbd4 5h32m) could not, because those ran"
-              echo "    eight concurrent cold compiles and their peak was the sum of eight."
-              echo "  * rc=137 IN STAGE 2 with NEFFs +0 -> not compile memory at all. Nothing was"
-              echo "    compiled, so the kill is runtime/device memory at 8 cores on halo-128 tiles."
-              echo "  * NEFFs +N > 0 in stage 2 -> the probe missed a (shape x timestamp) slot and"
-              echo "    the concurrency confound is still live. Fix the tile list, not the memory."
-              echo ""
-              echo "  Already measured, 4x8 halo 64, 8 cores, --iters 3, --lnc 1:"
-              echo "    gather      3900.5 ms   92.56 LSB   48.74 dB   +7 NEFFs"
-              echo "    nki-dyn     3820.4 ms   92.56 LSB   48.74 dB   +8 NEFFs"
-              echo "    gridsample  OOMKilled at 169 min and again at 94 min"
-              echo ""
-
-              # ============================================================================
-              # SYSTEM-PROFILE BUNDLE for Neuron Explorer's directory upload
-              # ============================================================================
-              # The upload tool wants a DIRECTORY, not a NEFF+NTFF pair:
-              #   trace_info.pb  REQUIRED   system-level trace events
-              #   *.pb           optional   additional trace data (ntrace, cpu_util, host_mem)
-              #   *.ntff         optional   device execution trace
-              #   *.neff         optional   compiled model, for instruction-level analysis
-              # plus the source that produced it.
-              #
-              # trace_info.pb comes from the RUNTIME INSPECT path, not from a capture command --
-              # neuron-profile/neuron-explorer capture only ever emit .ntff. The env vars point at
-              # an output dir and the runtime writes one i-<instance>_pid_<pid>/ directory per rank
-              # with the whole file set:
-              #   NEURON_RT_INSPECT_ENABLE=1         -> system profile, i.e. trace_info.pb
-              #   NEURON_RT_INSPECT_SYSTEM_PROFILE=1 -> the host-side .pb files
-              #   NEURON_RT_INSPECT_DEVICE_PROFILE=1 -> also emit .ntff + .neff
-              # This is the recipe from ~/pave-unrolling/unrolling-job.yaml, which produced working
-              # bundles, rather than something assembled from the docs.
-              #
-              # SYSTEM_PROFILE=0 is set on the container for the timed arms above, deliberately:
-              # inspect writes trace data on every dispatch and would distort the steady-state
-              # median. It is enabled only for this stage, on its own short run.
-              #
-              # THE .ntff SLOT USUALLY COMES BACK EMPTY, and the origin repo hit this too: the
-              # forward dispatches the device ASYNC and the runtime device-profiler emits no NTFF for
-              # async workloads (their run 40 got 0 .ntff). trace_info.pb, the .pb files and .neff
-              # are written regardless. So step 2b backfills .ntff beside each .neff using the
-              # neuron-profile --single-io path that is known to work in this image -- same directory,
-              # same basename, which is exactly the layout the upload tool expects.
-              echo "=== [3/4] SYSTEM-PROFILE BUNDLE (trace_info.pb) ==="
               SYSTRACE=/tmp/systrace; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
-              # One arm only, and the cheapest: 4x8 halo 64 gather at 8 cores with --iters 1. The
-              # bundle is about WHERE time goes, not how fast, and iters 1 keeps the trace small.
               set +e
               NEURON_RT_INSPECT_ENABLE=1 \
               NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
@@ -386,8 +190,6 @@ spec:
               echo ""
 
               echo "=== [4/4] BUNDLE THE SOURCE ALONGSIDE THE TRACES ==="
-              # The upload tool takes the source too, and a trace is much less useful without the
-              # exact code that produced it. Commit SHA is recorded so the bundle is unambiguous.
               SRC="$SYSTRACE/source"; mkdir -p "$SRC"
               cp repro_unrolling_trn2.py nki_shift_warp.py microbench.py \
                  profile_roofline.py "$SRC/" 2>/dev/null || true
@@ -441,10 +243,6 @@ spec:
               memory: 248Gi
             limits:
               cpu: 150
-              # 1800Gi, not the 1500Gi the two OOMKilled attempts had: prod-4x8-halo64 is the
-              # only 8-core run that ever completed here and it had 1800Gi. Stage 1 makes the
-              # compiles serial so the limit should no longer be the binding constraint, but
-              # there is no reason to run below the one level known to work.
               memory: 1800Gi
           volumeMounts:
             - name: dshm
@@ -460,25 +258,14 @@ spec:
               value: "8"
             - name: NEURON_RT_VISIBLE_CORES
               value: "0-7"
-            # MUST NOT contain --model-type unet-inference: it is the sole cause of the
-            # NCC_EBIR033 rejection. 8 arms on one shape, every arm with it rejected at the
-            # identical in=23,040, every arm without it fused.
             - name: NEURON_CC_FLAGS
               value: "--lnc 1"
-            # Debug vars the profile-querying skill requires. They must be set at COMPILE time,
-            # not only at capture time, or Instruction.bir_debug_info_source_location is NULL on
-            # every row and a hot instruction cannot be traced back to a source line. Every capture
-            # in this repo so far ran without them.
             - name: XLA_IR_DEBUG
               value: "1"
             - name: XLA_HLO_DEBUG
               value: "1"
             - name: NEURON_FRAMEWORK_DEBUG
               value: "1"
-            # NEURON_RT_INSPECT_* are deliberately NOT set here. The runtime writes trace data on
-            # every dispatch when INSPECT_ENABLE=1, which would distort the steady-state medians the
-            # timed arms exist to measure. The bundle stage exports all three itself, on its own
-            # short --iters 1 run.
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
               value: "/tmp/neff_cache"
             - name: OMP_NUM_THREADS

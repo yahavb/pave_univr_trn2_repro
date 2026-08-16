@@ -1296,6 +1296,12 @@ def main():
     ap.add_argument("--save-ref", metavar="PATH.npy",
                     help="save this run's output as an fp32 reference + PNG preview + provenance "
                          "manifest, for use as --gt on another device")
+    ap.add_argument("--perfetto", metavar="PATH.json",
+                    help="wrap the timed loop in torch.profiler and export a Chrome/Perfetto "
+                         "trace to PATH (drag the .gz into ui.perfetto.dev). This is the ONLY "
+                         "artifact that attributes device time back to a Python line: the runtime "
+                         "NEURON_RT_INSPECT bundle tells you a DMA happened, this tells you which "
+                         "line issued it. Adds real overhead, so never read latency from this run.")
     a = ap.parse_args()
 
     global _WARP, _RECORD, _RECORD_FLOW
@@ -1530,6 +1536,25 @@ def main():
         # unknown direction rather than merely scaled.
         BLOCK_MS.clear()
         ts = []
+        # --perfetto wraps the SAME loop rather than adding a separate run, so the trace covers
+        # exactly the iterations being timed. torch_neuronx's NeuronProfiler is preferred when
+        # importable because it adds the device rows (Stream / Compute Slot / TensorOp Slot); plain
+        # torch.profiler still gives the host rows and the Python attribution, which is the point.
+        # record_shapes + with_stack are what make an aten op traceable back to a source line.
+        _prof = _prof_kind = None
+        if a.perfetto:
+            try:
+                from torch_neuronx.profiling import NeuronProfiler
+                _prof = NeuronProfiler(record_shapes=True, with_stack=True)
+                _prof_kind = "torch_neuronx.NeuronProfiler"
+            except Exception:                                     # noqa: BLE001
+                from torch.profiler import profile, ProfilerActivity
+                _prof = profile(activities=[ProfilerActivity.CPU],
+                                record_shapes=True, with_stack=True)
+                _prof_kind = "torch.profiler (CPU rows only)"
+            print("  --perfetto: tracing the timed loop with %s" % _prof_kind)
+            print("  NOTE this run's median is NOT a latency measurement: the profiler is on.")
+            _prof.__enter__()
         for _ in range(a.iters):
             t0 = time.perf_counter()
             o = one_frame()
@@ -1537,6 +1562,22 @@ def main():
                 torch.cuda.synchronize()
             o.float().cpu()
             ts.append((time.perf_counter() - t0) * 1e3)
+        if _prof is not None:
+            _prof.__exit__(None, None, None)
+            # gzip on the way out: an uncompressed trace of this model is hundreds of MB, and
+            # Perfetto reads .gz directly, so there is no reason to ever move the plain file
+            # (350 MB -> ~23 MB observed on a comparable model).
+            import gzip
+            import shutil
+            try:
+                _prof.export_chrome_trace(a.perfetto)
+                with open(a.perfetto, "rb") as _f, gzip.open(a.perfetto + ".gz", "wb") as _g:
+                    shutil.copyfileobj(_f, _g)
+                os.remove(a.perfetto)
+                print("  --perfetto: wrote %s.gz (%.1f MB) -- drag into ui.perfetto.dev"
+                      % (a.perfetto, os.path.getsize(a.perfetto + ".gz") / 1e6))
+            except Exception as e:                                # noqa: BLE001
+                print("  --perfetto: export FAILED (%s: %s)" % (type(e).__name__, e))
         ts.sort()
         med = ts[len(ts) // 2]
         print("  steady state: median %.1f ms over %d iters (min %.1f, max %.1f)"
