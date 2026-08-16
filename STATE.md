@@ -72,17 +72,22 @@ is why the operand values looked incoherent.
 **2. Compiler HOST MEMORY is a separate ceiling, set by tile size, and the flag does not
 touch it.**
 
-| shape | px | outcome |
-|---|---|---|
-| 4x8 h64 512x576 | 294,912 | fuses |
-| 4x8 h64 576x640 | 368,640 | fuses |
-| 4x8 h128 576x768 | 442,368 | fuses |
-| 2x8 h64 928x640 | 593,920 | **OOM at 600Gi, 1000Gi AND 1500Gi** |
-| 2x4 h64 928x1088 | 1,009,664 | **OOM at 1500Gi, without the flag, after 147 min** |
+| shape | px | outcome | compiles |
+|---|---|---|---|
+| 4x8 h64 512x576 | 294,912 | fuses | serial |
+| 4x8 h64 576x640 | 368,640 | fuses | serial |
+| 4x8 h128 576x768 | 442,368 | fuses | serial |
+| 2x8 h64 928x640 | 593,920 | **OOM at 600Gi, 1000Gi AND 1500Gi** | serial |
+| 2x4 h64 928x1088 | 1,009,664 | **OOM at 1500Gi, without the flag, after 147 min** | serial |
 
 Ceiling sits between **~442k and ~594k padded px** and raising memory does not move it --
 2x8 died at all three levels. So 2x4 (1.0M px), 2x8 (594k px) and 3x4 (811k px) are all
 above it regardless of flags. **4x8 is the only grid entirely under it.**
+
+**Read the `compiles` column: every one of those is a SERIAL, one-graph-at-a-time
+measurement** (`--cores 1 --only-tile T`). That is what makes them comparable to each other
+and what makes the ceiling a per-compile number. An OOM from a run that compiled several
+graphs at once says nothing about it -- see the accuracy-triage OOMs below.
 
 ## Still blocking a shippable result
 
@@ -215,10 +220,32 @@ deterministic compiler verdicts rather than flaky runs.
 
 * **Why the fused frame fails accuracy at 92.56 LSB.** The live question.
   `accuracy-triage-job.yaml` runs `gather` at halo 128 -- the only remaining variable, since
-  gridsample cannot compile fused and the two warps already agree to every digit. Its largest
-  shape is 704x768 = 540,672 px, inside the ~442k-594k memory ceiling, so it may OOM rather
-  than answer. That job also produces the system-profile bundle.
-* **The system-profile bundle for Neuron Explorer.** `accuracy-triage-job.yaml` stages 2-3
+  gridsample cannot compile fused and the two warps already agree to every digit. That job
+  also produces the system-profile bundle.
+
+  **Two attempts OOMKilled and BOTH were wasted on a self-inflicted confound**:
+  `univr-accuracy-triage-rh7rz` at 8 h and `-jcbd4` at 5 h 32 m. Both logs stop at
+  `8 replica(s) built` with no compile output, and both entered with the cache empty
+  (`find /tmp/neff_cache -name '*.neff' | wc -l` -> `0`). **`torch.compile` is lazy** --
+  that line only means eight wrappers exist; neuronx-cc runs on first call, inside
+  `run_tiled`, which drives cores from `ThreadPoolExecutor(max_workers=ncore)`. So
+  `--cores 8` on a cold cache ran **eight concurrent compiles** of 442k-540k px graphs in one
+  container at 1500Gi. Peak host memory was the sum of eight, not one.
+
+  So 540,672 px was never tested against the ceiling. Its only other verdict is a DMA
+  rejection (`in=7,569,408`) earned **with** `--model-type unet-inference`. The job now runs
+  a serial probe first (8 graphs, largest first, shared cache) and gates the 8-core scored arm
+  on it, at 1800Gi to match `prod-4x8-halo64`, the only 8-core run that ever completed.
+
+* **A frame needs 8 graphs and each tile compiles exactly ONE.** `run_tiled` picks the pass
+  per tile -- `need_f = (oy+vy) > H/2`, `need_b = oy < H/2` -- and `H/2 = 864` falls exactly on
+  the row1/row2 boundary (4 rows x 432), so no tile ever needs both. From
+  `plan_tiles(1728, 4096, 4, 8, 128)` the eight (shape x pass) slots and one representative
+  tile each, largest first: `9`/`17` 704x768 540,672 px, `8`/`16` 704x640 450,560,
+  `1`/`25` 576x768 442,368, `0`/`24` 576x640 368,640. This is why `prod-4x8-halo64`'s serial
+  warm-up of tile 9 alone still left **+7 NEFFs** for the 8-core run to compile concurrently:
+  one tile seeds one of eight slots. A prewarm must cover all eight or the confound survives.
+* **The system-profile bundle for Neuron Explorer.** `accuracy-triage-job.yaml` stages 3-4
   build the directory-upload format: `trace_info.pb` (required), the host `.pb` files,
   `.neff`, `.ntff` with a backfill, plus the source and a PROVENANCE.txt. `trace_info.pb`
   comes from the runtime INSPECT env vars, NOT from a capture command -- capture only ever
@@ -262,7 +289,7 @@ deterministic compiler verdicts rather than flaky runs.
 | `repro-job.yaml` | whole model, original hardcoded `nki` arms |
 | `bigtile-noflag-job.yaml` | the job that proved 4x8 halo 64 fuses on all four shapes |
 | `fused-config-search-job.yaml` | geometry x warp under fullgraph. Superseded |
-| `accuracy-triage-job.yaml` | **the live job.** gather at halo 128, then the Neuron Explorer system-profile bundle |
+| `accuracy-triage-job.yaml` | **the live job.** 4 stages: serial 8-graph compile probe, then the gated 8-core scored arm, then the Neuron Explorer system-profile bundle |
 | `s3-mount-test-pod.yaml` | 85-second PVC mount check on a chosen node |
 | `nki_shift_warp.py` | the dead kernel, kept for the measured op-level result |
 
@@ -287,6 +314,15 @@ Deleted this session as dead ends: `profile-model-job.yaml`, `compile-modes-job.
   unconditionally because neither is traceable under fullgraph. Consequence: the eager
   figures (3673.3 ms README, 4125.5 ms re-run) can no longer be reproduced here at all, so
   fused numbers are comparable only to other fused numbers.
+* **`torch.compile` is LAZY, so `--cores N` on a cold cache means N CONCURRENT compiles.**
+  `8 replica(s) built` is printed by `apply_compile` and means only that eight wrappers exist;
+  neuronx-cc runs on first call, inside `run_tiled`'s `ThreadPoolExecutor(max_workers=ncore)`.
+  Peak host memory is the sum across concurrent compiles, so a cold `--cores 8` run OOMs at
+  shapes that compile fine one at a time. This cost **13.5 h across two pods** and produced an
+  OOM that was then nearly mis-recorded as a shape-ceiling result. **Always seed the NEFF cache
+  serially before going wide**, and check the `NEFFs +N` delta: `+0` proves the cache was warm.
+* **Every `FUSES` verdict in this file is a serial `--cores 1 --only-tile T` measurement.**
+  Do not compare an OOM from a multi-graph run against them; it is not the same experiment.
 * **Dynamo's `cache_size_limit` defaults to 8** and this model needs exactly 8 graphs
   (4 padded shapes x 2 triplet timestamps), so it sat on the limit -- one tile never trips it,
   8 cores always does, and under fullgraph it is a hard error. Set to 64 / 256 at import.
