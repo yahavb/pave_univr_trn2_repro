@@ -130,69 +130,6 @@ spec:
                 python3 microbench.py --op x --grid "$GRID" --halo "$HALO" \
                     --warp-impls "$WARP_IMPLS" --top "$TOP" --list-op-sites | sed 's/^/  /'
                 echo ""
-                # SET=gsmodel: gridsample in the REAL MODEL (repro_unrolling_trn2.py), three ways.
-                #   1  device + NKI   --warp gridsample-nkl --device neuron --fullgraph 1
-                #   2  device + ATen  --warp gridsample     --device neuron --fullgraph 0
-                #   3  host           --warp gridsample     --device cpu
-                # One tile, the largest shape of the least-padding geometry that works: 4x8 halo 64
-                # tile 9 = 576x640 = 368,640 px (padded/valid 1.535x against h128's 2.130x).
-                #
-                # Arm 2 MUST be --fullgraph 0: ATen grid_sample's fused graph exceeds compiler
-                # memory and was OOM-killed at 169 min and again at 94 min at 1500Gi. Arm 1 keeps
-                # fullgraph=1 because a single NKI call fuses -- proven in the op-level arms -- so
-                # the kernel does NOT cost us the fused config. Arm 3 compiles with inductor.
-                #
-                # This is the model's whole op sequence, not an isolated op, so it prices the two
-                # NHWC permutes the NKL kernel adds per call and the host round-trips the CPU arm
-                # needs -- neither of which any single-op arm can see.
-                if [ "$SET" = "gsmodel" ]; then
-                  GT="${GSMODEL_TILE:-9}"; GI="${GSMODEL_ITERS:-3}"
-                  FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
-                  REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
-                  BASE="--height 1728 --width 4096 --tiles $GRID --halo $HALO --bar 3 --dtype fp32"
-                  echo "gsmodel  $GRID halo $HALO tile $GT  iters $GI"
-                  echo ""
-                  # "label:warp:device:fullgraph"
-                  for CFG in "nki:gridsample-nkl:neuron:1" "aten:gridsample:neuron:0" "cpu:gridsample:cpu:1"; do
-                    LB=$(echo $CFG | cut -d: -f1); WP=$(echo $CFG | cut -d: -f2)
-                    DV=$(echo $CFG | cut -d: -f3); FG=$(echo $CFG | cut -d: -f4)
-                    if [ "$WP" = "gridsample-nkl" ] && [ "$NKL" != "1" ]; then
-                      echo "SKIP $LB: nkilib not importable"; continue; fi
-                    echo "################ gsmodel_${LB}_t${GT}"
-                    set +e
-                    python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \
-                        --device "$DV" --cores 1 --only-tile "$GT" \
-                        --warp "$WP" --fullgraph "$FG" --iters "$GI" \
-                        2>&1 | tee "$OUT/gsmodel_$LB.log"
-                    rc=${PIPESTATUS[0]}
-                    set -e
-                    echo "  rc=$rc"
-                    if [ "$rc" != "0" ]; then
-                      { grep -aoE "got in=[0-9]+ and out=[0-9]+|MemoryError|Killed|Unsupported|Error" \
-                        "$OUT/gsmodel_$LB.log" || true; } | head -3 | sed 's/^/    /'
-                    fi
-                    for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
-                    sleep 5
-                  done
-                  echo ""
-                  echo "################ GRIDSAMPLE IN THE MODEL, THREE CONFIGS ($GRID halo $HALO tile $GT)"
-                  printf "  %-10s %-16s %-8s %5s %12s %12s %10s\n" config warp device fg median_ms first_ms max_LSB
-                  for CFG in "nki:gridsample-nkl:neuron:1" "aten:gridsample:neuron:0" "cpu:gridsample:cpu:1"; do
-                    LB=$(echo $CFG | cut -d: -f1); WP=$(echo $CFG | cut -d: -f2)
-                    DV=$(echo $CFG | cut -d: -f3); FG=$(echo $CFG | cut -d: -f4)
-                    f="$OUT/gsmodel_$LB.log"; [ -f "$f" ] || continue
-                    MS=$(grep -aoE "steady state: median [0-9.]+ ms" "$f" | head -1 | awk '{print $4}' || true)
-                    FI=$(grep -aoE "first call [0-9.]+ ms" "$f" | head -1 | awk '{print $3}' || true)
-                    L=$(grep -aoE "max_diff +[0-9.]+ LSB" "$f" | tail -1 | awk '{print $2}' || true)
-                    printf "  %-10s %-16s %-8s %5s %12s %12s %10s\n" "$LB" "$WP" "$DV" "$FG" "${MS:--}" "${FI:--}" "${L:--}"
-                  done
-                  echo ""
-                  echo "  median_ms is ONE TILE of $GRID halo $HALO -- 14 warps + 54 convs, the real"
-                  echo "  sequence, not an isolated op. Multiply by 32 tiles and divide by cores to"
-                  echo "  reach a frame, remembering the cpu arm's threads are already spent."
-                  exit 0
-                fi
-
                 # SET=gsbackends: THE apples-to-apples comparison. ONE operation -- gridsample,
                 # stock RIFE semantics (bilinear / border / align_corners=True) -- across THREE
                 # backends, at the tile dims that minimise padding.
@@ -472,7 +409,7 @@ spec:
             #    SET=nklsweep  -> sweep the kernel's max_indices_per_indirect at one dim
             #    SET=both TOP=0 -> every op the model runs at every dim it runs it (256 arms)
             - name: SET
-              value: "gsmodel"
+              value: "gsbackends"
             - name: TOP
               value: "4"
             - name: GRID

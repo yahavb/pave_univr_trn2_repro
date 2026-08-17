@@ -184,6 +184,106 @@ spec:
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
               BASE="--height 1728 --width 4096 --tiles $GRID --halo $HALO --bar 3 --device neuron --dtype fp32 --fullgraph $FULLGRAPH"
 
+              # ── nkilib restore: the NKL kernel (CR-288764575) is UNMERGED, so it is in no
+              # released image. ONE tar object off the S3-FUSE mount, extracted locally, then TEST
+              # the import and let the answer decide -- never assume, and never run an arm that can
+              # only fail. A tar built from a branch WITHOUT the CR imports fine and still lacks
+              # the kernel, which is exactly what happened three runs in a row; verify with
+              #   tar -tzf <tar> | grep grid_sample
+              NKILIB_TGZ="${NKILIB_TGZ:-$PVC/nkilib.tar.gz}"
+              if [ -f "$NKILIB_TGZ" ]; then
+                cp "$NKILIB_TGZ" /tmp/nkilib.tar.gz && mkdir -p /tmp/nkilib \
+                  && tar -xzf /tmp/nkilib.tar.gz -C /tmp/nkilib \
+                  && export PYTHONPATH="/tmp/nkilib:${PYTHONPATH:-}" \
+                  && echo "nkilib: restored from $NKILIB_TGZ"
+              else
+                echo "nkilib: no tar at $NKILIB_TGZ"
+              fi
+              if python3 -c "import nkilib.experimental.indirect.grid_sample" 2>/dev/null; then
+                echo "nkilib: IMPORT OK -- gridsample-nkl available"
+              else
+                echo "nkilib: IMPORT FAILS -- gridsample-nkl arms will be SKIPPED"
+              fi
+              echo ""
+
+              # ── MODE=warpcmp: the SAME MODEL, one tile, once per resample config ────────────
+              # This is the model, not a microbenchmark: repro_unrolling_trn2.py running its real
+              # op sequence -- 14 warps and 54 convs -- so it prices what no isolated op can:
+              # the two NHWC permutes the NKL kernel adds per call, and the interaction with the
+              # convs around them.
+              #
+              #   nki    --warp gridsample-nkl --device neuron --fullgraph 1
+              #   aten   --warp gridsample     --device neuron --fullgraph 0
+              #   cpu    --warp gridsample     --device cpu
+              #
+              # ONE OP, THREE LOWERINGS -- gridsample throughout, so the only variable is where and
+              # how it runs. No gather, which is a different formulation entirely.
+              #
+              # TILE: the largest shape of the least-padding geometry that works. At 4x8 halo 64
+              # that is tile 9, 576x640 = 368,640 px. Padding ratio 1.535x against h128's 2.130x,
+              # and the smaller-padding alternatives are all dead (2x8 h64 OOM, 2x4 h128 OOM,
+              # 4x8 h48 fuses 0 of 3).
+              #
+              # aten MUST take --fullgraph 0: ATen grid_sample's fused graph exceeds compiler
+              # memory, OOM-killed at 169 min and again at 94 min at 1500Gi. nki keeps fullgraph=1
+              # because a single NKI call fuses, so adopting it would not cost the fused config --
+              # that asymmetry is itself part of the answer.
+              if [ "${MODE:-full}" = "warpcmp" ]; then
+                WT="${WARPCMP_TILE:-9}"; WI="${WARPCMP_ITERS:-3}"
+                echo "=== MODE=warpcmp  $GRID halo $HALO tile $WT  iters $WI ==="
+                echo ""
+                for CFG in "nki:gridsample-nkl:neuron:1" "aten:gridsample:neuron:0" "cpu:gridsample:cpu:1"; do
+                  LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; Z=${Z#*:}; DV=${Z%%:*}; FG=${Z##*:}
+                  if [ "$WP" = "gridsample-nkl" ] && ! python3 -c "import nkilib.experimental.indirect.grid_sample" 2>/dev/null; then
+                    echo "SKIP $LB: nkilib not importable (CR-288764575 is unmerged; upload a tar"
+                    echo "  CONTAINING nkilib/experimental/indirect/grid_sample.py to $NKILIB_TGZ --"
+                    echo "  a tar from a branch without the CR imports fine and still lacks it)"
+                    continue
+                  fi
+                  echo "################ warpcmp_${LB}_t${WT}"
+                  B=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
+                  set +e
+                  python -u repro_unrolling_trn2.py $FRAMES $REF \
+                      --height 1728 --width 4096 --tiles "$GRID" --halo "$HALO" --bar 3 \
+                      --dtype fp32 --device "$DV" --cores 1 --only-tile "$WT" \
+                      --warp "$WP" --fullgraph "$FG" --iters "$WI" \
+                      2>&1 | tee "$R/warpcmp_$LB.log"
+                  rc=${PIPESTATUS[0]}
+                  set -e
+                  A=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
+                  echo "$rc" > "$R/rc_warpcmp_$LB.txt"
+                  echo "  rc=$rc  NEFFs +$((A-B))"
+                  if [ "$rc" != "0" ]; then
+                    { grep -aoE "got in=[0-9]+ and out=[0-9]+|MemoryError|Killed|Unsupported|kernel_assert" \
+                      "$R/warpcmp_$LB.log" || true; } | head -3 | sed 's/^/    /'
+                  fi
+                  archive_cache
+                  for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                  sleep 5
+                done
+                echo ""
+                echo "################ GRIDSAMPLE IN THE MODEL -- $GRID halo $HALO tile $WT"
+                printf "  %-8s %-16s %-8s %3s %5s %12s %12s %10s\n" cfg warp device fg rc median_ms first_ms max_LSB
+                for CFG in "nki:gridsample-nkl:neuron:1" "aten:gridsample:neuron:0" "cpu:gridsample:cpu:1"; do
+                  LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; Z=${Z#*:}; DV=${Z%%:*}; FG=${Z##*:}
+                  f="$R/warpcmp_$LB.log"; [ -f "$f" ] || continue
+                  rc=$(cat "$R/rc_warpcmp_$LB.txt" 2>/dev/null || echo '?')
+                  MS=$(grep -aoE "steady state: median [0-9.]+ ms" "$f" | head -1 | awk '{print $4}' || true)
+                  FI=$(grep -aoE "first call [0-9.]+ ms" "$f" | head -1 | awk '{print $3}' || true)
+                  L=$(grep -aoE "max_diff +[0-9.]+ LSB" "$f" | tail -1 | awk '{print $2}' || true)
+                  printf "  %-8s %-16s %-8s %3s %5s %12s %12s %10s\n" \
+                    "$LB" "$WP" "$DV" "$FG" "$rc" "${MS:--}" "${FI:--}" "${L:--}"
+                done
+                echo ""
+                echo "  median_ms is ONE TILE of $GRID halo $HALO: 14 warps + 54 convs, the real"
+                echo "  sequence. x32 tiles / cores for a frame -- but the cpu arm's threads are"
+                echo "  ALREADY spent inside its number, so it does not divide by 8 the way the"
+                echo "  device arms do. That asymmetry is what makes a per-call cpu win evaporate"
+                echo "  at frame scale."
+                echo "  first_ms is compile+warmup, not latency."
+                exit 0
+              fi
+
               echo "=== [1/3] BUILD/LOAD -- serial compile probe, ONE graph at a time (not timed) ==="
               echo "tiles (largest shape first): $PREWARM_TILES"
               # SERIAL IS LOAD-BEARING. torch.compile is LAZY: neuronx-cc does not run until first
@@ -460,6 +560,20 @@ spec:
               value: "1"
             - name: BRANCH
               value: "main"
+            # MODE=warpcmp: the same MODEL, one tile, once per resample config -- nki / aten / cpu.
+            # MODE=full (default): the 3-run benchmark, serial 8-graph probe then the 8-core arm.
+            - name: MODE
+              value: "warpcmp"
+            # 64, not 128: the least-padding geometry that actually works (padded/valid 1.535x vs
+            # h128's 2.130x, so h128 is 39% more resample work) and the config that measured
+            # 3900.5 ms. Use 128 for accuracy questions, which is what the triage needed it for.
+            - name: HALO
+              value: "64"
+            - name: GRID
+              value: "4x8"
+            # tile 9 = 576x640 = 368,640 px, the LARGEST shape at 4x8 halo 64
+            - name: WARPCMP_TILE
+              value: "9"
             - name: NEURON_LOGICAL_NC_CONFIG
               value: "1"
             - name: NEURON_RT_NUM_CORES
