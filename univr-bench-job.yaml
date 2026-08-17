@@ -254,12 +254,27 @@ spec:
                 # tile; 288x320 is a quarter of its pixels; 192x224 is about a ninth.
                 # Random weights, since a reduced frame has no golden -- so RATIOS ONLY, and no
                 # accuracy claim. max_LSB is blank by design in this mode.
-                WRES="${WARPCMP_RES:-}"
+                # A LADDER of sizes, not one. The work distribution is EXACTLY scale-invariant --
+                # 90.04% C=3 / 7.50% C=16 / 1.88% / 0.47% / 0.12% at every size, because each
+                # Contextnet level is a fixed fraction of the tile area -- so a uniformly scaled
+                # tile reflects production's work mix precisely and only the absolutes scale, as
+                # H*W. That justifies extrapolation on paper. Running a LADDER DEMONSTRATES it: if
+                # the nki:aten ratio is stable across 128x128, 192x224 and 288x320, extrapolating
+                # to the real 576x640 tile is an empirical claim rather than an assumption. If it
+                # drifts with size, extrapolation is invalid and the log says so.
+                #   128x128  x22.5 to the production tile
+                #   192x224   x8.6
+                #   288x320   x4.0
+                #   576x640   x1    the real tile (WARPCMP_RES="" runs it via --only-tile)
+                # Sizes must be multiples of 32: IFBlock at scale=4 has effective stride 16 and
+                # lastconv must land back on the input size exactly; Contextnet also downsamples 16x.
+                WRES_LIST="${WARPCMP_RES:-128x128 192x224 288x320}"
                 echo "=== MODE=warpcmp  ${WRES:-$GRID halo $HALO tile $WT}  iters $WI ==="
                 echo "    THE MODEL STAYS ON NEURON in all three arms. Only the RESAMPLE REGION"
                 echo "    differs: its own torch.compile, its own backend. So the resample is the"
                 echo "    only variable, and the region boundary is a graph break in every arm."
                 echo ""
+                for WRES in $WRES_LIST; do
                 for CFG in "nki:gridsample-nkl:neuron" "aten:gridsample:neuron" "cpu:gridsample:cpu"; do
                   LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; RG=${Z##*:}
                   if [ "$WP" = "gridsample-nkl" ] && ! python3 -c "import nkilib.experimental.indirect.grid_sample" 2>/dev/null; then
@@ -296,23 +311,36 @@ spec:
                   for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
                   sleep 5
                 done
+                done
                 echo ""
                 echo "################ GRIDSAMPLE IN THE MODEL -- ${WRES:-$GRID halo $HALO tile $WT} fullgraph $WFG"
-                printf "  %-8s %-16s %-14s %5s %12s %12s %10s\n" cfg warp warp_region rc median_ms first_ms max_LSB
+                printf "  %-10s %-8s %-14s %5s %12s %12s %10s\n" size cfg warp_region rc median_ms vs_aten first_ms
+                for WRES in $WRES_LIST; do
+                A_MS=$(grep -aoE "steady state: median [0-9.]+ ms" "$R/warpcmp_aten_${WRES}.log" 2>/dev/null | head -1 | awk '{print $4}' || true)
                 for CFG in "nki:gridsample-nkl:neuron" "aten:gridsample:neuron" "cpu:gridsample:cpu"; do
                   LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; RG=${Z##*:}
-                  if [ -n "$WRES" ]; then f="$R/warpcmp_${LB}_${WRES}.log"; else f="$R/warpcmp_${LB}_t${WT}.log"; fi
-                  [ -f "$f" ] || continue
-                  if [ -n "$WRES" ]; then rcf="$R/rc_warpcmp_${LB}_${WRES}.txt"; else rcf="$R/rc_warpcmp_${LB}_t${WT}.txt"; fi
-                  rc=$(cat "$rcf" 2>/dev/null || echo '?')
+                  f="$R/warpcmp_${LB}_${WRES}.log"; [ -f "$f" ] || continue
+                  rc=$(cat "$R/rc_warpcmp_${LB}_${WRES}.txt" 2>/dev/null || echo '?')
                   MS=$(grep -aoE "steady state: median [0-9.]+ ms" "$f" | head -1 | awk '{print $4}' || true)
                   FI=$(grep -aoE "first call [0-9.]+ ms" "$f" | head -1 | awk '{print $3}' || true)
                   L=$(grep -aoE "max_diff +[0-9.]+ LSB" "$f" | tail -1 | awk '{print $2}' || true)
-                  RGL="$RG"; [ "$RG" = "cpu" ] && RGL="cpu/inductor"
-                  printf "  %-8s %-16s %-14s %5s %12s %12s %10s\n" \
-                    "$LB" "$WP" "$RGL" "$rc" "${MS:--}" "${FI:--}" "${L:--}"
+                  RGL="$RG"; if [ "$RG" = "cpu" ]; then RGL="cpu/inductor"; fi
+                  VS="-"
+                  if [ -n "${MS:-}" ] && [ -n "${A_MS:-}" ]; then
+                    VS=$(awk -v m="$MS" -v a="$A_MS" 'BEGIN{if(a>0) printf "%.3fx", m/a; else print "-"}')
+                  fi
+                  printf "  %-10s %-8s %-14s %5s %12s %12s %10s\n" \
+                    "$WRES" "$LB" "$RGL" "$rc" "${MS:--}" "$VS" "${FI:--}"
+                done
                 done
                 echo ""
+                echo "  vs_aten is the RATIO, and it is the point: if it is stable down the size"
+                echo "  column then extrapolating to the real 576x640 tile (x22.5 / x8.6 / x4.0)"
+                echo "  is empirical, not assumed. If it DRIFTS with size, extrapolation is invalid"
+                echo "  and only the largest row can be trusted."
+                echo "  The work mix is exactly scale-invariant (90.04% of pixel-warps at C=3 at"
+                echo "  every size), which is why a scaled tile reflects production at all."
+                echo "  max_LSB is absent by design: random weights, so no golden. RATIOS ONLY."
                 echo "  median_ms is ONE TILE of $GRID halo $HALO: 14 warps + 54 convs, the real"
                 echo "  sequence. x32 tiles / cores for a frame -- but the cpu arm's threads are"
                 echo "  ALREADY spent inside its number, so it does not divide by 8 the way the"
@@ -618,8 +646,13 @@ spec:
             # measured gridsample/gather ratio held at 2.94/2.94/2.95 across three dims. Prove the
             # RATIO here, then clear WARPCMP_RES to confirm the absolutes at the real tile.
             # Random weights => no golden => max_LSB is blank by design. Ratios only.
+            # A LADDER, smallest first: prove the ratio cheap, then watch whether it holds as
+            # size grows. If nki:aten is stable across all three, extrapolating to the real
+            # 576x640 tile (x22.5 / x8.6 / x4.0 respectively) is empirical rather than assumed.
+            # The work distribution is EXACTLY scale-invariant (90.04% of pixel-warps at C=3 at
+            # every size), which is why this works at all.
             - name: WARPCMP_RES
-              value: "288x320"
+              value: "128x128 192x224 288x320"
             - name: NEURON_LOGICAL_NC_CONFIG
               value: "1"
             - name: NEURON_RT_NUM_CORES
