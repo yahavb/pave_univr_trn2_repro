@@ -187,6 +187,28 @@ figure was taken at 992x1280 with `--model-type unet-inference`, so it is void),
 **`gridsample` at 3.0 and ~40 ns/descriptor are CONFIRMED** (3.004 and 40.40 vs the recorded
 ~38 ns).
 
+## How to assess a resample kernel: the distilled sequence, not per-op arms
+
+`microbench.py` answers "how many descriptors does this op issue" and it answered it. It CANNOT
+answer "what does swapping the resample do to the model", for three reasons:
+
+* an isolated op has no pipelining, no layout reuse and no overlap with the convs around it, so
+  per-op numbers do not sum to the sequence
+* absolute single-io microseconds are noise across runs -- only shares and counts are stable
+* a swapped resample changes the LAYOUT its neighbours see. The NKL kernel asserts NHWC while the
+  model is NCHW, so it adds two permutes per call that no per-op arm measures at all
+
+`distill_tile.py` runs the real sequence at a real padded tile shape as one compiled graph and
+reports a warm median, which IS comparable between warps. It imports the model's own modules, so
+a hand-copied "distilled" version cannot drift from the thing it claims to represent.
+
+Two rules for reading it:
+* **the bar is `gather`, not ATen `gridsample`.** gather is what the model uses, and it already
+  sits at the 1 descriptor/px floor at 40.40 ns, so a kernel only wins by beating ns/descriptor
+  -- i.e. by leaving the software DGE path (`hardware_dynamic_dma` is ~0% today).
+* **the ceiling is ~510 ms of a 3900 ms frame (~13%)**, the whole resample, even if it became
+  free. Any claimed win larger than that is a measurement error.
+
 ## Still blocking a shippable result
 
 **The baseline does not reproduce.** Same command as the README gives 4125.5 ms and
@@ -432,6 +454,8 @@ deterministic compiler verdicts rather than flaky runs.
 | `TILING_AND_GRAPH.md` | **read first.** Tiling algorithm, halo, quantisation, the full op graph, why the operand is `px x 14` |
 | `SINGLE_GRAPH_NCC_EBIR033.md` | the fusion walls, and that fusion is per TILE not per frame |
 | `METHOD.md` / `REPRO_README.md` | original bundle docs |
+| `distill_tile.py` | **the A/B harness.** The model's op SEQUENCE for one tile -- 3 pyramid stages with their 6 full-res warps, Contextnet x2, Unet -- as ONE compiled graph, with `--warp` swappable. Imports `UniVR`/`plan_tiles`/`WARPS` from the model, so the sequence is identical BY CONSTRUCTION, not transcription. Random weights, so no PSNR-vs-golden is printed; correctness is an `--save-out`/`--cmp` equivalence check between warps at a fixed seed |
+| `distill-job.yaml` | runs it per warp, `WARPS="gather gridsample-nkl"`, with nkilib preflight and a persistent NEFF cache |
 | `microbench.py` | the microbenchmark: 14 resamples + 54 convs, one op per invocation, each scored against a CPU reference |
 | `profile_roofline.py` | reads a `summary.json`, prints per-engine time and MFU |
 | `microbench-job.yaml` | runs it. `SET=warps|convs|both`, now the four 4x8 **halo-128** shapes and `CHANS=3 16 32 64 128`. **Every earlier warp arm ran at C=3 only** -- the cheapest site -- so gridsample was judged on its best case while its descriptor rate climbs to 205 pkt/px at C=128 (`_C=16`, so the resample runs at C=3/16/32/64/128) |
