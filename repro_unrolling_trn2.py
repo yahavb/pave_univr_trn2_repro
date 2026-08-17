@@ -68,8 +68,35 @@ import torch.nn.functional as F
 # the right fix rather than reducing --cores: the recompiles are legitimate, and halving cores
 # would roughly double wall clock (the README measures sum/wall 7.57 at 8 cores), producing a
 # latency not comparable to the baseline.
-torch._dynamo.config.cache_size_limit = 64
-torch._dynamo.config.accumulated_cache_size_limit = 256
+#
+# DYNAMO RENAMED THIS KNOB, AND SETTING THE OLD NAME IS A SILENT NO-OP. On the torch shipped
+# with neuronx-cc 2.27 the config attribute is `recompile_limit`; assigning the older
+# `cache_size_limit` neither raises nor aliases, so the limit stayed at the default 8 and the
+# 8-core arm of univr-accuracy-triage-k2zwh died AFTER the 8 probe compiles had already spent
+# ~11.5 h:
+#     torch._dynamo.exc.Unsupported: Dynamo recompile limit exceeded
+#     ... exceeding the recompile_limit cache size limit (currently set to 8)
+# So set EVERY name that exists, then VERIFY -- an unverified assignment is what cost that run.
+#
+# And the count needed is larger than the 8 NEFFs a frame builds. The recompiles are driven by
+# `row0`, which dynamo specialises as a python int at line ~831
+# (`tau = (t + gamma - gamma * rows / fh ...)`) and which differs per tile ROW, on top of the
+# padded shape and the timestamp. The failing log reached recompile 22 of that one frame.
+for _n, _v in (("cache_size_limit", 64), ("accumulated_cache_size_limit", 256),
+               ("recompile_limit", 64), ("accumulated_recompile_limit", 256)):
+    if hasattr(torch._dynamo.config, _n):
+        setattr(torch._dynamo.config, _n, _v)
+_eff = [getattr(torch._dynamo.config, _n)
+        for _n in ("cache_size_limit", "recompile_limit")
+        if hasattr(torch._dynamo.config, _n)]
+if not _eff or min(_eff) < 64:
+    raise SystemExit(
+        "dynamo recompile limit is %r, expected >= 64. The config attribute was renamed and "
+        "this build exposes neither a settable cache_size_limit nor recompile_limit. Fix the "
+        "name here BEFORE running: under fullgraph=True this is a hard error that only shows up "
+        "at 8 cores, after every compile is already paid for." % (_eff,))
+print("  dynamo recompile limit: %d (must exceed the per-tile recompile count, observed 22)"
+      % min(_eff))
 
 # NKI MUST be imported at MODULE level, not inside the builder function. NKI's parser frontend
 # resolves names through the kernel's __globals__ and NOT through its closure, so importing

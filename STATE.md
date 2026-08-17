@@ -89,6 +89,70 @@ measurement** (`--cores 1 --only-tile T`). That is what makes them comparable to
 and what makes the ceiling a per-compile number. An OOM from a run that compiled several
 graphs at once says nothing about it -- see the accuracy-triage OOMs below.
 
+## MEASURED: halo 128 fuses on all 8 slots, and EVERY TILE STILL FAILS ACCURACY
+
+`univr-accuracy-triage-k2zwh`, 4x8 halo 128, `gather`, serial probe, `--cores 1 --only-tile`,
+**neuronx-cc 2.27.2878.0** (not the 2.26.6360.0 every earlier result used):
+
+| tile | padded | px | compile | max_diff | PSNR |
+|---|---|---|---|---|---|
+| 9 | 704x768 | 540,672 | 73 min | 22.38 LSB | 48.45 dB |
+| 17 | 704x768 | 540,672 | 75 min | 31.79 LSB | 49.90 dB |
+| 8 | 704x640 | 450,560 | **215 min** | 25.08 LSB | 49.82 dB |
+| 16 | 704x640 | 450,560 | **229 min** | 39.01 LSB | 49.49 dB |
+| 1 | 576x768 | 442,368 | 33 min | 28.22 LSB | 49.84 dB |
+| 25 | 576x768 | 442,368 | 33 min | 40.63 LSB | 49.16 dB |
+| 0 | 576x640 | 368,640 | 21 min | 39.26 LSB | 47.66 dB |
+| 24 | 576x640 | 368,640 | 22 min | 47.56 LSB | 44.00 dB |
+
+`ALL 8 GRAPHS COMPILE = 1`, 11.7 h for the set, one NEFF per tile exactly as predicted.
+
+**This is the strongest localisation yet: a SINGLE tile, on ONE core, in ONE graph, at the
+PRODUCTION halo, already fails — on all four shapes and both passes, 22-48 LSB against a bar
+of 3.** Everything the frame adds is therefore exonerated:
+
+* **not the halo** -- 128 is the production value and it fails
+* **not the 8-core path** -- one core fails
+* **not tile stitching or the merge seam** -- one tile has neither
+* **not the replica deep-copy** -- a single replica fails
+* **not the resample** -- already known, `gather` and `nki-dyn` agreed to every digit
+
+What is left is the per-tile fused graph itself: a conv, `interpolate`, or `NeuronPReLU`
+lowering difference under `fullgraph=True`. The next step is a per-stage numeric diff of one
+tile against CPU, not another geometry sweep.
+
+Caveat: these are per-tile scores over each tile's own region, not whole-frame maxima, so they
+are not directly comparable to the 92.56 LSB frame number. Both fail by more than 7x.
+
+**Compile time is NOT monotonic in pixel count.** 704x640 at 450,560 px took 215 and 229 min;
+704x768 at 540,672 px took 73 and 75. A 17% SMALLER shape cost 3x MORE. Do not estimate compile
+cost from area.
+
+**The memory ceiling was overstated.** 540,672 px fuses in 73 min. The old "~442k-594k px"
+bracket came from 2x8 at 593,920 px (928x640) OOMing, so the limit is not area alone -- aspect
+ratio or the resulting tile geometry matters. 2x4 (1.0M px) and 2x8 remain measured OOMs; do not
+generalise a px threshold from them.
+
+## The 8-core arm produced NO latency: the dynamo fix had silently stopped working
+
+Same job, stage 2, against a fully warm cache (`NEFFs +0`, so the prewarm design worked):
+
+```
+torch._dynamo.exc.Unsupported: Dynamo recompile limit exceeded
+  ... exceeding the recompile_limit cache size limit (currently set to 8)
+```
+
+The script sets `torch._dynamo.config.cache_size_limit = 64`. **On the torch shipped with
+neuronx-cc 2.27 the attribute is `recompile_limit`, and assigning the old name neither raises
+nor aliases** -- so the limit stayed at 8 and the arm died after the 8 probe compiles had
+already spent 11.5 h. Now fixed by setting every name that exists AND verifying the effective
+value at import, raising `SystemExit` if it is still below 64.
+
+Also learned: the recompiles are driven by **`row0`**, which dynamo specialises as a python int
+at `tau = (t + gamma - gamma * rows / fh ...)` (~line 831) and which varies per tile ROW, on top
+of shape and timestamp. The failing frame reached recompile **22**, so "8 graphs" understates the
+host-side trace count even though it is exactly right about NEFFs.
+
 ## Still blocking a shippable result
 
 **The baseline does not reproduce.** Same command as the README gives 4125.5 ms and
@@ -369,11 +433,14 @@ univr_results_<TS>.tar.gz        everything else
   serially before going wide**, and check the `NEFFs +N` delta: `+0` proves the cache was warm.
 * **Every `FUSES` verdict in this file is a serial `--cores 1 --only-tile T` measurement.**
   Do not compare an OOM from a multi-graph run against them; it is not the same experiment.
-* **Dynamo's `cache_size_limit` defaults to 8** and this model needs exactly 8 graphs
-  (4 padded shapes x 2 triplet timestamps), so it sat on the limit -- one tile never trips it,
-  8 cores always does, and under fullgraph it is a hard error. Set to 64 / 256 at import.
-  It is a HOST trace counter: unrelated to cores or device memory, and reducing `--cores`
-  would only double wall clock.
+* **Dynamo's recompile limit defaults to 8** and this model needs more than that, so it sat on
+  the limit -- one tile never trips it, 8 cores always does, and under fullgraph it is a hard
+  error. It is a HOST trace counter: unrelated to cores or device memory, and reducing `--cores`
+  would only double wall clock. **The config attribute was RENAMED** (`cache_size_limit` ->
+  `recompile_limit` on the torch with neuronx-cc 2.27) and assigning the old name is a **silent
+  no-op** -- no raise, no alias -- which cost the 8-core arm of `k2zwh` after 11.5 h of compiles
+  were already paid for. The script now sets every name that exists and VERIFIES the effective
+  value at import. Never set a config knob without reading it back.
 * **Names drifted from what the files do**, twice. `warp_op_bench.py` benchmarked warps AND
   convs; `sweep-job.yaml` ran the whole microbenchmark. Now `microbench.py` and
   `microbench-job.yaml`. `conv_op_bench.py` and `conv-bench-job.yaml` are deleted -- they
