@@ -272,6 +272,26 @@ spec:
               value: "1"
             - name: RES
               value: "256x384"
+            # ── the knobs. Defaults are the DECISIVE run for the resample question:
+            #    SET=warps TOP=4 = the four C=3 dims, which are 90.0% of all resample work,
+            #    x {gather, gridsample, gridsample-nkl} = 12 arms instead of 256.
+            #    SET=sequence  -> the whole tile op sequence per warp (the model-level answer;
+            #                     catches the NHWC permutes the NKL kernel adds, which no
+            #                     single-op arm can see)
+            #    SET=both TOP=0 -> every op the model runs at every dim it runs it (256 arms)
+            - name: SET
+              value: "warps"
+            - name: TOP
+              value: "4"
+            - name: GRID
+              value: "4x8"
+            - name: HALO
+              value: "128"
+            # --op sequence only
+            - name: TILE
+              value: "9"
+            - name: ITERS
+              value: "5"
             - name: NEURON_LOGICAL_NC_CONFIG
               value: "1"
             - name: NEURON_RT_NUM_CORES
