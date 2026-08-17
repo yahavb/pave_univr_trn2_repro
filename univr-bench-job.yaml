@@ -230,9 +230,36 @@ spec:
               # that asymmetry is itself part of the answer.
               if [ "${MODE:-full}" = "warpcmp" ]; then
                 WT="${WARPCMP_TILE:-9}"; WI="${WARPCMP_ITERS:-3}"
-                echo "=== MODE=warpcmp  $GRID halo $HALO tile $WT  iters $WI ==="
+                # ALL THREE ARMS AT THE SAME fullgraph SETTING, and it has to be 0.
+                # This is the control. ATen grid_sample CANNOT compile fused -- its graph exceeds
+                # compiler memory, OOM-killed at 169 min and again at 94 min at 1500Gi -- so the
+                # only regime all three can share is fullgraph=0: graph breaks allowed, the
+                # resample left to whatever it lowers to, the rest compiled. Running nki at
+                # fullgraph=1 and aten at 0, as an earlier version did, meant the compilation
+                # regime varied alongside the resample and the resample was NOT the only variable.
+                #
+                # Consequence to keep in view: fullgraph=0 is NOT the production config, which is
+                # fullgraph=True. These numbers compare the three lowerings to each other; they do
+                # not predict the fused frame. The fused-config datapoint is the separate
+                # MODE=full run, and nki is the only one of the three that can even produce it.
+                WFG="${WARPCMP_FULLGRAPH:-0}"
+                # REDUCED MODE: prove the ratio fast, then confirm at full size. Set
+                # WARPCMP_RES=HxW to run ONE small tile instead of a real 4K tile.
+                # This is justified by our own data, not by hope: the op-level arms measured the
+                # gridsample/gather ratio at 2.94, 2.94 and 2.95 across three different dims, with
+                # pkt/px 1.006 vs 3.004 at every one. The cost law is PER PIXEL, so the RATIO is
+                # dim-invariant in the measured range even though the absolutes are not.
+                # Legal sizes must be multiples of 32: IFBlock at scale=4 does interpolate(1/4)
+                # then two stride-2 convs (effective stride 16) and lastconv must land back on the
+                # input size exactly, and Contextnet also downsamples 16x. 576x640 is the real
+                # tile; 288x320 is a quarter of its pixels; 192x224 is about a ninth.
+                # Random weights, since a reduced frame has no golden -- so RATIOS ONLY, and no
+                # accuracy claim. max_LSB is blank by design in this mode.
+                WRES="${WARPCMP_RES:-}"
+                echo "=== MODE=warpcmp  $GRID halo $HALO tile $WT  iters $WI  fullgraph $WFG ==="
+                echo "    all three arms at fullgraph=$WFG so the resample is the ONLY variable"
                 echo ""
-                for CFG in "nki:gridsample-nkl:neuron:1" "aten:gridsample:neuron:0" "cpu:gridsample:cpu:1"; do
+                for CFG in "nki:gridsample-nkl:neuron:$WFG" "aten:gridsample:neuron:$WFG" "cpu:gridsample:cpu:$WFG"; do
                   LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; Z=${Z#*:}; DV=${Z%%:*}; FG=${Z##*:}
                   if [ "$WP" = "gridsample-nkl" ] && ! python3 -c "import nkilib.experimental.indirect.grid_sample" 2>/dev/null; then
                     echo "SKIP $LB: nkilib not importable (CR-288764575 is unmerged; upload a tar"
@@ -240,34 +267,43 @@ spec:
                     echo "  a tar from a branch without the CR imports fine and still lacks it)"
                     continue
                   fi
-                  echo "################ warpcmp_${LB}_t${WT}"
+                  if [ -n "$WRES" ]; then
+                    WH=${WRES%%x*}; WW=${WRES##*x}
+                    GEOM="--height $WH --width $WW --tiles 1x1 --random-weights"
+                    LBL="warpcmp_${LB}_${WRES}"
+                  else
+                    GEOM="--height 1728 --width 4096 --tiles $GRID --halo $HALO $REF --only-tile $WT"
+                    LBL="warpcmp_${LB}_t${WT}"
+                  fi
+                  echo "################ $LBL"
                   B=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
                   set +e
-                  python -u repro_unrolling_trn2.py $FRAMES $REF \
-                      --height 1728 --width 4096 --tiles "$GRID" --halo "$HALO" --bar 3 \
-                      --dtype fp32 --device "$DV" --cores 1 --only-tile "$WT" \
+                  python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
+                      --dtype fp32 --device "$DV" --cores 1 \
                       --warp "$WP" --fullgraph "$FG" --iters "$WI" \
-                      2>&1 | tee "$R/warpcmp_$LB.log"
+                      2>&1 | tee "$R/$LBL.log"
                   rc=${PIPESTATUS[0]}
                   set -e
                   A=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
-                  echo "$rc" > "$R/rc_warpcmp_$LB.txt"
+                  echo "$rc" > "$R/rc_$LBL.txt"
                   echo "  rc=$rc  NEFFs +$((A-B))"
                   if [ "$rc" != "0" ]; then
                     { grep -aoE "got in=[0-9]+ and out=[0-9]+|MemoryError|Killed|Unsupported|kernel_assert" \
-                      "$R/warpcmp_$LB.log" || true; } | head -3 | sed 's/^/    /'
+                      "$R/$LBL.log" || true; } | head -3 | sed 's/^/    /'
                   fi
                   archive_cache
                   for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
                   sleep 5
                 done
                 echo ""
-                echo "################ GRIDSAMPLE IN THE MODEL -- $GRID halo $HALO tile $WT"
+                echo "################ GRIDSAMPLE IN THE MODEL -- ${WRES:-$GRID halo $HALO tile $WT} fullgraph $WFG"
                 printf "  %-8s %-16s %-8s %3s %5s %12s %12s %10s\n" cfg warp device fg rc median_ms first_ms max_LSB
-                for CFG in "nki:gridsample-nkl:neuron:1" "aten:gridsample:neuron:0" "cpu:gridsample:cpu:1"; do
+                for CFG in "nki:gridsample-nkl:neuron:$WFG" "aten:gridsample:neuron:$WFG" "cpu:gridsample:cpu:$WFG"; do
                   LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; Z=${Z#*:}; DV=${Z%%:*}; FG=${Z##*:}
-                  f="$R/warpcmp_$LB.log"; [ -f "$f" ] || continue
-                  rc=$(cat "$R/rc_warpcmp_$LB.txt" 2>/dev/null || echo '?')
+                  if [ -n "$WRES" ]; then f="$R/warpcmp_${LB}_${WRES}.log"; else f="$R/warpcmp_${LB}_t${WT}.log"; fi
+                  [ -f "$f" ] || continue
+                  if [ -n "$WRES" ]; then rcf="$R/rc_warpcmp_${LB}_${WRES}.txt"; else rcf="$R/rc_warpcmp_${LB}_t${WT}.txt"; fi
+                  rc=$(cat "$rcf" 2>/dev/null || echo '?')
                   MS=$(grep -aoE "steady state: median [0-9.]+ ms" "$f" | head -1 | awk '{print $4}' || true)
                   FI=$(grep -aoE "first call [0-9.]+ ms" "$f" | head -1 | awk '{print $3}' || true)
                   L=$(grep -aoE "max_diff +[0-9.]+ LSB" "$f" | tail -1 | awk '{print $2}' || true)
@@ -574,6 +610,14 @@ spec:
             # tile 9 = 576x640 = 368,640 px, the LARGEST shape at 4x8 halo 64
             - name: WARPCMP_TILE
               value: "9"
+            # REDUCED MODE, to cut turnaround. Set to HxW (multiple of 32) to run ONE small tile
+            # with random weights instead of a real 4K tile: 288x320 is a quarter of 576x640's
+            # pixels, 192x224 about a ninth. Justified because the cost law is per-pixel and the
+            # measured gridsample/gather ratio held at 2.94/2.94/2.95 across three dims. Prove the
+            # RATIO here, then clear WARPCMP_RES to confirm the absolutes at the real tile.
+            # Random weights => no golden => max_LSB is blank by design. Ratios only.
+            - name: WARPCMP_RES
+              value: "288x320"
             - name: NEURON_LOGICAL_NC_CONFIG
               value: "1"
             - name: NEURON_RT_NUM_CORES
