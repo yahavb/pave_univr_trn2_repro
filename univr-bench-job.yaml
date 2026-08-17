@@ -184,6 +184,46 @@ spec:
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
               BASE="--height 1728 --width 4096 --tiles $GRID --halo $HALO --bar 3 --device neuron --dtype fp32 --fullgraph $FULLGRAPH"
 
+              # ── RES: run the WHOLE 3-run flow at a REDUCED resolution ────────────────────────
+              # One small tile instead of the 4K frame, so the compile is affordable and the
+              # profiler artifacts are small enough to actually collect. Everything downstream --
+              # the clean run, the runtime trace_info.pb bundle, the perfetto trace, the per-NEFF
+              # ranking and the pairs -- is unchanged; only the geometry shrinks.
+              #
+              # Extrapolation is legitimate for the WORK MIX and NOT for measured ratios. The mix is
+              # exactly scale-invariant (90.04% of pixel-warps at C=3 at every size, because each
+              # Contextnet level is a fixed fraction of tile area). But the warpcmp ladder showed
+              # cpu/aten drifting 0.851 -> 0.924 -> 0.967 with size, so a RATIO measured at one size
+              # does not transfer. Treat these as a profile of the op mix, not a latency forecast.
+              #
+              # Sizes must be multiples of 32: IFBlock at scale=4 has effective stride 16 and
+              # lastconv must land back on the input size exactly; Contextnet also downsamples 16x.
+              #   128x128  16,384 px    192x224  43,008 px    288x320  92,160 px
+              #   576x640 368,640 px = the real halo-64 tile, for reference
+              #
+              # NOTE ATen gridsample under fullgraph=True OOM-killed at the PRODUCTION tile (169 and
+              # 94 min at 1500Gi). At these sizes it may compile -- that is part of what this run
+              # tests, and it fails cheaply rather than after hours if it does not.
+              RES="${RES:-}"
+              SKIP_PROBE=0
+              if [ -n "$RES" ]; then
+                RH=${RES%%x*}; RW=${RES##*x}
+                # No golden at a reduced size, so random weights and NO --gt: timing and
+                # descriptors are valid, absolute accuracy is not and none is claimed.
+                REF="--random-weights"
+                BASE="--height $RH --width $RW --tiles 1x1 --bar 3 --device neuron --dtype fp32 --fullgraph $FULLGRAPH"
+                CORES=1
+                SKIP_PROBE=1
+                CFG="${RES}"
+                RUN="exp_univr-${RES}-${WARP}-fg${FULLGRAPH}_${TS}"
+                RUNDIR="$PVC/runs/$RUN"
+                CACHE_TGZ="$PVC/neff_cache_${RES}_fg${FULLGRAPH}.tar.gz"
+                mkdir -p "$RUNDIR/explorer" "$RUNDIR/perfetto" || true
+                echo "── REDUCED: ${RH}x${RW} = $((RH*RW)) px, 1x1, 1 core, random weights"
+                echo "   run dir $RUNDIR"
+                echo ""
+              fi
+
               # ── nkilib restore: the NKL kernel (CR-288764575) is UNMERGED, so it is in no
               # released image. ONE tar object off the S3-FUSE mount, extracted locally, then TEST
               # the import and let the answer decide -- never assume, and never run an arm that can
@@ -367,6 +407,13 @@ spec:
               fi
 
               echo "=== [1/3] BUILD/LOAD -- serial compile probe, ONE graph at a time (not timed) ==="
+              if [ "$SKIP_PROBE" = "1" ]; then
+                # At 1x1 there is exactly ONE padded shape and ONE timestamp, so the 8-slot probe
+                # has nothing to probe -- the clean run below compiles it. The probe exists for the
+                # 4K frame, where 8 concurrent cold compiles OOMKilled two pods.
+                echo "  SKIPPED: reduced geometry has a single shape; the clean run compiles it"
+                PW_ALL=1
+              else
               echo "tiles (largest shape first): $PREWARM_TILES"
               # SERIAL IS LOAD-BEARING. torch.compile is LAZY: neuronx-cc does not run until first
               # call, inside run_tiled's ThreadPoolExecutor(max_workers=ncore). So --cores 8 on a
@@ -407,6 +454,7 @@ spec:
                 sleep 5
               done
               echo "  ==> ALL 8 GRAPHS COMPILE = $PW_ALL  (cache holds $(find /tmp/neff_cache -name '*.neff' | wc -l) NEFFs)"
+              fi
               echo ""
 
               T_CLEAN=""; LSB=""; PSNR=""; GATE=""
@@ -483,19 +531,27 @@ spec:
 
               # ─────────────── [4] per-NEFF: capture -> summary-json -> rank by FIXABILITY ───────
               echo "=== [4] per-NEFF engine breakdown + fixability ranking ==="
-              # neuron-profile CLI ONLY. NEVER the neuron-explorer view SERVER (--ingest-only, the
+              # NEVER the neuron-explorer view SERVER (--ingest-only, the
               # :3001/:3002/:8086 UI, SQL-over-curl) -- it hangs on big DMA NEFFs on this image.
               # Only summary-json and summary-text work; --output-format json returns EMPTY.
               POUT=/tmp/perneff; rm -rf "$POUT"; mkdir -p "$POUT"
+              # neuron-profile is DEPRECATED on this image (cc 2.27): every capture failed with a
+              # banner pointing at neuron-explorer, and an entire microbench run produced no
+              # descriptor data because of it. Prefer neuron-explorer, fall back for older images.
+              # This is the CAPTURE/VIEW subcommand -- NOT the neuron-explorer view SERVER
+              # (--ingest-only, :3001/:3002), which hangs on big DMA NEFFs and must never be used.
+              PROF=neuron-explorer
+              command -v "$PROF" >/dev/null 2>&1 || PROF=neuron-profile
+              echo "  profiler CLI: $PROF"
               mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)
               echo "  NEFFs in cache: ${#NEFFS[@]}"
               OK=0
               for neff in "${NEFFS[@]}"; do
                 hash=$(basename "$neff" .neff)
                 NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 900 \
-                  neuron-profile capture --single-io -n "$neff" -s "$POUT/${hash}.ntff" >/dev/null 2>&1 || continue
+                  "$PROF" capture --single-io -n "$neff" -s "$POUT/${hash}.ntff" >/dev/null 2>&1 || continue
                 [ -f "$POUT/${hash}.ntff" ] || continue
-                timeout 300 neuron-profile view -n "$neff" -s "$POUT/${hash}.ntff" \
+                timeout 300 "$PROF" view -n "$neff" -s "$POUT/${hash}.ntff" \
                   --output-format summary-json > "$POUT/${hash}.json" 2>/dev/null || true
                 [ -s "$POUT/${hash}.json" ] && OK=$((OK+1))
               done
@@ -515,7 +571,7 @@ spec:
               BIGHASH=$(python3 scripts/neuron/pick_neffs.py "$POUT" /tmp/neff_cache 2>/dev/null | head -1 || true)
               if [ -n "${BIGHASH:-}" ] && [ -f "$POUT/${BIGHASH}.ntff" ]; then
                 BIGNEFF=$(find /tmp/neff_cache -name "${BIGHASH}.neff" | head -1)
-                timeout 300 neuron-profile view -n "$BIGNEFF" -s "$POUT/${BIGHASH}.ntff" \
+                timeout 300 "$PROF" view -n "$BIGNEFF" -s "$POUT/${BIGHASH}.ntff" \
                   --output-format summary-text 2>/dev/null | tee "$R/hotspots_${BIGHASH}.txt" || true
               else
                 echo "  no dominant NEFF (capture sweep returned nothing) -- skip"
@@ -644,8 +700,10 @@ spec:
               value: "main"
             # MODE=warpcmp: the same MODEL, one tile, once per resample config -- nki / aten / cpu.
             # MODE=full (default): the 3-run benchmark, serial 8-graph probe then the 8-core arm.
+            # full = the 3-run benchmark: build/load, CLEAN run (the only latency), then the
+            # profiled runs that produce the explorer bundle and the perfetto trace.
             - name: MODE
-              value: "warpcmp"
+              value: "full"
             # 64, not 128: the least-padding geometry that actually works (padded/valid 1.535x vs
             # h128's 2.130x, so h128 is 39% more resample work) and the config that measured
             # 3900.5 ms. Use 128 for accuracy questions, which is what the triage needed it for.
@@ -653,6 +711,19 @@ spec:
               value: "64"
             - name: GRID
               value: "4x8"
+            # REDUCED resolution for the whole flow: one small tile, so the compile is affordable
+            # and the profiler artifacts are collectable. 128x128 / 192x224 / 288x320 are the
+            # ladder sizes; 576x640 is the real halo-64 tile. Multiples of 32 only.
+            # Clear RES to run the real 4K frame.
+            - name: RES
+              value: "288x320"
+            - name: WARP
+              value: "gridsample"
+            # fullgraph=1: ONE fused graph, no --warp-region. ATen gridsample OOM-killed at the
+            # PRODUCTION tile this way (169 and 94 min); at 288x320 it may well compile, and that
+            # is part of what this run answers.
+            - name: FULLGRAPH
+              value: "1"
             # tile 9 = 576x640 = 368,640 px, the LARGEST shape at 4x8 halo 64
             - name: WARPCMP_TILE
               value: "9"
