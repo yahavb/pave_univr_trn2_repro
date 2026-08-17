@@ -1532,6 +1532,11 @@ def main():
                              _SHIFTWARP_MAXC))
     if a.warp.startswith("nki") and a.device != "neuron":
         ap.error("--warp %s requires --device neuron" % a.warp)
+    # gridsample-nkl is an NKI kernel but does NOT start with "nki", so the guard above misses it.
+    # Without this it would try to wrap_nki() on the host and fail somewhere far from the cause.
+    if a.warp == "gridsample-nkl" and a.device != "neuron":
+        ap.error("--warp gridsample-nkl is an NKI kernel and requires --device neuron; use "
+                 "--warp gridsample for the host arm (same op, same semantics)")
     if a.warp.startswith("nki"):
         # Build the NKI wrappers HERE, before anything is compiled. warp_nki() otherwise builds them
         # lazily on first use, which puts wrap_nki() inside a traced frame. At the 4K
@@ -1594,6 +1599,12 @@ def main():
         which pixels get sampled. That bitcast is in the NKI warps ONLY, so --fullgraph 0 is
         gated to the warps without it (see the guard in main())."""
         fg = bool(a.fullgraph)
+        # backend="neuron" is only valid ON neuron. --device cpu exists so the SAME model and the
+        # SAME op sequence can be run on the host, which makes device-vs-host a controlled
+        # comparison rather than an extrapolation from an isolated op.
+        if a.device == "cpu":
+            print("  torch.compile[%s] inductor (cpu) fullgraph=%s" % (tag or "model", fg))
+            return torch.compile(m, dynamic=False, fullgraph=fg)
         print("  torch.compile[%s] fullgraph=%s%s"
               % (tag or "model", fg, "" if fg else "  (graph breaks ALLOWED)"))
         return torch.compile(m, backend="neuron", dynamic=False, fullgraph=fg)
