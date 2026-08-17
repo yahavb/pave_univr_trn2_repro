@@ -106,7 +106,16 @@ spec:
               # work, and TOP prints exactly what it left out rather than capping silently:
               #   the four C=3 dims alone are 90.0% of all resample work
               #   all five C=128 dims together are 0.11%
-              WARP_IMPLS="${WARP_IMPLS:-gather,gridsample}"
+              # DEFAULT IS gather ONLY, plus the kernel when available. gridsample is deliberately
+              # NOT here: it is the CORRECTNESS reference (every arm is scored against it computed
+              # on CPU) but it is NOT a latency baseline -- it cannot compile fused at all
+              # (OOM-killed at 169 and again at 94 min), so the model never pays its 64.66 ms.
+              # Comparing gather against it earned its keep once, by establishing that time =
+              # descriptors x ~40 ns (1.006 vs 3.004 pkt/px at identical ns/desc). That law is
+              # settled, so its latency column is now a third of the arms for a number we already
+              # have and cannot use. Add it back explicitly with WARP_IMPLS=gather,gridsample if a
+              # future change needs the law re-checked.
+              WARP_IMPLS="${WARP_IMPLS:-gather}"
               if [ "$NKL" = "1" ]; then WARP_IMPLS="$WARP_IMPLS,gridsample-nkl"; fi
               TOP="${TOP:-0}"          # 0 = every dim the model uses
 
