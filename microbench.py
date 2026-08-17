@@ -205,8 +205,38 @@ def warp_gridsample_nkl(x, flow):
     return out.permute(0, 3, 1, 2)
 
 
+def warp_nki_repo(x, flow):
+    """The repo's WORKING NKI resample -- `bilinear_2x2_gather_blend` from the model, reached
+    through the model's own `warp_nki` host wrapper so index construction cannot drift.
+
+    THIS IS THE ARM THAT WAS MISSING, and its absence made every earlier comparison misleading.
+    gather is only the argparse default and "the port's form"; it is not the reference and not the
+    fastest. At the model level nki-dyn measured 3820.4 ms against gather's 3900.5, and the
+    README's 3673.3 ms baseline used --warp nki. So the bar for any new resample kernel is
+    nki-dyn, not gather.
+
+    NOT to be confused with `nkishift`, which is the DEAD shiftwarp kernel: 1.16x at the op level
+    and then 229.72 LSB in the model, because it clamps at R=3 px while measured displacement is
+    29.02 px. This one is accurate -- gather and nki-dyn agreed to every digit in the fused model.
+    """
+    import repro_unrolling_trn2 as M
+    M._NKI_DYN = _NKI_DYN_SEL
+    return M.warp_nki(x, flow)
+
+
+def warp_nki_dyn_repo(x, flow):
+    """The device-loop variant: compiles in seconds where the unrolled one takes 80-100 min at a
+    4K tile, at ~1.1-1.3x its runtime. The FASTEST resample on record at the model level."""
+    return warp_nki_repo(x, flow)
+
+
+_NKI_DYN_SEL = False    # set from --op in main(): nki-dyn picks the device-loop kernel
+
+
 OPS = {
     "gridsample": warp_gridsample,
+    "nki": warp_nki_repo,
+    "nki-dyn": warp_nki_dyn_repo,
     "gridsample-nkl": warp_gridsample_nkl,
     "gather": warp_gather,
     "transpose": transpose_only,
@@ -697,7 +727,8 @@ def main():
               % (len(inv), tot / 1e9, (tot + ctx) / 1e9))
         return 0
 
-    global _NKL_MAX_IDX, _NKL_GM
+    global _NKL_MAX_IDX, _NKL_GM, _NKI_DYN_SEL
+    _NKI_DYN_SEL = (a.op == "nki-dyn")
     _NKL_MAX_IDX = a.nkl_max_indices
     _NKL_GM = a.nkl_gather_method
     if a.op == "gridsample-nkl":

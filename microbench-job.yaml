@@ -106,16 +106,22 @@ spec:
               # work, and TOP prints exactly what it left out rather than capping silently:
               #   the four C=3 dims alone are 90.0% of all resample work
               #   all five C=128 dims together are 0.11%
-              # DEFAULT IS gather ONLY, plus the kernel when available. gridsample is deliberately
-              # NOT here: it is the CORRECTNESS reference (every arm is scored against it computed
-              # on CPU) but it is NOT a latency baseline -- it cannot compile fused at all
-              # (OOM-killed at 169 and again at 94 min), so the model never pays its 64.66 ms.
-              # Comparing gather against it earned its keep once, by establishing that time =
-              # descriptors x ~40 ns (1.006 vs 3.004 pkt/px at identical ns/desc). That law is
-              # settled, so its latency column is now a third of the arms for a number we already
-              # have and cannot use. Add it back explicitly with WARP_IMPLS=gather,gridsample if a
-              # future change needs the law re-checked.
-              WARP_IMPLS="${WARP_IMPLS:-gather}"
+              # THE BAR IS nki-dyn, NOT gather. Getting this wrong made an entire comparison
+              # misleading, so it is spelled out:
+              #   gridsample  stock RIFE, the CORRECTNESS reference every arm is scored against on
+              #               CPU -- but NOT a latency baseline: it cannot compile fused at all
+              #               (OOM at 169 and 94 min), so the model never pays its 64.66 ms
+              #   gather      "the port's form", a portable 4-tap gather. Only the argparse
+              #               DEFAULT. Not the reference and not the fastest. 3900.5 ms fused
+              #   nki         the unrolled kernel the README's 3673.3 ms baseline used.
+              #               80-100 min to compile per 4K tile shape, so opt in deliberately
+              #   nki-dyn     device-loop kernel, compiles in seconds, 3820.4 ms fused --
+              #               the FASTEST resample on record, hence the bar
+              # gather stays in because it is what the current fused runs used, so it links these
+              # numbers to the 3900.5 ms on record. gridsample is out: its law (time = descriptors
+              # x ~40 ns, 1.006 vs 3.004 pkt/px) is settled and re-measuring it costs arms for a
+              # number we cannot use. Add either back explicitly via WARP_IMPLS.
+              WARP_IMPLS="${WARP_IMPLS:-gather,nki-dyn}"
               if [ "$NKL" = "1" ]; then WARP_IMPLS="$WARP_IMPLS,gridsample-nkl"; fi
               TOP="${TOP:-0}"          # 0 = every dim the model uses
 
