@@ -143,6 +143,14 @@ def warp_nkishift(x, flow, radius=2):
 
 
 _NKL_GS_FN = None
+# Set from --nkl-max-indices / --nkl-gather-method in main(), read by the warp below.
+# max_indices_per_indirect=None DISABLES the kernel's batched indirect gather -- the feature its
+# own description leads with. Measured with batching OFF it reached hardware_dynamic_dma 5.8%
+# (vs gather's 0.10%) at 44.2 ns/descriptor against gather's 40.4, i.e. 9% slower overall despite
+# matching gather's 1.006 desc/px. Raising the hardware-DGE share is the only lever left, so this
+# knob must be reachable rather than hardcoded.
+_NKL_MAX_IDX = None
+_NKL_GM = None
 
 
 def ensure_nkl():
@@ -183,14 +191,16 @@ def warp_gridsample_nkl(x, flow):
     grid = torch.cat([hor, ver], 1)
     f = torch.cat([flow[:, 0:1] / ((W - 1.0) / 2.0), flow[:, 1:2] / ((H - 1.0) / 2.0)], 1)
     g = (grid + f).permute(0, 2, 3, 1).contiguous()
-    gm = "transpose" if x.element_size() == 2 else "copy"
+    # fp32 forces "copy": the kernel asserts gather_method="transpose" needs a 2-byte dtype, and
+    # bf16 is not an escape here (it fails the model's quality gate at 23.31 dB).
+    gm = _NKL_GM or ("transpose" if x.element_size() == 2 else "copy")
     # The already-wrapped kernel, resolved by ensure_nkl() BEFORE torch.compile. Referencing the
     # global directly rather than calling ensure_nkl() here keeps the import out of the traced
     # region entirely -- that is what produced "torch._dynamo.exc.Unsupported: Import failure".
     out = _NKL_GS_FN(x.permute(0, 2, 3, 1).contiguous(), g,
                      sampling_mode="bilinear", coord_mode="minus_one_one",
                      input_layout="NHWC", align_corners=True,
-                     padding_mode="border", max_indices_per_indirect=None,
+                     padding_mode="border", max_indices_per_indirect=_NKL_MAX_IDX,
                      gather_method=gm)
     return out.permute(0, 3, 1, 2)
 
@@ -686,6 +696,13 @@ def main():
         print("ops %d   MACs single pass %.2f G   per forward (ctx x2) %.2f G"
               % (len(inv), tot / 1e9, (tot + ctx) / 1e9))
         return 0
+
+    global _NKL_MAX_IDX, _NKL_GM
+    _NKL_MAX_IDX = a.nkl_max_indices
+    _NKL_GM = a.nkl_gather_method
+    if a.op == "gridsample-nkl":
+        print("nkl config    gather_method=%s  max_indices_per_indirect=%s"
+              % (_NKL_GM or "auto(copy for fp32)", _NKL_MAX_IDX))
 
     if a.op == "sequence":
         if a.fullgraph == 0 and a.warp in ("nki", "nki-dyn"):

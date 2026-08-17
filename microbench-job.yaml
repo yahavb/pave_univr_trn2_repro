@@ -115,6 +115,49 @@ spec:
                 python3 microbench.py --op x --grid "$GRID" --halo "$HALO" \
                     --warp-impls "$WARP_IMPLS" --top "$TOP" --list-op-sites | sed 's/^/  /'
                 echo ""
+                # SET=nklsweep: the ONE knob with headroom left. Measured with batching DISABLED
+                # (max_indices_per_indirect=None) the kernel matched gather's 1.006 desc/px -- it
+                # fully solved ATen gridsample's 3x blowup, a 2.7x win over gridsample -- but ran
+                # 44.2 ns/descriptor against gather's 40.4, so 9% SLOWER than gather overall. It
+                # did reach hardware_dynamic_dma 5.8% where gather is at 0.10%, and batched
+                # indirection is the kernel's headline feature, so raising that share is the only
+                # remaining lever. One dim, one warp, several caps.
+                if [ "$SET" = "nklsweep" ]; then
+                  if [ "$NKL" != "1" ]; then echo "nklsweep needs nkilib; aborting"; exit 0; fi
+                  SWEEP_SHAPE="${SWEEP_SHAPE:-3,704,768}"      # the 38.75%-of-work dim
+                  CAPS="${CAPS:-none 128 256 512 1024}"
+                  echo "nklsweep at $SWEEP_SHAPE   caps: $CAPS   (gather = 21.98 ms @ 40.39 ns/desc)"
+                  for CAP in $CAPS; do
+                    MI=""; [ "$CAP" = "none" ] || MI="--nkl-max-indices $CAP"
+                    echo "################ nklcap${CAP}_$(echo $SWEEP_SHAPE | tr ',' 'x')"
+                    set +e
+                    python -u microbench.py --op gridsample-nkl --shape "$SWEEP_SHAPE" \
+                        --device neuron --flow-smooth --flow-mag 2.33 $MI \
+                        2>&1 | tee "$OUT/nklcap$CAP.log"
+                    rc=${PIPESTATUS[0]}
+                    set -e
+                    echo "  rc=$rc"
+                    for i in $(seq 1 30); do pgrep -f microbench.py >/dev/null || break; sleep 2; done
+                    sleep 5
+                  done
+                  echo ""
+                  echo "################ NKL BATCHING SWEEP ($SWEEP_SHAPE)"
+                  printf "  %-10s %5s %10s %9s %8s %9s\n" cap rc active_ms ns_desc hwDMA% max_LSB
+                  for CAP in $CAPS; do
+                    f="$OUT/nklcap$CAP.log"; [ -f "$f" ] || continue
+                    A=$(grep -aoE "total_active_time +[0-9.]+" "$f" | awk '{print $2*1000}' | head -1 || true)
+                    N=$(grep -aoE "ns per descriptor +[0-9.]+" "$f" | awk '{print $4}' | head -1 || true)
+                    HW=$(grep -aoE "hardware_dynamic_dma +[0-9.]+ +[0-9.]+" "$f" | awk '{print $3}' | head -1 || true)
+                    L=$(grep -aoE "max_diff +[0-9.]+ LSB" "$f" | awk '{print $2}' | head -1 || true)
+                    printf "  %-10s %5s %10s %9s %8s %9s\n" "$CAP" "-" "${A:--}" "${N:--}" "${HW:--}" "${L:--}"
+                  done
+                  echo ""
+                  echo "  BEAT gather = ns_desc below 40.39. If no cap does, the kernel cannot"
+                  echo "  displace gather in this model and the CR is a win only over ATen"
+                  echo "  gridsample, which the model does not use."
+                  exit 0
+                fi
+
                 # SET=sequence: the model's WHOLE op sequence for one tile, one compiled graph,
                 # once per warp. This is the arm that assesses a resample kernel, because an
                 # isolated op has no pipelining, no layout reuse and no overlap with the convs

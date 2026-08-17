@@ -215,6 +215,35 @@ Two rules for reading it:
 * **the ceiling is ~510 ms of a 3900 ms frame (~13%)**, the whole resample, even if it became
   free. Any claimed win larger than that is a measurement error.
 
+## MEASURED: the NKL GridSample kernel WORKS, solves gridsample, and still loses to gather
+
+Job `univr-microbench-snk4g`, `SET=warps TOP=4`, cc 2.27, `nkilib` restored from the PVC,
+`max_indices_per_indirect=None` (batching OFF), fp32 so `gather_method="copy"`:
+
+| dim | warp | active | pkt/px | ns/desc | hwDMA% | max_LSB | vs gather |
+|---|---|---|---|---|---|---|---|
+| 3x704x768 | gather | 21.98 ms | 1.006 | **40.39** | 0.10 | 0.028 | -- |
+| | gridsample | 64.66 ms | 3.004 | 39.81 | 0.00 | 0.028 | 2.94x slower |
+| | **gridsample-nkl** | **24.06 ms** | **1.006** | **44.22** | **5.80** | 0.028 | **1.09x slower** |
+| 3x576x768 | gather | 18.00 ms | 1.006 | 40.44 | 0.10 | 0.0236 | -- |
+| | gridsample | 52.95 ms | 3.004 | 39.85 | 0.00 | 0.0234 | 2.94x slower |
+| | **gridsample-nkl** | **19.73 ms** | **1.007** | **44.31** | **5.90** | 0.0234 | **1.10x slower** |
+
+**The kernel does exactly what it was built to do.** It collapsed the descriptor blowup
+**3.004 -> 1.006 pkt/px**, matching gather exactly -- a **2.7x win over ATen gridsample** -- and
+its accuracy is identical to both other warps to three decimals, so it is numerically correct.
+
+**But it does not beat `gather`, which is what the model uses: it is 9-10% slower.** Exactly what
+the descriptor-floor argument predicted -- gather already sat at 1 descriptor per output pixel, so
+there was no descriptor headroom, and the kernel costs **~9.6% more per descriptor** (44.2 vs
+40.4 ns).
+
+One lead remains: `hardware_dynamic_dma` is **5.8%** on the kernel against **0.10%** on gather, so
+it does reach hardware DGE -- for ~6% of the work, 94% still software. And this was measured with
+**batching DISABLED** (`max_indices_per_indirect=None`), which is the kernel's headline feature.
+`SET=nklsweep` sweeps the cap at the 38.75%-of-work dim. **Beating gather means ns/desc below
+40.39**; if no cap does that, the CR is a win only over an implementation this model does not use.
+
 ## Still blocking a shippable result
 
 **The baseline does not reproduce.** Same command as the README gives 4125.5 ms and
