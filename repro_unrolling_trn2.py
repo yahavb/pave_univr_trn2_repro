@@ -648,6 +648,39 @@ def warp(x, f):
     return _WARP(x, f)
 
 
+def build_warp_region(base, region, device):
+    """Compile the RESAMPLE as its OWN region, with its own backend, separate from the model.
+
+    This is what makes "gridsample on CPU while everything else stays on the device" measurable:
+    the resample becomes a distinct compiled unit, so its backend can differ from the model's.
+
+    torch._dynamo.disable() at the boundary is the load-bearing part. Without it dynamo would
+    INLINE the inner callable into the outer graph and the region would silently stop being
+    separate -- the arms would then differ in ways that are invisible in the log. With it the
+    boundary is a real graph break in EVERY arm, so all arms share one break structure and the
+    only variable is the region's backend and implementation. It also means the outer
+    torch.compile cannot be fullgraph=True: that is a CONSEQUENCE of splitting the model in two,
+    not a setting anyone chose.
+
+    region="cpu": the region is inductor-compiled and the tensors hop host-ward and back on every
+    call -- 14 per tile. That transfer is part of what the arm is measuring, not an artifact.
+    """
+    if region == "cpu":
+        inner = torch.compile(base, dynamic=False)                  # inductor
+        def _cpu_region(x, f):
+            dev = x.device
+            return inner(x.cpu(), f.cpu()).to(dev)
+        fn = _cpu_region
+    else:
+        fn = torch.compile(base, backend="neuron", dynamic=False)
+    try:
+        return torch._dynamo.disable(fn)
+    except Exception as e:                                          # noqa: BLE001
+        print("  WARNING: torch._dynamo.disable unavailable (%s); the region may be INLINED into "
+              "the outer graph, which would silently defeat the split" % type(e).__name__)
+        return fn
+
+
 # =============================================================================================
 # PER-BLOCK TIMING, keyed to line up with the repo's C28 per-module table (a0/a1/a2 + ctx + unet)
 # =============================================================================================
@@ -1421,6 +1454,13 @@ def main():
     ap.add_argument("--save-ref", metavar="PATH.npy",
                     help="save this run's output as an fp32 reference + PNG preview + provenance "
                          "manifest, for use as --gt on another device")
+    ap.add_argument("--warp-region", choices=("none", "neuron", "cpu"), default="none",
+                    help="compile the RESAMPLE as its own region with its own backend, separate "
+                         "from the model. none = inline in the model graph (default). neuron = its "
+                         "own neuron graph. cpu = inductor on the HOST, tensors hopping device -> "
+                         "host -> device on each of the 14 calls per tile, with the rest of the "
+                         "model still on neuron -- which is how 'is gridsample better on CPU' gets "
+                         "measured without moving the whole model. Forces fullgraph=0.")
     ap.add_argument("--fullgraph", type=int, choices=(0, 1), default=1,
                     help="1 (default) = torch.compile(fullgraph=True), one fused graph per tile "
                          "shape. 0 = allow graph breaks, which is what makes --warp gridsample "
@@ -1501,6 +1541,21 @@ def main():
     if not a.neuron_prelu:
         print("  NOTE nn.PReLU replaced by NeuronPReLU: it cannot be legalised under torch.compile")
     _WARP = WARPS[a.warp]
+    if a.warp_region != "none":
+        # Splitting the model into two compiled regions means the outer graph MUST break at the
+        # boundary, so fullgraph=True is not available. Forced here rather than left to the caller,
+        # because a mismatch would fail deep in tracing with an unrelated-looking error.
+        if a.fullgraph:
+            print("  --warp-region %s forces --fullgraph 0 (the region boundary IS a graph break)"
+                  % a.warp_region)
+            a.fullgraph = 0
+        if a.warp_region == "cpu" and a.warp == "gridsample-nkl":
+            ap.error("--warp-region cpu with --warp gridsample-nkl is contradictory: the NKL "
+                     "kernel is an NKI device kernel and cannot run on the host. Use "
+                     "--warp gridsample for the cpu region.")
+        _WARP = build_warp_region(WARPS[a.warp], a.warp_region, a.device)
+        print("  warp region   : %s (own torch.compile, backend %s)"
+              % (a.warp_region, "inductor/cpu" if a.warp_region == "cpu" else "neuron"))
     if a.warp == "window":
         _r = a.radius
         _WARP = lambda x, f: warp_window(x, f, radius=_r)   # noqa: E731

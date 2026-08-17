@@ -242,7 +242,6 @@ spec:
                 # fullgraph=True. These numbers compare the three lowerings to each other; they do
                 # not predict the fused frame. The fused-config datapoint is the separate
                 # MODE=full run, and nki is the only one of the three that can even produce it.
-                WFG="${WARPCMP_FULLGRAPH:-0}"
                 # REDUCED MODE: prove the ratio fast, then confirm at full size. Set
                 # WARPCMP_RES=HxW to run ONE small tile instead of a real 4K tile.
                 # This is justified by our own data, not by hope: the op-level arms measured the
@@ -256,11 +255,13 @@ spec:
                 # Random weights, since a reduced frame has no golden -- so RATIOS ONLY, and no
                 # accuracy claim. max_LSB is blank by design in this mode.
                 WRES="${WARPCMP_RES:-}"
-                echo "=== MODE=warpcmp  $GRID halo $HALO tile $WT  iters $WI  fullgraph $WFG ==="
-                echo "    all three arms at fullgraph=$WFG so the resample is the ONLY variable"
+                echo "=== MODE=warpcmp  ${WRES:-$GRID halo $HALO tile $WT}  iters $WI ==="
+                echo "    THE MODEL STAYS ON NEURON in all three arms. Only the RESAMPLE REGION"
+                echo "    differs: its own torch.compile, its own backend. So the resample is the"
+                echo "    only variable, and the region boundary is a graph break in every arm."
                 echo ""
-                for CFG in "nki:gridsample-nkl:neuron:$WFG" "aten:gridsample:neuron:$WFG" "cpu:gridsample:cpu:$WFG"; do
-                  LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; Z=${Z#*:}; DV=${Z%%:*}; FG=${Z##*:}
+                for CFG in "nki:gridsample-nkl:neuron" "aten:gridsample:neuron" "cpu:gridsample:cpu"; do
+                  LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; RG=${Z##*:}
                   if [ "$WP" = "gridsample-nkl" ] && ! python3 -c "import nkilib.experimental.indirect.grid_sample" 2>/dev/null; then
                     echo "SKIP $LB: nkilib not importable (CR-288764575 is unmerged; upload a tar"
                     echo "  CONTAINING nkilib/experimental/indirect/grid_sample.py to $NKILIB_TGZ --"
@@ -279,8 +280,8 @@ spec:
                   B=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
                   set +e
                   python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
-                      --dtype fp32 --device "$DV" --cores 1 \
-                      --warp "$WP" --fullgraph "$FG" --iters "$WI" \
+                      --dtype fp32 --device neuron --cores 1 \
+                      --warp "$WP" --warp-region "$RG" --iters "$WI" \
                       2>&1 | tee "$R/$LBL.log"
                   rc=${PIPESTATUS[0]}
                   set -e
@@ -297,9 +298,9 @@ spec:
                 done
                 echo ""
                 echo "################ GRIDSAMPLE IN THE MODEL -- ${WRES:-$GRID halo $HALO tile $WT} fullgraph $WFG"
-                printf "  %-8s %-16s %-8s %3s %5s %12s %12s %10s\n" cfg warp device fg rc median_ms first_ms max_LSB
-                for CFG in "nki:gridsample-nkl:neuron:$WFG" "aten:gridsample:neuron:$WFG" "cpu:gridsample:cpu:$WFG"; do
-                  LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; Z=${Z#*:}; DV=${Z%%:*}; FG=${Z##*:}
+                printf "  %-8s %-16s %-14s %5s %12s %12s %10s\n" cfg warp warp_region rc median_ms first_ms max_LSB
+                for CFG in "nki:gridsample-nkl:neuron" "aten:gridsample:neuron" "cpu:gridsample:cpu"; do
+                  LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; RG=${Z##*:}
                   if [ -n "$WRES" ]; then f="$R/warpcmp_${LB}_${WRES}.log"; else f="$R/warpcmp_${LB}_t${WT}.log"; fi
                   [ -f "$f" ] || continue
                   if [ -n "$WRES" ]; then rcf="$R/rc_warpcmp_${LB}_${WRES}.txt"; else rcf="$R/rc_warpcmp_${LB}_t${WT}.txt"; fi
@@ -307,8 +308,9 @@ spec:
                   MS=$(grep -aoE "steady state: median [0-9.]+ ms" "$f" | head -1 | awk '{print $4}' || true)
                   FI=$(grep -aoE "first call [0-9.]+ ms" "$f" | head -1 | awk '{print $3}' || true)
                   L=$(grep -aoE "max_diff +[0-9.]+ LSB" "$f" | tail -1 | awk '{print $2}' || true)
-                  printf "  %-8s %-16s %-8s %3s %5s %12s %12s %10s\n" \
-                    "$LB" "$WP" "$DV" "$FG" "$rc" "${MS:--}" "${FI:--}" "${L:--}"
+                  RGL="$RG"; [ "$RG" = "cpu" ] && RGL="cpu/inductor"
+                  printf "  %-8s %-16s %-14s %5s %12s %12s %10s\n" \
+                    "$LB" "$WP" "$RGL" "$rc" "${MS:--}" "${FI:--}" "${L:--}"
                 done
                 echo ""
                 echo "  median_ms is ONE TILE of $GRID halo $HALO: 14 warps + 54 convs, the real"
