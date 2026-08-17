@@ -195,11 +195,25 @@ Note also `d2h` was **91.4%** of the summed per-core time (22,498 ms of 24,627) 
 at 4.4%. The script's own caveat says `dev+d2h` is reliable as a sum and the split only
 indicative, but device work is clearly a small fraction of that wall clock.
 
-**`gridsample` cannot compile fused.** OOM-killed at 169 min and again at 94 min at 1500Gi,
+**`gridsample` cannot compile FUSED.** OOM-killed at 169 min and again at 94 min at 1500Gi,
 on the same geometry where gather and nki-dyn both compile. Consistent with the
 microbenchmark: it issues 3-205x more DMA descriptors than gather (3.0 pkt/px at C=3 rising
-to 205 at C=128), so its fused graph is far larger. It cannot serve as the reference
-implementation under fusion.
+to 205 at C=128), so its fused graph is far larger.
+
+**Read that as a statement about FUSION, not about gridsample.** `fullgraph=True` is the only
+thing that ever blocked it, and it is not a requirement -- it was chosen so a dynamo break would
+RAISE rather than silently emit a subgraph, because an unguarded break around the
+`view(torch.uint32)` index bitcast corrupts which pixels get sampled. **That bitcast is in the
+NKI warps only** (`warp_nki`, ~line 480); `gridsample`, `gather` and `window` carry none. So
+`--fullgraph 0` is safe for gridsample and is now available, refused for `nki`/`nki-dyn`.
+
+Why this matters: **the resample is the largest device cost** -- 614.2 ms of 973.2 ms
+device-active, **63.1%**, against 36.9% for all 54 convs -- and `gridsample` is both the
+REFERENCE every other warp is scored against (`microbench.py` scores against
+`warp_gridsample`) and its most expensive form. An efficient NKI GridSample therefore attacks
+the biggest device-side item in its worst case. The counter-argument previously recorded here
+(that a faster resample cannot pay off) rested on the `d2h` phase split and the eager 23.6%
+device share, and **both are invalid for that purpose** -- see the traps.
 
 Two other host-side caps found along the way, both fixed:
 * `FailOnRecompileLimitHit` -- dynamo's `cache_size_limit` defaults to **8**, and this model
@@ -315,6 +329,17 @@ deterministic compiler verdicts rather than flaky runs.
   comes from the runtime INSPECT env vars, NOT from a capture command -- capture only ever
   emits `.ntff`. Expect the `.ntff` slot to need the backfill: the forward dispatches async
   and the runtime device-profiler emits nothing for async workloads.
+* **An NKI GridSample kernel (odysseyml/odyssey-trainium PR 13).** Adds `GridSample` /
+  `GridSampleBwd` to the NKL experimental kernels: nearest + bilinear, `align_corners`, [-1,1] or
+  [0,1] coords, OOB zeros/border, batched indirection via DMA transpose or copy. `GridSampleBwd`
+  is irrelevant here (inference only). Architecturally it is the right shape where `shiftwarp`
+  was wrong: shiftwarp approximated a warp as a bounded shift-sum and silently clamped past R,
+  which is why it hit 229.72 LSB against a measured 29.02 px displacement. A real grid_sample
+  with explicit OOB handling has no such approximation. Two questions decide usability:
+  **(1)** is it callable under `torch.compile(backend="neuron")` as a traceable custom op, and
+  **(2)** does it cover fp32 at C=3 through C=128? `--warp` is a pluggable selector, so wiring it
+  in is small. First test is one tile: `--cores 1 --only-tile 9 --halo 128 --fullgraph 0`, scored
+  against `gather`'s **22.38 LSB** on that exact tile.
 * **Re-measure the microbenchmark at the fused shapes.** Every existing per-op number --
   49,278 us for gather, ~38 ns/descriptor, 2.0 packets/pixel -- was taken at 992x1280 under
   `--model-type unet-inference`. Both are now wrong for the running config: the fused shapes
@@ -347,7 +372,7 @@ deterministic compiler verdicts rather than flaky runs.
 | `METHOD.md` / `REPRO_README.md` | original bundle docs |
 | `microbench.py` | the microbenchmark: 14 resamples + 54 convs, one op per invocation, each scored against a CPU reference |
 | `profile_roofline.py` | reads a `summary.json`, prints per-engine time and MFU |
-| `microbench-job.yaml` | runs it. `SET=warps|convs|both`, defaults to the four 4x8 halo-64 shapes |
+| `microbench-job.yaml` | runs it. `SET=warps|convs|both`, now the four 4x8 **halo-128** shapes and `CHANS=3 16 32 64 128`. **Every earlier warp arm ran at C=3 only** -- the cheapest site -- so gridsample was judged on its best case while its descriptor rate climbs to 205 pkt/px at C=128 (`_C=16`, so the resample runs at C=3/16/32/64/128) |
 | `ccflag-fusion-job.yaml` | the flag sweep that found `--model-type unet-inference`. Done |
 | `prod-4x8-halo64-job.yaml` | the fused timing run that produced 3900.5 / 3820.4 ms |
 | `repro-job.yaml` | whole model, original hardcoded `nki` arms |
@@ -418,10 +443,12 @@ univr_results_<TS>.tar.gz        everything else
   happened and only one is loud: on `bigtile-noflag` the API server REJECTED the manifest
   (`strict decoding error: unknown field "spec.template.spec.backoffLimit"`) so nothing ran;
   on `halo-shapeset` it was accepted SILENTLY and the retry simply did not exist.
-* **`--compile` no longer exists.** The script is always
-  `torch.compile(m, backend="neuron", dynamic=False, fullgraph=True)`. There is no eager
-  path, no `whole`/`halves`/`stages`. `--per-block` and `--record-flow` now error
-  unconditionally because neither is traceable under fullgraph. Consequence: the eager
+* **`--compile` no longer exists.** The script always calls
+  `torch.compile(m, backend="neuron", dynamic=False, fullgraph=<--fullgraph>)`. There is still no
+  eager path and no `whole`/`halves`/`stages`. `--fullgraph 0` allows graph breaks, which
+  re-enables `--record-flow`; `--per-block` still errors, and `--fullgraph 0` does NOT rescue it
+  (breaks land wherever dynamo puts them, not on module boundaries, so the attribution would be
+  arbitrary rather than merely coarse -- that is how a block table once summed to 2.51x the frame). Consequence: the eager
   figures (3673.3 ms README, 4125.5 ms re-run) can no longer be reproduced here at all, so
   fused numbers are comparable only to other fused numbers.
 * **`torch.compile` is LAZY, so `--cores N` on a cold cache means N CONCURRENT compiles.**
@@ -461,6 +488,17 @@ univr_results_<TS>.tar.gz        everything else
   and is not comparable to compiled runs.
 * **`repro-job.yaml` never passes `--compile`**, so it defaults to eager. The README's
   3673.3 ms is an eager number, and 275 NEFFs is what eager costs.
+* **`d2h` is NOT a transfer measurement, and it must never be used to argue device work is
+  small.** The forward returns before the device finishes and the completion barrier is the
+  `.cpu()` read, so **async device execution is attributed to `d2h`**. The code says so at
+  `run_tiled` (~line 979): `prep+dev+d2h` is reliable as a SUM, the `dev`/`d2h` split is
+  indicative only. The fused run's `d2h` 91.4% / `dev` 4.4% was read here as "device work is a
+  small fraction" and used to argue against optimising the resample. That was wrong -- it is
+  mostly device time sitting behind the sync point. Cite the microbenchmark for device shares,
+  never the phase split.
+* **`23.6% device` is an EAGER number and does not transfer to the fused config.** It came from
+  the 275-NEFF eager run, a regime that is dispatch-bound by construction. Do not use it to size
+  the payoff of a device-side optimisation under fusion.
 * **Per-engine `*_active_time_percent` in `summary.json` sum past 100%** — they are
   overlapping busy times, not a partition of time. Do not present them as a decomposition.
 * **The saved NEFF+NTFF pairs have never been read** by any code here; `profile_roofline.py`

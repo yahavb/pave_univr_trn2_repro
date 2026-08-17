@@ -1323,6 +1323,16 @@ def main():
     ap.add_argument("--save-ref", metavar="PATH.npy",
                     help="save this run's output as an fp32 reference + PNG preview + provenance "
                          "manifest, for use as --gt on another device")
+    ap.add_argument("--fullgraph", type=int, choices=(0, 1), default=1,
+                    help="1 (default) = torch.compile(fullgraph=True), one fused graph per tile "
+                         "shape. 0 = allow graph breaks, which is what makes --warp gridsample "
+                         "usable: F.grid_sample issues 3-205x more DMA descriptors than gather "
+                         "(3.0 pkt/px at C=3 up to 205 at C=128) and its FUSED graph exceeds "
+                         "compiler memory (OOM at 169 and 94 min at 1500Gi). gridsample is the "
+                         "resample REFERENCE every other warp is scored against, and the resample "
+                         "is 63.1%% of device-active time (614.2 of 973.2 ms) against 36.9%% for "
+                         "all 54 convs -- so it is the largest device cost, in its most expensive "
+                         "form. NOT usable with --warp nki/nki-dyn: see the guard below.")
     ap.add_argument("--perfetto", metavar="PATH.json",
                     help="wrap the timed loop in torch.profiler and export a Chrome/Perfetto "
                          "trace to PATH (drag the .gz into ui.perfetto.dev). This is the ONLY "
@@ -1367,9 +1377,11 @@ def main():
     global _SHIFTWARP_FN, _SHIFTWARP_R, _SHIFTWARP_MAXC
     _NKI_DYN = (a.warp == "nki-dyn")
     if a.per_block:
-        ap.error("--per-block is incompatible with fullgraph=True: torch.compile dissolves the "
-                 "module boundaries the timers sit on, so the numbers would be meaningless. This "
-                 "script always compiles one fused graph, so --per-block can never apply.")
+        ap.error("--per-block is incompatible with torch.compile: it dissolves the module "
+                 "boundaries the timers sit on, so the numbers would be meaningless. --fullgraph 0 "
+                 "does NOT rescue it -- breaks fall wherever dynamo puts them, not on module "
+                 "boundaries, so the attribution would be arbitrary rather than merely coarse. "
+                 "That is how an earlier table came to sum to 2.51x the frame.")
     _PROFILE_BLOCKS = a.per_block
     # Must be set BEFORE UniVR() is constructed, since conv()/deconv() read it at build time.
     # Unconditional: nn.PReLU cannot be legalised by the Neuron backend, and this script
@@ -1381,10 +1393,21 @@ def main():
     if a.warp == "window":
         _r = a.radius
         _WARP = lambda x, f: warp_window(x, f, radius=_r)   # noqa: E731
-    if a.record_flow:
+    # THE GUARD THAT MAKES --fullgraph 0 SAFE TO OFFER. fullgraph=True was not a preference: it
+    # exists so a dynamo break RAISES instead of silently emitting a subgraph, because an
+    # unguarded break around the `view(torch.uint32)` index bitcast (line ~480, warp_nki's host
+    # side) corrupts WHICH PIXELS GET SAMPLED -- wrong output, no error. That bitcast lives only
+    # in the NKI warps. gridsample, gather and window carry no bitcast, so breaks are harmless
+    # for them. Hence: --fullgraph 0 is allowed for those, refused for the NKI path.
+    if a.fullgraph == 0 and a.warp in ("nki", "nki-dyn"):
+        ap.error("--fullgraph 0 is unsafe with --warp %s: a graph break around the "
+                 "view(torch.uint32) index bitcast silently corrupts which pixels are sampled. "
+                 "Use --warp gridsample or gather with --fullgraph 0, or keep --fullgraph 1."
+                 % a.warp)
+    if a.record_flow and a.fullgraph == 1:
         ap.error("--record-flow cannot run under fullgraph=True: it appends to a Python list and "
-                 "syncs to host inside the warp, which dynamo cannot trace. This script always "
-                 "compiles, so use an older commit if the displacement table is needed.")
+                 "syncs to host inside the warp, which dynamo cannot trace. Pass --fullgraph 0 to "
+                 "re-enable it -- the break it needs is exactly what fullgraph forbids.")
     if a.warp == "shiftwarp":
         if a.device != "neuron":
             ap.error("--warp shiftwarp requires --device neuron")
@@ -1457,9 +1480,12 @@ def main():
     def apply_compile(m, tag=""):
         """fullgraph=True so a dynamo break RAISES rather than silently emitting a subgraph:
         an unguarded break around the view(torch.uint32) index bitcast in the warp corrupts
-        which pixels get sampled."""
-        print("  torch.compile[%s] fullgraph=True" % (tag or "model"))
-        return torch.compile(m, backend="neuron", dynamic=False, fullgraph=True)
+        which pixels get sampled. That bitcast is in the NKI warps ONLY, so --fullgraph 0 is
+        gated to the warps without it (see the guard in main())."""
+        fg = bool(a.fullgraph)
+        print("  torch.compile[%s] fullgraph=%s%s"
+              % (tag or "model", fg, "" if fg else "  (graph breaks ALLOWED)"))
+        return torch.compile(m, backend="neuron", dynamic=False, fullgraph=fg)
 
     ny, nx = (int(v) for v in a.tiles.lower().split("x"))
     tiled = (ny * nx > 1) or a.cores > 1 or a.only_tile is not None
@@ -1509,11 +1535,11 @@ def main():
     # is a graph break and dynamo raises instead of tracing, so the accounting is only collected on
     # the eager path. --report-only still produces the full table from shapes alone, with no device.
     # Both recorders append to Python lists from inside the warp, which fullgraph=True cannot
-    # trace, so neither can ever be active now that compilation is unconditional.
+    # trace. Under --fullgraph 0 that append is just a graph break, which is allowed, so the flow
+    # recorder works again. main() already refuses --record-flow with --fullgraph 1, so reaching
+    # here with a.record_flow set means breaks are permitted.
     _RECORD = False
-    # Same graph-break reason as _RECORD: appending to a Python list and calling .item() inside the
-    # warp cannot be traced, so this is eager-only. main() already errors if --record-flow is
-    _RECORD_FLOW = False
+    _RECORD_FLOW = bool(a.record_flow)
     FLOW_STATS.clear()
     CALL_SITES.clear()
     t0 = time.perf_counter()

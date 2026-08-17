@@ -81,6 +81,15 @@ spec:
               # ============================ configuration ============================
               GRID="${GRID:-4x8}"; HALO="${HALO:-128}"; WARP="${WARP:-gather}"
               CORES="${CORES:-8}"; ITERS="${ITERS:-5}"
+              # FULLGRAPH=0 is what makes WARP=gridsample runnable at all. gridsample is the
+              # resample REFERENCE (every other warp is scored against it) and the resample is the
+              # largest device cost -- 614.2 ms of 973.2 ms device-active, 63.1%, against 36.9% for
+              # all 54 convs. It was abandoned for ONE reason: its FUSED graph exceeds compiler
+              # memory (OOM at 169 and 94 min at 1500Gi), because it issues 3-205x more DMA
+              # descriptors than gather. Allowing graph breaks removes that constraint.
+              # NOT valid with WARP=nki/nki-dyn -- the script refuses it, because a break around
+              # the view(torch.uint32) index bitcast silently corrupts which pixels are sampled.
+              FULLGRAPH="${FULLGRAPH:-1}"
               # The 8 (padded shape x triplet timestamp) slots a frame needs, one representative
               # tile each, LARGEST FIRST. run_tiled picks the pass per tile from the merge seam --
               # need_f = (oy+vy) > H/2, need_b = oy < H/2 -- and H/2 = 864 lands exactly on the
@@ -96,7 +105,7 @@ spec:
 
               CFG="${GRID}_h${HALO}"
               TS=$(date -u +%Y%m%d_%H%M%S)
-              RUN="exp_univr-${CFG}-${WARP}_${TS}"
+              RUN="exp_univr-${CFG}-${WARP}-fg${FULLGRAPH}_${TS}"
               PVC=/var/mdl/univr
               RUNDIR="$PVC/runs/$RUN"
               CACHE_TGZ="$PVC/neff_cache_${CFG}.tar.gz"
@@ -173,7 +182,7 @@ spec:
 
               FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
-              BASE="--height 1728 --width 4096 --tiles $GRID --halo $HALO --bar 3 --device neuron --dtype fp32"
+              BASE="--height 1728 --width 4096 --tiles $GRID --halo $HALO --bar 3 --device neuron --dtype fp32 --fullgraph $FULLGRAPH"
 
               echo "=== [1/3] BUILD/LOAD -- serial compile probe, ONE graph at a time (not timed) ==="
               echo "tiles (largest shape first): $PREWARM_TILES"

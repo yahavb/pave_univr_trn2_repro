@@ -44,15 +44,29 @@ spec:
               POUT=/tmp/perneff; mkdir -p "$POUT"
 
               SET="${SET:-both}"
-              SHAPES="${SHAPES:-512,576 512,640 576,576 576,640}"
+              # The 4x8 halo-128 shapes -- the config now PROVEN fully fusable (all 8 slots, job
+              # k2zwh). The old default was the halo-64 set, which no longer matches anything we run.
+              SHAPES="${SHAPES:-576,640 576,768 704,640 704,768}"
+              # THE CHANNEL SWEEP IS THE POINT, and it was missing. The resample is applied at
+              # C=3 (images) AND at the Contextnet feature widths C=16/32/64/128 (_C=16, so
+              # C,2C,4C,8C). Every previous warp arm ran at C=3 ONLY -- the CHEAPEST site -- while
+              # the measured descriptor rate for gridsample climbs from 3.0 pkt/px at C=3 to
+              # 205 at C=128 against gather's ~2.0 flat. So the arm that mattered was never run,
+              # and any judgement about gridsample's cost rests on its best case.
+              CHANS="${CHANS:-3 16 32 64 128}"
 
               SPECS="${SPECS:-}"
               if [ -z "$SPECS" ]; then
                 case "$SET" in
                   warps|both)
                     for S in $SHAPES; do
-                      SPECS="$SPECS gather:3,$S"
-                      SPECS="$SPECS gridsample:3,$S"
+                      for C in $CHANS; do
+                        # gather is the compilable substitute, gridsample the REFERENCE every
+                        # other warp is scored against (microbench.py scores vs warp_gridsample).
+                        # Both at every C so the gap is measured per site, not assumed.
+                        SPECS="$SPECS gather:$C,$S"
+                        SPECS="$SPECS gridsample:$C,$S"
+                      done
                       SPECS="$SPECS nkishift/3:3,$S"
                     done
                     ;;
