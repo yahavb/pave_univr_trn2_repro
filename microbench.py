@@ -3,6 +3,7 @@ import argparse
 import math
 import os
 
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -459,6 +460,107 @@ def build_conv(i, o, s):
 FUSED_4x8_H64_SHAPES = ["512,576", "512,640", "576,576", "576,640"]
 
 
+def run_sequence(a):
+    """`--op sequence`: the model's WHOLE op sequence for one tile, compiled, timed.
+
+    The other ops here measure ONE call in isolation. That answers "how many descriptors does a
+    resample issue" -- and it did: gather 1.006 desc/px at 40.40 ns, gridsample 3.004 at 39.81.
+    It cannot answer "what does swapping the resample do to the model", because an isolated op has
+    no pipelining, no layout reuse, and no overlap with the convs around it; because absolute
+    single-io microseconds are noise across runs; and because a swapped resample changes the
+    LAYOUT its neighbours see -- the NKL kernel asserts NHWC while the model is NCHW, so it adds
+    two permutes per call that no single-op arm measures.
+
+    So this runs the real sequence: IFNet's three pyramid stages with their six full-resolution
+    warps, Contextnet's four levels x {img0, img1}, and the Unet -- 14 warps and 54 convs -- as
+    ONE compiled graph at a real padded tile shape. That median IS comparable between warps.
+
+    It reuses the MODEL'S OWN modules, so the sequence is identical by construction rather than by
+    transcription; a hand-copied version would drift and still look authoritative.
+
+    Random weights, so PSNR against the golden would be meaningless and none is printed.
+    Correctness is an equivalence check BETWEEN warps at a fixed seed: same weights, same input,
+    so two resample implementations must agree to fp32 rounding. --save-out then --cmp.
+    """
+    import time
+    import repro_unrolling_trn2 as M
+
+    H, W = 1728, 4096
+    ny, nx = (int(v) for v in a.grid.lower().split("x"))
+    tiles = M.plan_tiles(H, W, ny, nx, a.halo)
+    T = tiles[a.tile]
+    ph, pw, py0 = T["ph"], T["pw"], T["py0"]
+    half = H // 2
+    need_f = (T["oy"] + T["vy"]) > half
+    t = (1 - a.gamma / 2) if need_f else (-a.gamma / 2)
+
+    print("op            sequence (14 warps + 54 convs, one graph)")
+    print("grid/halo     %s halo %d tile %d" % (a.grid, a.halo, a.tile))
+    print("padded        %dx%d = %d px   row0 %d   pass %s (t=%+.4f)"
+          % (ph, pw, ph * pw, py0, "forward" if need_f else "backward", t))
+    print("warp          %s" % a.warp)
+    for name, c, h, w, calls in warp_inventory(ph, pw):
+        print("  site        %-8s C=%-4d %dx%d  x%d" % (name, c, h, w, calls))
+
+    torch.manual_seed(a.seed)
+    dt = torch.bfloat16 if a.dtype == "bf16" else torch.float32
+    # Globals MUST be set before UniVR() is built: conv()/deconv() read _PRELU at build time.
+    M._PRELU = M.NeuronPReLU
+    M._WARP = M.WARPS[a.warp]
+    M._NKI_DYN = (a.warp == "nki-dyn")
+    M._NKL_GATHER_METHOD = a.nkl_gather_method
+    M._NKL_MAX_INDICES = a.nkl_max_indices
+    if a.warp == "gridsample-nkl":
+        M._build_gridsample_nkl()        # fail in a second, not after a compile
+        print("nkl kernel    imported and wrapped OK")
+    if a.warp == "shiftwarp":
+        M._SHIFTWARP_FN = M._build_shiftwarp()
+
+    model = M.UniVR().to(dt).to(a.device).eval()
+    x = torch.rand(1, 6, ph, pw, dtype=dt).to(a.device)
+    print("torch.compile fullgraph=%s" % bool(a.fullgraph))
+    fn = torch.compile(model, backend="neuron", dynamic=False, fullgraph=bool(a.fullgraph))
+
+    with torch.no_grad():
+        t0 = time.perf_counter()
+        out = fn(x, t, a.gamma, row0=py0, full_h=H)
+        out.float().cpu()
+        print("ran           first call %.0f ms (compile+warmup)  out %s"
+              % ((time.perf_counter() - t0) * 1e3, tuple(out.shape)))
+        ts = []
+        for _ in range(a.iters):
+            t0 = time.perf_counter()
+            o = fn(x, t, a.gamma, row0=py0, full_h=H)
+            o.float().cpu()
+            ts.append((time.perf_counter() - t0) * 1e3)
+    ts.sort()
+    med = ts[len(ts) // 2]
+    print("TILE MEDIAN   %.2f ms over %d iters (min %.2f, max %.2f)" % (med, len(ts), ts[0], ts[-1]))
+    same = sum(1 for q in tiles if (q["ph"], q["pw"]) == (ph, pw))
+    print("frame extrap  %d of %d tiles share this shape -> %.0f ms tile work, %.0f ms across 8 cores"
+          % (same, len(tiles), med * same, med * same / 8))
+    print("              (assumes equal cost per tile and perfect 8-way overlap: a LOWER bound)")
+
+    got = o.float().cpu().numpy()
+    if a.save_out:
+        np.save(a.save_out, got)
+        print("saved         %s  (compare another warp with --cmp)" % a.save_out)
+    if a.cmp:
+        ref = np.load(a.cmp)
+        if ref.shape != got.shape:
+            print("EQUIVALENCE   n/a: %s vs %s" % (ref.shape, got.shape))
+        else:
+            d = np.abs(ref - got)
+            lsb = float(d.max()) * 255.0
+            mse = float((d ** 2).mean())
+            psnr = float("inf") if mse == 0 else 10.0 * math.log10(1.0 / mse)
+            print("EQUIVALENCE   max_diff %.4f LSB   PSNR %.2f dB   [%s vs %s]"
+                  % (lsb, psnr, "AGREE" if lsb <= 3.0 else "DISAGREE", a.cmp))
+            print("              same seed, so this isolates the RESAMPLE. NOT accuracy vs the")
+            print("              golden -- random weights make that meaningless, so none is shown.")
+    return 0
+
+
 def run_conv(name, group, i, o, ih, iw, st, a):
     dt = torch.bfloat16 if a.dtype == "bf16" else torch.float32
     torch.manual_seed(0)
@@ -545,6 +647,22 @@ def main():
     ap.add_argument("--radius", type=int, default=3)
     ap.add_argument("--dtype", default="fp32", choices=("fp32", "bf16"))
     ap.add_argument("--int-flow", action="store_true")
+    # --op sequence only
+    ap.add_argument("--tile", type=int, default=9,
+                    help="--op sequence: which tile. 9 is the LARGEST shape at 4x8; tile 1 is NOT "
+                         "the largest and testing it once produced a false FUSES verdict.")
+    ap.add_argument("--warp", default="gather",
+                    help="--op sequence: the resample implementation inside the sequence")
+    ap.add_argument("--iters", type=int, default=5,
+                    help="--op sequence: timed iterations after the compile/warmup call")
+    ap.add_argument("--fullgraph", type=int, choices=(0, 1), default=1)
+    ap.add_argument("--gamma", type=float, default=0.98)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="fixes weights AND input, so two warps are a true equivalence test")
+    ap.add_argument("--nkl-gather-method", choices=("transpose", "copy"), default=None)
+    ap.add_argument("--nkl-max-indices", type=int, default=None)
+    ap.add_argument("--save-out", metavar="PATH.npy")
+    ap.add_argument("--cmp", metavar="PATH.npy")
     a = ap.parse_args()
 
     if a.list_op_sites or a.op_site_specs:
@@ -568,6 +686,15 @@ def main():
         print("ops %d   MACs single pass %.2f G   per forward (ctx x2) %.2f G"
               % (len(inv), tot / 1e9, (tot + ctx) / 1e9))
         return 0
+
+    if a.op == "sequence":
+        if a.fullgraph == 0 and a.warp in ("nki", "nki-dyn"):
+            ap.error("--fullgraph 0 is unsafe with --warp %s: a graph break around the "
+                     "view(torch.uint32) index bitcast silently corrupts which pixels are sampled."
+                     % a.warp)
+        if a.device == "neuron":
+            import torch_neuronx  # noqa: F401
+        return run_sequence(a)
 
     if not a.shape and not a.fused_shapes:
         ap.error("need --shape, or --fused-shapes to sweep the 4x8 halo-64 shapes")

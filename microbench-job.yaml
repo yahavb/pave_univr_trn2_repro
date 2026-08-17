@@ -32,6 +32,24 @@ spec:
               echo "commit $(git rev-parse HEAD)"
 
               OUT=/tmp/mb; mkdir -p "$OUT"
+              # ARCHIVE IN A TRAP, never as the last block. Under `set -euo pipefail` any earlier
+              # failure -- or an early `exit` from a branch like SET=sequence -- skips a trailing
+              # archive and takes every artifact with it. One S3 object, verified non-empty.
+              finalize() {
+                echo ""
+                echo "=== FINALIZE (trap EXIT -- runs even on failure or early exit) ==="
+                local A="/tmp/univr_microbench_$(date -u +%Y%m%d_%H%M%S).tar.gz"
+                tar -czf "$A" -C /tmp mb 2>/dev/null || true
+                if [ -s "$A" ]; then
+                  mkdir -p /var/mdl/univr_neuron || true
+                  cp "$A" /var/mdl/univr_neuron/ \
+                    && echo "  saved /var/mdl/univr_neuron/$(basename "$A") ($(du -h "$A" | cut -f1))" \
+                    || echo "  publish FAILED"
+                else
+                  echo "  nothing to archive"
+                fi
+              }
+              trap finalize EXIT
               RES="${RES:-256x384}"
               H=${RES%%x*}; W=${RES##*x}
 
@@ -97,6 +115,58 @@ spec:
                 python3 microbench.py --op x --grid "$GRID" --halo "$HALO" \
                     --warp-impls "$WARP_IMPLS" --top "$TOP" --list-op-sites | sed 's/^/  /'
                 echo ""
+                # SET=sequence: the model's WHOLE op sequence for one tile, one compiled graph,
+                # once per warp. This is the arm that assesses a resample kernel, because an
+                # isolated op has no pipelining, no layout reuse and no overlap with the convs
+                # around it -- and because the NKL kernel needs NHWC while the model is NCHW, so it
+                # adds two permutes per call that no single-op arm measures. gather runs first and
+                # saves its output; later warps are compared against it at the same seed, which
+                # isolates the resample without needing the golden.
+                if [ "$SET" = "sequence" ]; then
+                  TILE="${TILE:-9}"; ITERS="${ITERS:-5}"; FULLGRAPH="${FULLGRAPH:-1}"
+                  SEQ_WARPS="${SEQ_WARPS:-gather}"
+                  if [ "$NKL" = "1" ]; then SEQ_WARPS="$SEQ_WARPS gridsample-nkl"; fi
+                  REF=/tmp/ref_seq.npy
+                  for W in $SEQ_WARPS; do
+                    echo "################ sequence_${W}_t${TILE}"
+                    EX=""
+                    if [ "$W" = "gather" ]; then EX="--save-out $REF"
+                    elif [ -f "$REF" ]; then EX="--cmp $REF"; fi
+                    set +e
+                    python -u microbench.py --op sequence --grid "$GRID" --halo "$HALO" \
+                        --tile "$TILE" --warp "$W" --iters "$ITERS" \
+                        --fullgraph "$FULLGRAPH" --device neuron $EX \
+                        2>&1 | tee "$OUT/sequence_$W.log"
+                    rc=${PIPESTATUS[0]}
+                    set -e
+                    echo "  rc=$rc"
+                    if [ "$rc" != "0" ]; then
+                      { grep -aoE "got in=[0-9]+ and out=[0-9]+|kernel_assert|Unsupported|MemoryError|Killed" \
+                        "$OUT/sequence_$W.log" || true; } | head -3 | sed 's/^/    /'
+                    fi
+                    for i in $(seq 1 60); do pgrep -f microbench.py >/dev/null || break; sleep 2; done
+                    sleep 5
+                  done
+                  echo ""
+                  echo "################ SEQUENCE A/B (tile $TILE, $GRID halo $HALO)"
+                  printf "  %-16s %5s %12s %14s %12s %s\n" warp rc tile_ms frame_8core equiv_LSB verdict
+                  for W in $SEQ_WARPS; do
+                    f="$OUT/sequence_$W.log"; [ -f "$f" ] || continue
+                    MS=$(grep -aoE "TILE MEDIAN +[0-9.]+ ms" "$f" | head -1 | awk '{print $3}' || true)
+                    FR=$(grep -aoE "[0-9.]+ ms across 8 cores" "$f" | head -1 | awk '{print $1}' || true)
+                    EQ=$(grep -aoE "max_diff +[0-9.]+ LSB" "$f" | head -1 | awk '{print $2}' || true)
+                    VD=$(grep -aoE "(AGREE|DISAGREE) vs" "$f" | head -1 | awk '{print $1}' || true)
+                    printf "  %-16s %5s %12s %14s %12s %s\n" "$W" "-" "${MS:--}" "${FR:--}" "${EQ:--}" "${VD:-baseline}"
+                  done
+                  echo ""
+                  echo "  tile_ms is the ONLY comparable latency here; per-op single-io us are noise."
+                  echo "  frame_8core is a LOWER bound (equal cost per tile, perfect 8-way overlap)."
+                  echo "  The bar is GATHER, not ATen gridsample: gather already sits at the"
+                  echo "  1 desc/px floor at 40.40 ns, so a kernel wins only by beating ns/desc."
+                  echo "  Whole resample is ~510 ms of the 3900 ms frame, so that is the ceiling."
+                  exit 0
+                fi
+
                 # SET filters the classes: warps = the resample question, convs = dense compute.
                 SPECS=$(python3 microbench.py --op x --grid "$GRID" --halo "$HALO" \
                     --warp-impls "$WARP_IMPLS" --top "$TOP" --op-site-specs --op-site-class "$SET" \
@@ -182,11 +252,7 @@ spec:
               done
               echo ""
 
-              ARCHIVE=/tmp/univr_microbench_$(date -u +%Y%m%d_%H%M%S).tar.gz
-              tar -czf "$ARCHIVE" -C /tmp mb
-              mkdir -p /var/mdl/univr_neuron
-              cp "$ARCHIVE" /var/mdl/univr_neuron/
-              echo "saved /var/mdl/univr_neuron/$(basename "$ARCHIVE") ($(du -h "$ARCHIVE" | cut -f1))"
+              # (the archive is the EXIT trap defined at the top)
           resources:
             claims:
               - name: neurons
