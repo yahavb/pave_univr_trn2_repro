@@ -694,7 +694,8 @@ def main():
     ap.add_argument("--warp", default="gather",
                     help="--op sequence: the resample implementation inside the sequence")
     ap.add_argument("--iters", type=int, default=5,
-                    help="--op sequence: timed iterations after the compile/warmup call")
+                    help="timed iterations after the compile/warmup call, for both the single-op "
+                         "arms and --op sequence")
     ap.add_argument("--fullgraph", type=int, choices=(0, 1), default=1)
     ap.add_argument("--gamma", type=float, default=0.98)
     ap.add_argument("--seed", type=int, default=0,
@@ -812,7 +813,6 @@ def main():
         bulk = (by, bx)
         print("bulk_shift    (dy=%d, dx=%d)  computed on host, baked as a constant" % bulk)
 
-    print("torch.compile fullgraph=True")
     op = OPS[a.op]
     if a.op == "shiftmatmul":
         _b = bulk
@@ -834,12 +834,44 @@ def main():
                 "Put nkilib on PYTHONPATH; the job can restore it from a single tar object on "
                 "the PVC." % e)
         print("nkl kernel    imported and wrapped OK (gather_method picked by dtype)")
-    fn = torch.compile(op, backend="neuron", dynamic=False, fullgraph=True)
+    # backend="neuron" is only valid ON neuron. A CPU arm exists so gridsample can be compared
+    # across BACKENDS -- same op, same semantics, three lowerings -- which is the only truly
+    # apples-to-apples comparison available: gather is a different formulation (4-tap indirect
+    # gather), numerically equivalent but not the same code path, and mixing it in is what made
+    # the earlier baseline arbitrary.
+    if a.device == "cpu":
+        try:
+            fn = torch.compile(op, dynamic=False, fullgraph=True)   # inductor
+            print("torch.compile inductor (cpu), fullgraph=True")
+        except Exception as e:                                      # noqa: BLE001
+            fn = op
+            print("cpu EAGER (inductor unavailable: %s) -- not a compiled number" % type(e).__name__)
+    else:
+        fn = torch.compile(op, backend="neuron", dynamic=False, fullgraph=True)
+        print("torch.compile fullgraph=True")
 
+    # WARM WALL-CLOCK MEDIAN. This path previously ran the op exactly ONCE and never timed it --
+    # every latency number came from the neuron-only profiler (total_active_time), so a CPU arm
+    # would have produced no number at all and the three-backend comparison was impossible.
+    # The first call compiles, so it is discarded; the median of the rest is the comparable figure.
+    import time as _time
     with torch.no_grad():
+        t0 = _time.perf_counter()
         out = fn(x, flow)
+        out.float().cpu()
+        first = (_time.perf_counter() - t0) * 1e3
+        ts = []
+        for _ in range(max(1, a.iters)):
+            t0 = _time.perf_counter()
+            out = fn(x, flow)
+            out.float().cpu()
+            ts.append((_time.perf_counter() - t0) * 1e3)
+    ts.sort()
     got = out.float().cpu()
-    print("ran           output %s" % (tuple(out.shape),))
+    print("ran           output %s   first call %.1f ms (compile+warmup)"
+          % (tuple(out.shape), first))
+    print("wall          %.3f ms  median of %d (min %.3f, max %.3f)"
+          % (ts[len(ts) // 2], len(ts), ts[0], ts[-1]))
 
     with torch.no_grad():
         ref = warp_gridsample(x.float().cpu(), flow.float().cpu())

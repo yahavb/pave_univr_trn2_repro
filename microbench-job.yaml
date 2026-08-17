@@ -130,6 +130,68 @@ spec:
                 python3 microbench.py --op x --grid "$GRID" --halo "$HALO" \
                     --warp-impls "$WARP_IMPLS" --top "$TOP" --list-op-sites | sed 's/^/  /'
                 echo ""
+                # SET=gsbackends: THE apples-to-apples comparison. ONE operation -- gridsample,
+                # stock RIFE semantics (bilinear / border / align_corners=True) -- across THREE
+                # backends, at the tile dims that minimise padding.
+                #
+                # This is cleaner than anything before it because it removes the confound: gather
+                # is a DIFFERENT formulation (4-tap indirect gather), numerically equivalent but
+                # not the same code path, so using it as the baseline made the bar arbitrary.
+                # Here every arm computes the same op, so the only variable is the lowering.
+                #
+                # GEOMETRY: 4x8 halo 64, because among everything tried it is the least padding
+                # that actually works -- padded/valid 1.535x, against h128's 2.130x (h128 is 39%
+                # more resample work), and the smaller-padding options are all dead:
+                #   2x8 h64  1.309x  compile OOM at 600/1000/1500Gi
+                #   2x4 h128 1.363x  OOM / DMA rejection
+                #   4x8 h48  1.389x  0 of 3 shapes fuse
+                #   4x8 h64  1.535x  FUSES, and is the config that measured 3900.5 ms  <- this
+                if [ "$SET" = "gsbackends" ]; then
+                  GSG="${GSG:-4x8}"; GSH="${GSH:-64}"
+                  # the C=3 full-resolution dims: 6 of the 14 calls per tile and ~90% of the work
+                  DIMS=$(python3 microbench.py --op x --grid "$GSG" --halo "$GSH" \
+                         --warp-impls gather --top 4 --op-site-class warps --op-site-specs \
+                         | sed 's/^gather://')
+                  echo "gsbackends  grid $GSG halo $GSH   dims: $(echo $DIMS | tr '\n' ' ')"
+                  echo ""
+                  for D in $DIMS; do
+                    for BK in "gridsample:cpu" "gridsample:neuron" "gridsample-nkl:neuron"; do
+                      OPN=${BK%%:*}; DEV=${BK##*:}
+                      if [ "$OPN" = "gridsample-nkl" ] && [ "$NKL" != "1" ]; then continue; fi
+                      TAG="${OPN}-${DEV}_$(echo $D | tr ',' 'x')"
+                      echo "################ $TAG"
+                      set +e
+                      python -u microbench.py --op "$OPN" --shape "$D" --device "$DEV" \
+                          --flow-smooth --flow-mag 2.33 2>&1 | tee "$OUT/$TAG.log"
+                      rc=${PIPESTATUS[0]}
+                      set -e
+                      echo "  rc=$rc"
+                      for i in $(seq 1 30); do pgrep -f microbench.py >/dev/null || break; sleep 2; done
+                      sleep 3
+                    done
+                  done
+                  echo ""
+                  echo "################ GRIDSAMPLE ACROSS BACKENDS ($GSG halo $GSH)"
+                  printf "  %-22s %-16s %10s %10s %9s\n" dim backend wall_ms max_LSB gate
+                  for D in $DIMS; do
+                    for BK in "gridsample:cpu" "gridsample:neuron" "gridsample-nkl:neuron"; do
+                      OPN=${BK%%:*}; DEV=${BK##*:}
+                      f="$OUT/${OPN}-${DEV}_$(echo $D | tr ',' 'x').log"
+                      [ -f "$f" ] || continue
+                      MS=$(grep -aoE "wall +[0-9.]+ ms" "$f" | head -1 | awk '{print $2}' || true)
+                      L=$(grep -aoE "max_diff +[0-9.]+ LSB" "$f" | head -1 | awk '{print $2}' || true)
+                      G=$(grep -aoE "\[(PASS|FAIL) vs bar 3\]" "$f" | head -1 | tr -d '[]' | awk '{print $1}' || true)
+                      printf "  %-22s %-16s %10s %10s %9s\n" "$D" "${OPN}/${DEV}" "${MS:--}" "${L:--}" "${G:--}"
+                    done
+                  done
+                  echo ""
+                  echo "  Same op, same semantics, three lowerings -- the only variable is the"
+                  echo "  backend. cpu is the golden (it IS the reference every arm is scored"
+                  echo "  against), so its LSB is 0 by construction; its wall time is a sanity"
+                  echo "  anchor, not a target. The question is whether NKI beats ATen on neuron."
+                  exit 0
+                fi
+
                 # SET=nklsweep: the ONE knob with headroom left. Measured with batching DISABLED
                 # (max_indices_per_indirect=None) the kernel matched gather's 1.006 desc/px -- it
                 # fully solved ATen gridsample's 3x blowup, a 2.7x win over gridsample -- but ran
@@ -336,9 +398,15 @@ spec:
             #    SET=sequence  -> the whole tile op sequence per warp (the model-level answer;
             #                     catches the NHWC permutes the NKL kernel adds, which no
             #                     single-op arm can see)
+            #    SET=gsbackends -> ONE op (gridsample) across THREE backends -- cpu / neuron /
+            #                      NKI -- at the least-padding geometry that works (4x8 halo 64,
+            #                      padded/valid 1.535x vs h128's 2.130x). 12 arms. This is the
+            #                      apples-to-apples comparison: same op, same semantics, only the
+            #                      lowering varies, so no gather confound.
+            #    SET=nklsweep  -> sweep the kernel's max_indices_per_indirect at one dim
             #    SET=both TOP=0 -> every op the model runs at every dim it runs it (256 arms)
             - name: SET
-              value: "warps"
+              value: "gsbackends"
             - name: TOP
               value: "4"
             - name: GRID
