@@ -13,9 +13,6 @@ spec:
       restartPolicy: Never
       nodeSelector:
         node-type: trn3-dev1
-        # Pinned: the S3 add-on backing the /var/mdl PVC only runs on this node. Elsewhere the
-        # pod sits Pending on "MountVolume.SetUp failed ... DeadlineExceeded".
-        kubernetes.io/hostname: ip-192-168-192-189.us-east-2.compute.internal
       resourceClaims:
         - name: neurons
           resourceClaimTemplateName: s-lnc1
@@ -44,45 +41,71 @@ spec:
               POUT=/tmp/perneff; mkdir -p "$POUT"
 
               SET="${SET:-both}"
-              # The 4x8 halo-128 shapes -- the config now PROVEN fully fusable (all 8 slots, job
-              # k2zwh). The old default was the halo-64 set, which no longer matches anything we run.
-              SHAPES="${SHAPES:-576,640 576,768 704,640 704,768}"
-              # THE CHANNEL SWEEP IS THE POINT, and it was missing. The resample is applied at
-              # C=3 (images) AND at the Contextnet feature widths C=16/32/64/128 (_C=16, so
-              # C,2C,4C,8C). Every previous warp arm ran at C=3 ONLY -- the CHEAPEST site -- while
-              # the measured descriptor rate for gridsample climbs from 3.0 pkt/px at C=3 to
-              # 205 at C=128 against gather's ~2.0 flat. So the arm that mattered was never run,
-              # and any judgement about gridsample's cost rests on its best case.
-              CHANS="${CHANS:-3 16 32 64 128}"
+              # THE GRID AND HALO THE FRAME ACTUALLY USES. The arm list is DERIVED from these via
+              # the model's own plan_tiles, not hand-written:
+              #   4x8 halo 128  proven fusable on all 8 slots (job k2zwh). 448 warp calls a frame,
+              #                 100.4M pixel-warps, 4 padded shapes, 20 distinct (C,H,W)
+              #   4x8 halo  64  the config that measured 3900.5 / 3820.4 ms. 448 calls but only
+              #                 72.4M pixel-warps -- halo 128 is 39% MORE resample work
+              #   2x8 halo  64  224 calls, 61.7M pixel-warps, but a measured compile OOM
+              GRID="${GRID:-4x8}"; HALO="${HALO:-128}"
+
+              # nkilib PREFLIGHT. The NKL kernel (CR-288764575) is UNMERGED, so it is absent from
+              # released images. Restore it from ONE tar object if present on the PVC -- never
+              # traverse the S3-FUSE mount file-by-file -- then TEST the import and let the answer
+              # decide whether the arms run. Predicting the failure and running the arms anyway,
+              # which is what the previous version did, wastes the run and tells us nothing.
+              NKILIB_TGZ="${NKILIB_TGZ:-/var/mdl/univr/nkilib.tar.gz}"
+              if [ -f "$NKILIB_TGZ" ]; then
+                cp "$NKILIB_TGZ" /tmp/nkilib.tar.gz && mkdir -p /tmp/nkilib \
+                  && tar -xzf /tmp/nkilib.tar.gz -C /tmp/nkilib \
+                  && export PYTHONPATH="/tmp/nkilib:${PYTHONPATH:-}" \
+                  && echo "nkilib: restored from $NKILIB_TGZ -> PYTHONPATH"
+              else
+                echo "nkilib: no tar at $NKILIB_TGZ"
+              fi
+              if python3 -c "import nkilib.experimental.indirect.grid_sample" 2>/dev/null; then
+                NKL="${NKL:-1}"; echo "nkilib: IMPORT OK  -> gridsample-nkl arms ENABLED (NKL=$NKL)"
+              else
+                NKL="${NKL:-0}"; echo "nkilib: IMPORT FAILS -> gridsample-nkl arms SKIPPED (NKL=$NKL)"
+                echo "  to enable: tar the package as ONE object and put it on the PVC --"
+                echo "    cd ~/KaenaNeuronKernelLibrary && tar -czf /tmp/nkilib.tar.gz -C src/nkilib_src nkilib"
+                echo "    aws s3 cp /tmp/nkilib.tar.gz s3://621547421844-ap-southeast-4/univr/nkilib.tar.gz"
+              fi
+              echo ""
 
               SPECS="${SPECS:-}"
               if [ -z "$SPECS" ]; then
                 case "$SET" in
                   warps|both)
-                    for S in $SHAPES; do
-                      for C in $CHANS; do
-                        # gather is the compilable substitute, gridsample the REFERENCE every
-                        # other warp is scored against (microbench.py scores vs warp_gridsample).
-                        # Both at every C so the gap is measured per site, not assumed.
-                        SPECS="$SPECS gather:$C,$S"
-                        SPECS="$SPECS gridsample:$C,$S"
-                        # The NKL kernel from CR-288764575. Third arm at every (C, shape) so the
-                        # comparison that matters is direct: it against ATen gridsample, the
-                        # reference it is meant to replace, at the C where ATen's descriptor rate
-                        # explodes (205 pkt/px at C=128 vs ~2.0 for gather). Set NKL=0 to drop
-                        # these arms -- the kernel is UNMERGED and absent from released images, so
-                        # it raises SystemExit on import unless the package is on PYTHONPATH.
-                        # `if`, not `[ ] &&`: a bare && as the last statement in a loop body
-                        # leaves the loop with a non-zero status, which is a set -e hazard.
-                        if [ "${NKL:-1}" = "1" ]; then SPECS="$SPECS gridsample-nkl:$C,$S"; fi
-                      done
-                      SPECS="$SPECS nkishift/3:3,$S"
+                    # THE ARM LIST IS THE MODEL'S REAL INVENTORY, not a synthetic C sweep. The
+                    # previous version swept C=3..128 all at the FULL padded tile shape, which the
+                    # model never computes: Contextnet is four Conv2(stride=2) levels, so each step
+                    # doubles C and QUARTERS the area. C=128 lives at ph/16 x pw/16 -- 44x48 = 2,112
+                    # px, not 540,672 -- so a C=128 arm at full tile size measured a shape 256x too
+                    # large. Consequence: gridsample's "205 pkt/px at C=128" applies to ~0.12% of
+                    # the frame's pixel-warps, and weighted properly it is ~3.2x gather overall
+                    # rather than 100x, with the dominant site being C=3 at FULL resolution (54.5%
+                    # of channel-pixels, 6 calls per tile) where gridsample is only 3.0 vs ~2.0.
+                    python3 microbench.py --op x --grid "$GRID" --halo "$HALO" \
+                        --list-warp-sites | sed 's/^/  /'
+                    python3 microbench.py --op x --grid "$GRID" --halo "$HALO" \
+                        --warp-site-specs > "$OUT/warp_weights.txt"
+                    echo ""
+                    for L in $(cat "$OUT/warp_weights.txt"); do
+                      SHP=${L%%:*}                      # C,H,W   (weight after the colon)
+                      SPECS="$SPECS gather:$SHP"
+                      SPECS="$SPECS gridsample:$SHP"
+                      if [ "$NKL" = "1" ]; then SPECS="$SPECS gridsample-nkl:$SHP"; fi
                     done
                     ;;
                 esac
                 case "$SET" in
                   convs|both)
-                    CS=$(echo $SHAPES | awk '{print $NF}')
+                    # The largest padded tile for this grid/halo, derived rather than hardcoded:
+                    # the conv inventory is reported at one shape and the biggest is the honest one.
+                    CS=$(python3 -c "import microbench,sys; p=microbench.tile_shapes(sys.argv[1],int(sys.argv[2]))[0]; print('%d,%d'%(p[0],p[1]))" "$GRID" "$HALO")
+                    echo "conv arms at largest padded tile: $CS"
                     for OP in $(python3 microbench.py --op x --list-convs --shape "$CS" \
                                 | awk '$6 ~ /^-?[0-9]+$/ && $7 ~ /^[0-9.]+$/ {print $1}'); do
                       SPECS="$SPECS $OP:$CS"
@@ -90,7 +113,7 @@ spec:
                     ;;
                 esac
               fi
-              echo "SET=$SET  SHAPES=$SHAPES"
+              echo "SET=$SET  GRID=$GRID  HALO=$HALO  NKL=$NKL"
               echo "arms: $(echo $SPECS | wc -w)"
               echo ""
 
@@ -130,10 +153,23 @@ spec:
                 hash=$(basename "$BIG" .neff)
                 ntff="$POUT/$hash.ntff"; json="$POUT/$hash.json"
                 echo "  neff $hash ($(stat -c%s "$BIG") B)"
-                timeout 3600 neuron-profile capture --single-io -n "$BIG" -s "$ntff" \
+                # neuron-profile is DEPRECATED on this image (cc 2.27): every capture failed with
+                # a banner pointing at neuron-explorer. 10/10 arms lost their profile data that way,
+                # so the whole descriptor payload was missing. Prefer neuron-explorer, fall back to
+                # neuron-profile for older images. This is the CAPTURE subcommand -- NOT the
+                # neuron-explorer view SERVER (--ingest-only, :3001/:3002), which hangs on big DMA
+                # NEFFs and must still never be used.
+                PROF=neuron-explorer
+                command -v "$PROF" >/dev/null 2>&1 || PROF=neuron-profile
+                timeout 3600 "$PROF" capture --single-io -n "$BIG" -s "$ntff" \
                     >"$POUT/$hash.cap.log" 2>&1 || true
+                if [ ! -s "$ntff" ] && [ "$PROF" != "neuron-profile" ]; then
+                  echo "  $PROF capture empty -- retrying with neuron-profile"
+                  timeout 3600 neuron-profile capture --single-io -n "$BIG" -s "$ntff" \
+                      >>"$POUT/$hash.cap.log" 2>&1 || true
+                fi
                 [ -s "$ntff" ] || { echo "  CAPTURE FAILED"; tail -6 "$POUT/$hash.cap.log"; continue; }
-                timeout 900 neuron-profile view -n "$BIG" -s "$ntff" \
+                timeout 900 "$PROF" view -n "$BIG" -s "$ntff" \
                     --output-format summary-json > "$json" 2>/dev/null || true
                 [ -s "$json" ] || { echo "  VIEW FAILED"; continue; }
                 python3 profile_roofline.py "$json" "$TAG" "${PX:-0}" "${TB:-0}" \

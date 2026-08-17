@@ -141,6 +141,29 @@ def warp_nkishift(x, flow, radius=2):
     return out.permute(2, 0, 1).unsqueeze(0).to(x.dtype)
 
 
+_NKL_GS_FN = None
+
+
+def ensure_nkl():
+    """Import and wrap the NKL kernel. MUST be called BEFORE torch.compile, never from inside the
+    traced function.
+
+    The first version did the import inside warp_gridsample_nkl, which torch.compile traces. Dynamo
+    then raised its OWN error before the except clause could run:
+        torch._dynamo.exc.Unsupported: Import failure
+          module_name: nkilib.experimental.indirect.grid_sample
+    which is unhelpful twice over -- it masks whether the module is merely absent, and it looks
+    like a tracing limitation rather than a missing dependency. Hoisting the import out means a
+    missing package says so plainly, and a present one is wrapped once.
+    """
+    global _NKL_GS_FN
+    if _NKL_GS_FN is None:
+        from nkilib.experimental.indirect.grid_sample import grid_sample
+        from torch_neuronx.nki_hop import wrap_nki
+        _NKL_GS_FN = wrap_nki(grid_sample)
+    return _NKL_GS_FN
+
+
 def warp_gridsample_nkl(x, flow):
     """NKL grid_sample (KaenaNeuronKernelLibrary, CR-288764575) behind F.grid_sample semantics.
 
@@ -152,14 +175,6 @@ def warp_gridsample_nkl(x, flow):
     docstring is unimplemented) so the value is permuted in and out, and gather_method
     "transpose" requires a 2-byte dtype, so fp32 takes the "copy" path.
     """
-    try:
-        from nkilib.experimental.indirect.grid_sample import grid_sample
-    except ImportError as e:                                      # noqa: BLE001
-        raise SystemExit(
-            "op gridsample-nkl needs nkilib.experimental.indirect.grid_sample from "
-            "KaenaNeuronKernelLibrary (CR-288764575, OPEN at rev 3 -- unmerged, so absent from "
-            "released images). Import failed: %s" % e)
-    from torch_neuronx.nki_hop import wrap_nki
     B, C, H, W = x.shape
     d = flow.device
     hor = torch.linspace(-1.0, 1.0, W, device=d, dtype=flow.dtype).view(1, 1, 1, W).expand(B, -1, H, -1)
@@ -168,11 +183,14 @@ def warp_gridsample_nkl(x, flow):
     f = torch.cat([flow[:, 0:1] / ((W - 1.0) / 2.0), flow[:, 1:2] / ((H - 1.0) / 2.0)], 1)
     g = (grid + f).permute(0, 2, 3, 1).contiguous()
     gm = "transpose" if x.element_size() == 2 else "copy"
-    out = wrap_nki(grid_sample)(x.permute(0, 2, 3, 1).contiguous(), g,
-                                sampling_mode="bilinear", coord_mode="minus_one_one",
-                                input_layout="NHWC", align_corners=True,
-                                padding_mode="border", max_indices_per_indirect=None,
-                                gather_method=gm)
+    # The already-wrapped kernel, resolved by ensure_nkl() BEFORE torch.compile. Referencing the
+    # global directly rather than calling ensure_nkl() here keeps the import out of the traced
+    # region entirely -- that is what produced "torch._dynamo.exc.Unsupported: Import failure".
+    out = _NKL_GS_FN(x.permute(0, 2, 3, 1).contiguous(), g,
+                     sampling_mode="bilinear", coord_mode="minus_one_one",
+                     input_layout="NHWC", align_corners=True,
+                     padding_mode="border", max_indices_per_indirect=None,
+                     gather_method=gm)
     return out.permute(0, 3, 1, 2)
 
 
@@ -218,6 +236,93 @@ def _prelu(o):
             w = self.weight.view(1, -1, *([1] * (x.dim() - 2)))
             return F.relu(x) - w * F.relu(-x)
     return P(o)
+
+
+# =============================================================================================
+# THE REAL RESAMPLE INVENTORY -- what a 4K frame actually warps, and at what shapes
+# =============================================================================================
+# This exists because the synthetic arms were WRONG in the way that matters. They swept
+# C=3,16,32,64,128 all at the FULL padded tile shape, but the model never does that: Contextnet
+# is four Conv2(stride=2) levels, so every step DOUBLES the channel count and QUARTERS the area.
+# C=128 runs at ph/16 x pw/16 -- 44x48 = 2,112 px for a 704x768 tile, not 540,672. Benchmarking
+# C=128 at full tile resolution measures a shape that does not exist, 256x too large.
+#
+# Consequence for the gridsample-vs-NKI question: the headline "3.0 pkt/px at C=3 rising to 205
+# at C=128" is real per call, but C=128 is only ~0.12% of the frame's pixel-warps. Weighted by
+# the actual inventory, gridsample is roughly 3.2x gather in total descriptors, not 100x, and the
+# dominant site is C=3 at FULL resolution (54.5% of channel-pixels, 6 calls per tile) where
+# gridsample is only 3.0 vs gather's ~2.0. Any claim about the kernel's headroom has to be made
+# against this table, not against the per-call peak.
+#
+# The 14 sites per tile match the count in STATE.md: 6 full-resolution pyramid warps (3 stages x
+# {img0, img1}) plus 4 Contextnet levels x {img0, img1}. 32 tiles x 14 = 448 warp calls a frame.
+#
+# The padded shapes come from the MODEL's own plan_tiles, imported rather than copied. An earlier
+# version hardcoded the 4x8 halo-128 set, which was wrong on two counts: it silently excluded every
+# other geometry this project has run, and a hardcoded table drifts from the tiling code the moment
+# TILE_ALIGN or the clipping changes. --grid/--halo now select any of them:
+#     4x8 halo 128  the config PROVEN fully fusable (all 8 slots, job k2zwh)
+#     4x8 halo  64  the config that produced the measured 3900.5 / 3820.4 ms fused frame
+#     2x8 halo  64  928x640 = 593,920 px, the measured compile OOM -- included because its
+#                   resample inventory is still the right question even where it cannot compile
+# Border tiles get their halo clipped, so each grid has several distinct padded shapes, and each
+# tile runs exactly ONE pass (H/2 = 864 falls on a row boundary at 4 rows, so need_f and need_b
+# are never both true) -- which makes the tile count the call multiplier.
+def tile_shapes(grid="4x8", halo=128, H=1728, W=4096):
+    """[(ph, pw, n_tiles)] for a grid, via the model's plan_tiles. Single source of truth."""
+    from repro_unrolling_trn2 import plan_tiles           # safe: guarded by __name__ == __main__
+    ny, nx = (int(v) for v in grid.lower().split("x"))
+    counts = {}
+    for T in plan_tiles(H, W, ny, nx, halo):
+        counts[(T["ph"], T["pw"])] = counts.get((T["ph"], T["pw"]), 0) + 1
+    return sorted(((ph, pw, n) for (ph, pw), n in counts.items()), key=lambda r: -r[0] * r[1])
+
+
+def warp_inventory(ph, pw):
+    """Resample sites for ONE tile of padded size (ph, pw): (name, C, H, W, calls_per_tile).
+
+    Six at full resolution from the flow pyramid (_StageFirst + 2x _StageNext, each warping img0
+    and img1), then one per Contextnet level. Level lvl outputs _C * 2**(lvl-1) channels at
+    ph/2**lvl because Conv2's first conv has stride 2, and is called twice (img0, img1).
+    """
+    sites = [("ifnet_pyramid", 3, ph, pw, 6)]
+    for lvl in range(1, 5):
+        sites.append(("ctx%d" % lvl, _C * 2 ** (lvl - 1), ph >> lvl, pw >> lvl, 2))
+    return sites
+
+
+def print_warp_sites(grid="4x8", halo=128, specs_only=False):
+    """The frame-wide inventory. With specs_only, emit `C,H,W:calls_per_frame` for the job to
+    consume, deduplicated across shapes, so the arm list is derived rather than hand-written."""
+    shapes = tile_shapes(grid, halo)
+    weight = {}
+    for ph, pw, ntiles in shapes:
+        for _n, c, h, w, calls in warp_inventory(ph, pw):
+            weight[(c, h, w)] = weight.get((c, h, w), 0) + calls * ntiles
+    if specs_only:
+        for (c, h, w), n in sorted(weight.items(), key=lambda kv: -kv[0][1] * kv[0][2] * kv[1]):
+            print("%d,%d,%d:%d" % (c, h, w, n))
+        return 0
+    tot_px = sum(h * w * n for (_c, h, w), n in weight.items())
+    tot_cpx = sum(c * h * w * n for (c, h, w), n in weight.items())
+    print("grid %s halo %d -> %d tiles, %d distinct padded shapes"
+          % (grid, halo, sum(n for _p, _q, n in shapes), len(shapes)))
+    print("%-14s %5s %10s %7s %8s %13s %7s" % ("site", "C", "HxW", "px", "calls", "ch_px", "share%"))
+    for ph, pw, ntiles in shapes:
+        print("--- padded %dx%d  x%d tiles" % (ph, pw, ntiles))
+        for n, c, h, w, calls in warp_inventory(ph, pw):
+            cpx = c * h * w * calls * ntiles
+            print("%-14s %5d %10s %7d %8d %13d %7.2f"
+                  % (n, c, "%dx%d" % (h, w), h * w, calls * ntiles, cpx, 100.0 * cpx / tot_cpx))
+    print()
+    print("frame: %d warp calls, %.2fM pixel-warps, %.2fM channel-pixels, %d distinct (C,H,W)"
+          % (sum(weight.values()), tot_px / 1e6, tot_cpx / 1e6, len(weight)))
+    byc = {}
+    for (c, h, w), n in weight.items():
+        byc[c] = byc.get(c, 0) + c * h * w * n
+    for c in sorted(byc):
+        print("  C=%-4d %7.2fM ch_px  %5.1f%% of frame" % (c, byc[c] / 1e6, 100.0 * byc[c] / tot_cpx))
+    return 0
 
 
 def conv_inventory(H, W):
@@ -313,7 +418,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--op", required=True)
     ap.add_argument("--shape")
+    ap.add_argument("--grid", default="4x8",
+                    help="tile grid for --list-warp-sites/--warp-site-specs. 4x8 = the only grid "
+                         "under the compiler memory ceiling and the one both fused configs use; "
+                         "2x8/2x4/3x4 are measured OOMs but their inventories are still printable.")
+    ap.add_argument("--halo", type=int, default=128,
+                    help="halo for --list-warp-sites/--warp-site-specs. 128 = the production halo, "
+                         "proven fusable on all 8 slots; 64 = the config that measured 3900.5 ms.")
     ap.add_argument("--list-convs", action="store_true")
+    ap.add_argument("--list-warp-sites", action="store_true",
+                    help="print the resample inventory a 4K frame actually performs: the real "
+                         "(C,H,W) of every warp call across all four padded tile shapes, weighted "
+                         "by call count and tile multiplicity. Read this BEFORE trusting any warp "
+                         "arm -- the Contextnet levels halve resolution as they double channels, "
+                         "so C=128 lives at ph/16 and a C=128 arm at full tile size is fiction.")
+    ap.add_argument("--warp-site-specs", action="store_true",
+                    help="machine-readable form of --list-warp-sites: `C,H,W:calls_per_frame`, "
+                         "deduplicated. The job builds its arm list from this.")
     ap.add_argument("--fused-shapes", action="store_true")
     ap.add_argument("--device", default="neuron")
     ap.add_argument("--flow-mag", type=float, default=8.0)
@@ -322,6 +443,9 @@ def main():
     ap.add_argument("--dtype", default="fp32", choices=("fp32", "bf16"))
     ap.add_argument("--int-flow", action="store_true")
     a = ap.parse_args()
+
+    if a.list_warp_sites or a.warp_site_specs:
+        return print_warp_sites(a.grid, a.halo, specs_only=a.warp_site_specs)
 
     if a.list_convs:
         H, W = (int(v) for v in (a.shape or "576,640").split(","))
@@ -415,6 +539,19 @@ def main():
     elif a.op == "nkishift":
         _r = a.radius
         op = lambda t, f: warp_nkishift(t, f, radius=_r)
+    elif a.op == "gridsample-nkl":
+        # Resolve the kernel BEFORE torch.compile so a missing package reports itself plainly
+        # instead of surfacing as a dynamo "Import failure" graph break from inside tracing.
+        try:
+            ensure_nkl()
+        except ImportError as e:                                  # noqa: BLE001
+            raise SystemExit(
+                "op gridsample-nkl needs nkilib.experimental.indirect.grid_sample from "
+                "KaenaNeuronKernelLibrary (CR-288764575, OPEN at rev 3 -- unmerged, so absent "
+                "from released images). Import failed: %s\n"
+                "Put nkilib on PYTHONPATH; the job can restore it from a single tar object on "
+                "the PVC." % e)
+        print("nkl kernel    imported and wrapped OK (gather_method picked by dtype)")
     fn = torch.compile(op, backend="neuron", dynamic=False, fullgraph=True)
 
     with torch.no_grad():

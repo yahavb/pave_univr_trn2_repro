@@ -49,6 +49,7 @@ import argparse
 import hashlib
 import math
 import os
+import sys
 import time
 
 import torch
@@ -95,8 +96,11 @@ if not _eff or min(_eff) < 64:
         "this build exposes neither a settable cache_size_limit nor recompile_limit. Fix the "
         "name here BEFORE running: under fullgraph=True this is a hard error that only shows up "
         "at 8 cores, after every compile is already paid for." % (_eff,))
+# stderr, not stdout: microbench.py imports this module to reuse plan_tiles, and its
+# --warp-site-specs output is PARSED by the job. An import-time line on stdout would land in the
+# arm list and break it.
 print("  dynamo recompile limit: %d (must exceed the per-tile recompile count, observed 22)"
-      % min(_eff))
+      % min(_eff), file=sys.stderr)
 
 # NKI MUST be imported at MODULE level, not inside the builder function. NKI's parser frontend
 # resolves names through the kernel's __globals__ and NOT through its closure, so importing
