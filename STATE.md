@@ -244,6 +244,48 @@ it does reach hardware DGE -- for ~6% of the work, 94% still software. And this 
 `SET=nklsweep` sweeps the cap at the 38.75%-of-work dim. **Beating gather means ns/desc below
 40.39**; if no cap does that, the CR is a win only over an implementation this model does not use.
 
+## MEASURED: gridsample on CPU is NOT a lever, and the ratio is size-dependent
+
+Job `univr-bench-79h4g`/`univr-bench` at `f26eb21`, `MODE=warpcmp`. The model runs on **neuron**
+in every arm; only the RESAMPLE REGION differs (`--warp-region`, its own `torch.compile`, its own
+backend). `--warp-region` forces `fullgraph=0` in all arms, so the break structure is identical
+and the resample is the only variable. Random weights, so ratios only -- no accuracy claim.
+
+| size | px | aten (neuron) | cpu (inductor) | nki (fallback) | **cpu/aten** |
+|---|---|---|---|---|---|
+| 128x128 | 16,384 | 98.0 ms | 83.4 ms | 6,908 ms | **0.851x** |
+| 192x224 | 43,008 | 187.8 ms | 173.5 ms | 18,048 ms | **0.924x** |
+| 288x320 | 92,160 | 392.4 ms | 379.5 ms | 38,490 ms | **0.967x** |
+
+**The CPU advantage is small and VANISHING with size: 0.851 -> 0.924 -> 0.967, converging on
+1.0.** The production tile (576x640, 368,640 px) is 4x the largest rung, so on this trend the host
+arm is at or past parity there. **Running gridsample on CPU is not a lever.**
+
+**A single small tile would have produced the OPPOSITE conclusion** -- 128x128 alone says "CPU is
+15% faster" -- which is exactly why the ladder exists. The work MIX is scale-invariant (90.04% of
+pixel-warps at C=3 at every size, because each Contextnet level is a fixed fraction of tile area),
+but that does NOT make measured ratios scale-invariant. Prove a ratio at more than one size before
+extrapolating it.
+
+**Scaling, which is the diagnostic:**
+
+```
+aten   1.00x -> 1.92x -> 4.00x time    for 1.00x -> 2.62x -> 5.62x pixels   sublinear
+cpu    1.00x -> 2.08x -> 4.55x                                              sublinear
+nki    1.00x -> 2.61x -> 5.57x                                              LINEAR in pixels
+```
+
+`aten` and `cpu` are sublinear, so both carry fixed per-call overhead -- the split region's
+dispatch, plus 14 host round-trips for `cpu`. **`nki` tracks pixels almost exactly**, which
+**refutes the "fixed per-call dispatch overhead" reading of its 6,908 ms**: a fixed cost would
+be roughly CONSTANT across the ladder, and it is not. The software-DGE fallback is ~98x slower
+**per pixel**, not per call. `nki/aten` runs 70x -> 96x -> 98x.
+
+Absolute scale worth remembering: `aten` at 288x320 is 392 ms for ONE tile, so ~5-6 s a frame once
+scaled to the production tile over 32 tiles and 8 cores -- far worse than the 3900 ms fused
+number. `fullgraph=0` plus a separately dispatched region is expensive, and **fusion is the thing
+that matters**.
+
 ## BLOCKED: the NKL GridSample kernel needs unmerged DGE MICROCODE
 
 Every `gridsample-nkl` number measured so far ran on the **software DGE fallback**, so none of
