@@ -153,6 +153,40 @@ at `tau = (t + gamma - gamma * rows / fh ...)` (~line 831) and which varies per 
 of shape and timestamp. The failing frame reached recompile **22**, so "8 graphs" understates the
 host-side trace count even though it is exactly right about NEFFs.
 
+## MEASURED: the resample is descriptor-bound, and `gather` is already AT the floor
+
+Job `univr-microbench-c8lm6`, arm `3x704x768` -- the C=3 flow-pyramid site of the largest
+4x8 halo-128 tile, which is 38.75% of all resample work:
+
+| | gather | gridsample | ratio |
+|---|---|---|---|
+| total_active_time | **21.98 ms** | **64.66 ms** | 2.94x |
+| sw_dynamic_dma packets | 544,064 | 1,624,192 | **2.99x** |
+| **pkt/px** | **1.006** | **3.004** | 2.99x |
+| **ns per descriptor** | **40.40** | **39.81** | **1.00x -- flat** |
+| hbm_read_bytes | 36.9 MB | 30.4 MB | gridsample reads LESS |
+| gpsimd / tensor / MFU | 99.3% / 0.1% / 0.00% | 99.7% / 0.1% / 0.00% | |
+
+**Time = descriptor count x ~40 ns and nothing else.** Not compute (MFU 0.00%, tensor 0.1%),
+not bandwidth (gridsample moves FEWER bytes -- same data in 3x more, smaller transfers).
+`gather` wins because it is laid out so a pixel's channels are contiguous (`[B*N, C]`, one
+descriptor covers the C-run); `F.grid_sample` works on NCHW where channels are strided by H*W.
+
+**The tool prints its own floor -- `min_desc 540672 at 1/px` -- and gather measured 1.006.
+gather is AT the theoretical minimum.** So no kernel can beat it by cutting descriptors; the
+only remaining axis is the 40.40 ns, i.e. getting off software DGE. `hardware_dynamic_dma` is
+0.1% / 0.0% on both -- everything goes through the software path today.
+
+**Frame-level consequence.** 100.45M pixel-warps x 1.006 desc/px x 40.40 ns = 4.08 s
+single-core, **~510 ms across 8 cores = ~13% of the 3900 ms frame**. That is the ENTIRE
+resample, all 448 calls, and it is already descriptor-optimal. So ~510 ms is the absolute
+ceiling on any resample optimisation, and only if the resample became free.
+
+Two per-op numbers on record are now corrected: **`gather` is 1.006 pkt/px, not 2.0** (the old
+figure was taken at 992x1280 with `--model-type unet-inference`, so it is void), while
+**`gridsample` at 3.0 and ~40 ns/descriptor are CONFIRMED** (3.004 and 40.40 vs the recorded
+~38 ns).
+
 ## Still blocking a shippable result
 
 **The baseline does not reproduce.** Same command as the README gives 4125.5 ms and

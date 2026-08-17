@@ -291,6 +291,96 @@ def warp_inventory(ph, pw):
     return sites
 
 
+def op_sites(grid="4x8", halo=128, warps=("gather",)):
+    """EVERY op the model performs, at the dimensions it performs them, weighted by calls/frame.
+
+    Nothing here is synthetic. Warp dims come from warp_inventory (which reads the model's real
+    call sites) and conv dims from conv_inventory, both evaluated at every padded tile shape the
+    grid produces. Weight is calls/frame times the cost driver for that op CLASS -- pixel-warps
+    for the resample (measured descriptor-bound: 1.006 desc/px at 40.40 ns, MFU 0.00%) and MACs
+    for the convs (dense compute) -- so the two are ranked within their class, never against each
+    other, because a pixel-warp and a MAC are not comparable units.
+
+    Returns [(cls, op, shape_str, calls, weight, unit)] sorted by weight within each class,
+    where `unit` names the piece of MODEL work the row measures -- the shape for a warp (two
+    implementations of one dim measure the same work) and site@shape for a conv (eight cb convs
+    share a shape but are eight distinct sites). Coverage is summed over units, never rows.
+    """
+    rows = []
+    shapes = tile_shapes(grid, halo)
+    wq = {}
+    for ph, pw, ntiles in shapes:
+        for _n, c, h, w, calls in warp_inventory(ph, pw):
+            wq[(c, h, w)] = wq.get((c, h, w), 0) + calls * ntiles
+    for (c, h, w), calls in wq.items():
+        shape = "%d,%d,%d" % (c, h, w)
+        for op in warps:
+            # unit = shape: two impls of one dim are two measurements of ONE piece of model work.
+            rows.append(("warp", op, shape, calls, float(h) * w * calls, shape))
+    cq = {}
+    for ph, pw, ntiles in shapes:
+        for name, grp, i, o, ih, iw, st in conv_inventory(ph, pw):
+            # Contextnet runs twice per forward (img0 and img1); everything else once per tile.
+            k = ntiles * (2 if grp == "ctx" else 1)
+            key = (name, ih, iw)
+            cq[key] = (cq.get(key, (0, 0.0))[0] + k, conv_macs(i, o, ih, iw, st))
+    for (name, ih, iw), (calls, macs) in cq.items():
+        # unit = (site, shape): eight cb convs share one shape but are eight distinct sites.
+        rows.append(("conv", name, "%d,%d" % (ih, iw), calls, macs * calls, "%s@%d,%d" % (name, ih, iw)))
+    out = []
+    for cls in ("warp", "conv"):
+        sel = sorted((r for r in rows if r[0] == cls), key=lambda r: -r[4])
+        out.extend(sel)
+    return out
+
+
+def print_op_sites(grid="4x8", halo=128, warps=("gather",), top=0, specs_only=False, only="both"):
+    """The arm list, derived. With specs_only emit `op:shape` lines the job consumes directly."""
+    rows = op_sites(grid, halo, warps)
+    if only != "both":
+        want = "warp" if only == "warps" else "conv"
+        rows = [r for r in rows if r[0] == want]
+    # Coverage is per DIMENSION, not per arm: measuring one dim with two implementations is two
+    # arms but ONE unit of the model's work, so summing arm weights would report 200% coverage.
+    dim_w = {}
+    for cls, _o, _shape, _k, wt, unit in rows:
+        dim_w[(cls, unit)] = wt
+    tot = {}
+    for (cls, _s), wt in dim_w.items():
+        tot[cls] = tot.get(cls, 0.0) + wt
+    # top applies to DIMS, keeping every implementation of each kept dim so the A/B stays paired.
+    keep = rows
+    if top:
+        keep = []
+        for cls in ("warp", "conv"):
+            dims = [u for (c, u), _w in sorted(dim_w.items(), key=lambda kv: -kv[1]) if c == cls]
+            sel = set(dims[:top])
+            keep.extend(r for r in rows if r[0] == cls and r[5] in sel)
+    if specs_only:
+        for _cls, op, shape, _k, _wt, _u in keep:
+            print("%s:%s" % (op, shape))
+        return 0
+    print("grid %s halo %d -- EVERY op the model runs, at the dims it runs them" % (grid, halo))
+    print("%-6s %-16s %-12s %8s %14s %8s %8s"
+          % ("class", "op", "shape", "calls/fr", "weight", "share%", "cum%"))
+    for cls in ("warp", "conv"):
+        cum = 0.0
+        seen = set()
+        for _c, op, shape, k, wt, unit in [x for x in keep if x[0] == cls]:
+            share = 100.0 * wt / tot[cls]
+            if unit not in seen:                   # count each unit of model work once
+                cum += share
+                seen.add(unit)
+            print("%-6s %-16s %-12s %8d %14.4g %8.2f %8.2f" % (cls, op, shape, k, wt, share, cum))
+        ndim = len([1 for (c, _s) in dim_w if c == cls])
+        if top and len(seen) < ndim:
+            print("  ^ %d of %d %s DIMS measured -- %.1f%% of %s weight NOT measured"
+                  % (len(seen), ndim, cls, 100.0 - cum, cls))
+    print()
+    print("arms selected: %d of %d" % (len(keep), len(rows)))
+    return 0
+
+
 def print_warp_sites(grid="4x8", halo=128, specs_only=False):
     """The frame-wide inventory. With specs_only, emit `C,H,W:calls_per_frame` for the job to
     consume, deduplicated across shapes, so the arm list is derived rather than hand-written."""
@@ -432,6 +522,19 @@ def main():
                          "by call count and tile multiplicity. Read this BEFORE trusting any warp "
                          "arm -- the Contextnet levels halve resolution as they double channels, "
                          "so C=128 lives at ph/16 and a C=128 arm at full tile size is fiction.")
+    ap.add_argument("--list-op-sites", action="store_true",
+                    help="EVERY op the model runs (warps AND convs) at the dims it runs them, "
+                         "weight-ordered with cumulative coverage. Nothing synthetic.")
+    ap.add_argument("--op-site-specs", action="store_true",
+                    help="machine-readable --list-op-sites: `op:shape` lines for the job.")
+    ap.add_argument("--warp-impls", default="gather",
+                    help="comma-separated warp implementations to emit arms for, e.g. "
+                         "gather,gridsample-nkl")
+    ap.add_argument("--op-site-class", default="both", choices=("warps", "convs", "both"),
+                    help="restrict --list-op-sites/--op-site-specs to one op class.")
+    ap.add_argument("--top", type=int, default=0,
+                    help="keep only the top N arms per class by weight (0 = all). A truncated run "
+                         "PRINTS what it left out -- never a silent cap.")
     ap.add_argument("--warp-site-specs", action="store_true",
                     help="machine-readable form of --list-warp-sites: `C,H,W:calls_per_frame`, "
                          "deduplicated. The job builds its arm list from this.")
@@ -443,6 +546,10 @@ def main():
     ap.add_argument("--dtype", default="fp32", choices=("fp32", "bf16"))
     ap.add_argument("--int-flow", action="store_true")
     a = ap.parse_args()
+
+    if a.list_op_sites or a.op_site_specs:
+        return print_op_sites(a.grid, a.halo, tuple(a.warp_impls.split(",")), a.top,
+                              specs_only=a.op_site_specs, only=a.op_site_class)
 
     if a.list_warp_sites or a.warp_site_specs:
         return print_warp_sites(a.grid, a.halo, specs_only=a.warp_site_specs)

@@ -74,46 +74,35 @@ spec:
               fi
               echo ""
 
+              # THE ARM LIST IS THE MODEL'S OWN OP INVENTORY. Nothing here is invented: warp
+              # dims come from the model's real call sites (6 pyramid warps at FULL tile resolution
+              # plus 4 Contextnet levels x {img0,img1}, per tile) and conv dims from conv_inventory,
+              # both evaluated at every padded shape plan_tiles produces for this grid/halo.
+              #
+              # This replaced a synthetic C=3..128 sweep at the FULL tile shape, which measured
+              # shapes the model never computes -- Contextnet's Conv2(stride=2) levels double C
+              # while QUARTERING area, so C=128 lives at 44x48 = 2,112 px, not 540,672. Chasing its
+              # "205 pkt/px" was chasing 0.1% of the work.
+              #
+              # WARP_IMPLS is the A/B. Weight-ordered, so a truncated run still covers the most
+              # work, and TOP prints exactly what it left out rather than capping silently:
+              #   the four C=3 dims alone are 90.0% of all resample work
+              #   all five C=128 dims together are 0.11%
+              WARP_IMPLS="${WARP_IMPLS:-gather,gridsample}"
+              if [ "$NKL" = "1" ]; then WARP_IMPLS="$WARP_IMPLS,gridsample-nkl"; fi
+              TOP="${TOP:-0}"          # 0 = every dim the model uses
+
               SPECS="${SPECS:-}"
               if [ -z "$SPECS" ]; then
-                case "$SET" in
-                  warps|both)
-                    # THE ARM LIST IS THE MODEL'S REAL INVENTORY, not a synthetic C sweep. The
-                    # previous version swept C=3..128 all at the FULL padded tile shape, which the
-                    # model never computes: Contextnet is four Conv2(stride=2) levels, so each step
-                    # doubles C and QUARTERS the area. C=128 lives at ph/16 x pw/16 -- 44x48 = 2,112
-                    # px, not 540,672 -- so a C=128 arm at full tile size measured a shape 256x too
-                    # large. Consequence: gridsample's "205 pkt/px at C=128" applies to ~0.12% of
-                    # the frame's pixel-warps, and weighted properly it is ~3.2x gather overall
-                    # rather than 100x, with the dominant site being C=3 at FULL resolution (54.5%
-                    # of channel-pixels, 6 calls per tile) where gridsample is only 3.0 vs ~2.0.
-                    python3 microbench.py --op x --grid "$GRID" --halo "$HALO" \
-                        --list-warp-sites | sed 's/^/  /'
-                    python3 microbench.py --op x --grid "$GRID" --halo "$HALO" \
-                        --warp-site-specs > "$OUT/warp_weights.txt"
-                    echo ""
-                    for L in $(cat "$OUT/warp_weights.txt"); do
-                      SHP=${L%%:*}                      # C,H,W   (weight after the colon)
-                      SPECS="$SPECS gather:$SHP"
-                      SPECS="$SPECS gridsample:$SHP"
-                      if [ "$NKL" = "1" ]; then SPECS="$SPECS gridsample-nkl:$SHP"; fi
-                    done
-                    ;;
-                esac
-                case "$SET" in
-                  convs|both)
-                    # The largest padded tile for this grid/halo, derived rather than hardcoded:
-                    # the conv inventory is reported at one shape and the biggest is the honest one.
-                    CS=$(python3 -c "import microbench,sys; p=microbench.tile_shapes(sys.argv[1],int(sys.argv[2]))[0]; print('%d,%d'%(p[0],p[1]))" "$GRID" "$HALO")
-                    echo "conv arms at largest padded tile: $CS"
-                    for OP in $(python3 microbench.py --op x --list-convs --shape "$CS" \
-                                | awk '$6 ~ /^-?[0-9]+$/ && $7 ~ /^[0-9.]+$/ {print $1}'); do
-                      SPECS="$SPECS $OP:$CS"
-                    done
-                    ;;
-                esac
+                python3 microbench.py --op x --grid "$GRID" --halo "$HALO" \
+                    --warp-impls "$WARP_IMPLS" --top "$TOP" --list-op-sites | sed 's/^/  /'
+                echo ""
+                # SET filters the classes: warps = the resample question, convs = dense compute.
+                SPECS=$(python3 microbench.py --op x --grid "$GRID" --halo "$HALO" \
+                    --warp-impls "$WARP_IMPLS" --top "$TOP" --op-site-specs --op-site-class "$SET" \
+                    | tr '\n' ' ')
               fi
-              echo "SET=$SET  GRID=$GRID  HALO=$HALO  NKL=$NKL"
+              echo "SET=$SET  GRID=$GRID  HALO=$HALO  NKL=$NKL  TOP=$TOP  IMPLS=$WARP_IMPLS"
               echo "arms: $(echo $SPECS | wc -w)"
               echo ""
 
