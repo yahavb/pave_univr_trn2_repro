@@ -147,7 +147,10 @@ spec:
                 #   4x8 h48  1.389x  0 of 3 shapes fuse
                 #   4x8 h64  1.535x  FUSES, and is the config that measured 3900.5 ms  <- this
                 if [ "$SET" = "gsbackends" ]; then
-                  GSG="${GSG:-4x8}"; GSH="${GSH:-64}"
+                  # GRID/HALO, the SAME knobs every other arm uses. A separate GSG/GSH pair
+                  # existed here and defaulted to 4x8/64 while the manifest declared HALO=128 --
+                  # the YAML would have said 128 while the run did 64. One set of knobs, declared.
+                  GSG="$GRID"; GSH="$HALO"
                   # the C=3 full-resolution dims: 6 of the 14 calls per tile and ~90% of the work
                   DIMS=$(python3 microbench.py --op x --grid "$GSG" --halo "$GSH" \
                          --warp-impls gather --top 4 --op-site-class warps --op-site-specs \
@@ -411,8 +414,12 @@ spec:
               value: "4"
             - name: GRID
               value: "4x8"
+            # 64, not 128: among everything tried, 4x8 halo 64 is the LEAST PADDING that
+            # actually works (padded/valid 1.535x vs h128's 2.130x, so h128 is 39% more resample
+            # work) and it is the config that measured 3900.5 ms. h128 is proven fusable and is
+            # what the ACCURACY triage needed, so switch back to 128 for accuracy questions.
             - name: HALO
-              value: "128"
+              value: "64"
             # --op sequence only
             - name: TILE
               value: "9"
