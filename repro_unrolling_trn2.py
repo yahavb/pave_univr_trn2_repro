@@ -489,6 +489,91 @@ def warp_nki(tenInput, tenFlow):
     return out.reshape(B, N, C).permute(0, 2, 1).reshape(B, C, H, W)
 
 
+# =============================================================================================
+# NKL GridSample -- the KaenaNeuronKernelLibrary kernel from CR-288764575 (ethschan)
+# =============================================================================================
+# WHY THIS ARM EXISTS. `gridsample` (F.grid_sample) is the REFERENCE every other warp is scored
+# against, and the resample is the largest device cost: 614.2 ms of 973.2 ms device-active,
+# 63.1%, against 36.9% for all 54 convs. But ATen's grid_sample cannot compile FUSED here -- it
+# OOM-killed at 169 and again at 94 min at 1500Gi -- because it lowers to 3-205x more DMA
+# descriptors than gather (3.0 pkt/px at C=3 rising to 205 at C=128). The blowup is in the
+# LOWERING, not the operation, so a single hand-written kernel is the natural fix and may well
+# fuse where ATen's expansion cannot. If it does, --fullgraph 0 is not even needed.
+#
+# TWO CONSTRAINTS COME STRAIGHT FROM THE KERNEL'S OWN ASSERTS, and both cost something here:
+#
+#  1. NHWC ONLY. The docstring advertises input_layout="NCHW" but the kernel asserts
+#     `input_layout == "NHWC"` -- "not yet implemented". Our tensors are torch NCHW, so this warp
+#     permutes in and out. That is a real layout copy on the hot path at C=3..128, and layout
+#     copies are exactly what materialise as standalone copy NEFFs. Watch for them in the
+#     per-NEFF ranking rather than assuming they are free.
+#  2. fp32 FORCES gather_method="copy". `transpose` asserts a 2-byte dtype. We run fp32 and
+#     cannot drop to bf16 (it fails the quality gate at 23.31 dB), so the faster transpose path
+#     -- which is what most of the kernel's perf tests use -- is unavailable to us. The default
+#     below picks by dtype so the assert can never fire.
+#
+# UNTESTED AT OUR SCALE, so treat a first failure as "needs tuning", not "kernel is wrong":
+#  * the CR's test matrix tops out at H,W = 200x200 sampling to H_out,W_out = 64x64. Our tiles
+#    are 704x768 -> 704x768, roughly 540k query points against ~4k. max_indices_per_indirect and
+#    the SBUF budget are where that will bite; --nkl-max-indices exposes it.
+#  * our exact combination (fp32 + bilinear + border + align_corners=True) is NOT in the matrix.
+#    The fp32 rows are bilinear/zeros/align_corners=False and nearest/border; the
+#    align_corners=True row is bf16 with zeros.
+#  * C is covered (8 to 260 tested, fp32/copy at 260) EXCEPT C=3, which is below the smallest
+#    tested channel width of 8. Several of this model's resample sites are C=3.
+_NKL_GS_FN = None
+_NKL_GATHER_METHOD = None   # set by --nkl-gather-method; None = pick by dtype
+_NKL_MAX_INDICES = None     # set by --nkl-max-indices
+
+
+def _build_gridsample_nkl():
+    """Wrap the NKL grid_sample for torch, the same way the other NKI warps are wrapped."""
+    try:
+        from nkilib.experimental.indirect.grid_sample import grid_sample
+    except ImportError as e:                                      # noqa: BLE001
+        raise SystemExit(
+            "--warp gridsample-nkl needs nkilib.experimental.indirect.grid_sample from "
+            "KaenaNeuronKernelLibrary (CR-288764575, OPEN at revision 3 -- NOT merged, so it is "
+            "not in a released image). Import failed: %s\n"
+            "Put the package on PYTHONPATH or bake it into the image. Check the import BEFORE "
+            "spending a compile budget: this raises in a second, a bad run costs hours." % e)
+    from torch_neuronx.nki_hop import wrap_nki
+    return wrap_nki(grid_sample)
+
+
+def warp_gridsample_nkl(tenInput, tenFlow):
+    """F.grid_sample semantics via the NKL kernel. Grid math is IDENTICAL to warp_gridsample so
+    the two are a true A/B -- any accuracy difference is the kernel, not the coordinates."""
+    if _RECORD:
+        CALL_SITES.append(("gridsample-nkl", tenInput.shape[1], tenInput.shape[2],
+                           tenInput.shape[3]))
+    global _NKL_GS_FN
+    if _NKL_GS_FN is None:
+        _NKL_GS_FN = _build_gridsample_nkl()
+    B, C, H, W = tenInput.shape
+    dev = tenFlow.device
+    # Copied verbatim from warp_gridsample: same linspace, same normalisation, same cat order.
+    # Channel 0 is horizontal (x, indexing W) and channel 1 vertical (y, indexing H), which is
+    # the (x, y) order the kernel's `grid` argument documents.
+    hor = torch.linspace(-1.0, 1.0, W, device=dev, dtype=tenFlow.dtype).view(1, 1, 1, W).expand(B, -1, H, -1)
+    ver = torch.linspace(-1.0, 1.0, H, device=dev, dtype=tenFlow.dtype).view(1, 1, H, 1).expand(B, -1, -1, W)
+    grid = torch.cat([hor, ver], 1)
+    f = torch.cat([tenFlow[:, 0:1] / ((W - 1.0) / 2.0), tenFlow[:, 1:2] / ((H - 1.0) / 2.0)], 1)
+    g = (grid + f).permute(0, 2, 3, 1).contiguous()               # (B, H, W, 2), last dim (x, y)
+    # gather_method="transpose" asserts a 2-byte dtype, so choose by dtype unless overridden.
+    gm = _NKL_GATHER_METHOD or ("transpose" if tenInput.element_size() == 2 else "copy")
+    value = tenInput.permute(0, 2, 3, 1).contiguous()             # NCHW -> NHWC (constraint 1)
+    out = _NKL_GS_FN(value, g,
+                     sampling_mode="bilinear",
+                     coord_mode="minus_one_one",
+                     input_layout="NHWC",
+                     align_corners=True,
+                     padding_mode="border",
+                     max_indices_per_indirect=_NKL_MAX_INDICES,
+                     gather_method=gm)
+    return out.permute(0, 3, 1, 2)                                # (B,H,W,C) -> (B,C,H,W)
+
+
 _SHIFTWARP_FN = None      # wrap_nki(shift_warp_band), built eagerly in main()
 _SHIFTWARP_R = 3          # set by --shiftwarp-radius
 _SHIFTWARP_MAXC = 3       # sites with C above this fall back; see the note in warp_shiftwarp
@@ -551,7 +636,7 @@ def warp_shiftwarp(tenInput, tenFlow):
 
 WARPS = {"gridsample": warp_gridsample, "gather": warp_gather,
          "window": warp_window, "nki": warp_nki, "nki-dyn": warp_nki,
-         "shiftwarp": warp_shiftwarp}
+         "shiftwarp": warp_shiftwarp, "gridsample-nkl": warp_gridsample_nkl}
 _WARP = warp_gridsample          # swapped by --warp; Contextnet and IFNet_m both call through it
 
 
@@ -1279,6 +1364,15 @@ def main():
     ap.add_argument("--warp", default="gather", choices=sorted(WARPS),
                     help="nki = unrolled kernel (best runtime, 80-100 min compile at 4K tiles); "
                          "nki-dyn = device-loop kernel (seconds to compile, ~2x runtime)")
+    ap.add_argument("--nkl-gather-method", choices=("transpose", "copy"), default=None,
+                    help="gridsample-nkl only. Default picks by dtype, because the kernel asserts "
+                         "gather_method='transpose' requires a 2-byte dtype -- so fp32 gets "
+                         "'copy'. Override only to test the assert or to force the slower path.")
+    ap.add_argument("--nkl-max-indices", type=int, default=None,
+                    help="gridsample-nkl only: max_indices_per_indirect, the cap on gather indices "
+                         "per batched indirect gather (None disables the batched path). This is "
+                         "THE tuning knob at our scale: the kernel's tests sample to 64x64 (~4k "
+                         "queries) while a 704x768 tile is ~540k, so the default may not fit SBUF.")
     ap.add_argument("--record-flow", action="store_true",
                     help="measure post-clamp displacement at every resample call and print a table. "
                          "Diagnostic: answers what radius a bounded-neighbourhood kernel needs. "
@@ -1375,7 +1469,20 @@ def main():
 
     global _NKI_DYN, _PRELU, _PROFILE_BLOCKS, _NKI_FN, _NKI_FN_DYN
     global _SHIFTWARP_FN, _SHIFTWARP_R, _SHIFTWARP_MAXC
+    global _NKL_GATHER_METHOD, _NKL_MAX_INDICES
     _NKI_DYN = (a.warp == "nki-dyn")
+    _NKL_GATHER_METHOD = a.nkl_gather_method
+    _NKL_MAX_INDICES = a.nkl_max_indices
+    if a.warp == "gridsample-nkl":
+        # Fail in a second rather than after a compile: the kernel is unmerged (CR-288764575 is
+        # OPEN at rev 3), so it is absent from any released image. Building the wrapper here also
+        # surfaces a wrap_nki/nki_hop mismatch before any device work starts.
+        _build_gridsample_nkl()
+        print("  --warp gridsample-nkl: NKL grid_sample imported and wrapped OK")
+        print("    gather_method=%s (fp32 must use 'copy': transpose asserts a 2-byte dtype)"
+              % (_NKL_GATHER_METHOD or ("transpose" if a.dtype == "bf16" else "copy")))
+        print("    max_indices_per_indirect=%s   value permuted NCHW->NHWC (kernel asserts NHWC)"
+              % _NKL_MAX_INDICES)
     if a.per_block:
         ap.error("--per-block is incompatible with torch.compile: it dissolves the module "
                  "boundaries the timers sit on, so the numbers would be meaningless. --fullgraph 0 "

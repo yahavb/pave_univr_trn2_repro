@@ -329,17 +329,45 @@ deterministic compiler verdicts rather than flaky runs.
   comes from the runtime INSPECT env vars, NOT from a capture command -- capture only ever
   emits `.ntff`. Expect the `.ntff` slot to need the backfill: the forward dispatches async
   and the runtime device-profiler emits nothing for async workloads.
-* **An NKI GridSample kernel (odysseyml/odyssey-trainium PR 13).** Adds `GridSample` /
-  `GridSampleBwd` to the NKL experimental kernels: nearest + bilinear, `align_corners`, [-1,1] or
-  [0,1] coords, OOB zeros/border, batched indirection via DMA transpose or copy. `GridSampleBwd`
-  is irrelevant here (inference only). Architecturally it is the right shape where `shiftwarp`
-  was wrong: shiftwarp approximated a warp as a bounded shift-sum and silently clamped past R,
-  which is why it hit 229.72 LSB against a measured 29.02 px displacement. A real grid_sample
-  with explicit OOB handling has no such approximation. Two questions decide usability:
-  **(1)** is it callable under `torch.compile(backend="neuron")` as a traceable custom op, and
-  **(2)** does it cover fp32 at C=3 through C=128? `--warp` is a pluggable selector, so wiring it
-  in is small. First test is one tile: `--cores 1 --only-tile 9 --halo 128 --fullgraph 0`, scored
-  against `gather`'s **22.38 LSB** on that exact tile.
+* **`--warp gridsample-nkl`: the NKL GridSample kernel, WIRED, never run.**
+  `CR-288764575` (`KaenaNeuronKernelLibrary`, author `ethschan`) -- **OPEN at revision 3, NOT
+  merged**, so it is absent from every released image and the arm raises `SystemExit` on import
+  until the package is on `PYTHONPATH`. Source is `@nki.jit grid_sample(value, grid,
+  sampling_mode, coord_mode, input_layout, align_corners, padding_mode,
+  max_indices_per_indirect, gather_method)` at
+  `src/nkilib_src/nkilib/experimental/indirect/grid_sample.py`.
+
+  Why it is worth running: `gridsample` is the reference every warp is scored against, the
+  resample is 63.1% of device-active time, and ATen's `grid_sample` cannot compile fused only
+  because its LOWERING explodes into descriptors. A single kernel may fuse where that expansion
+  cannot -- in which case `--fullgraph 0` is not even needed.
+
+  Every semantic matches our call exactly: `bilinear`, `border`, `align_corners=True`,
+  `minus_one_one`. Integration is the repo's existing `torch_neuronx.nki_hop.wrap_nki`, already
+  used for two `@nki.jit` kernels here. Grid math in the new warp is copied verbatim from
+  `warp_gridsample`, so an accuracy delta is the kernel and not the coordinates.
+
+  **Two constraints from the kernel's own asserts.** `input_layout` must be **NHWC** -- the NCHW
+  option in its docstring is unimplemented -- so the warp permutes in and out, which is a layout
+  copy on the hot path at C=3..128; look for it in the NEFF ranking rather than assuming it is
+  free. And `gather_method="transpose"` asserts a **2-byte dtype**, so fp32 must use `copy` and
+  the faster transpose path is unavailable (bf16 is not an option: 23.31 dB fails the gate).
+
+  **Untested where we need it.** The CR's matrix tops out at 200x200 sampling to 64x64 (~4k
+  queries); a 704x768 tile is ~540k, so `max_indices_per_indirect` is the tuning knob and is
+  exposed as `--nkl-max-indices`. Our exact combination, **fp32 + bilinear + border +
+  align_corners=True, is not in the matrix** (fp32 rows are bilinear/zeros or nearest/border; the
+  align_corners=True row is bf16/zeros). C is covered 8-260 **except C=3**, below the smallest
+  tested width, and several resample sites here are C=3.
+
+  First test, cheapest first: the microbench arm (`gridsample-nkl` at every C, `NKL=0` disables),
+  then one tile -- `--cores 1 --only-tile 9 --halo 128 --warp gridsample-nkl` -- scored against
+  `gather`'s **22.38 LSB** on that exact tile.
+
+  Architecturally it is the right shape where `shiftwarp` was wrong: shiftwarp approximated a
+  warp as a bounded shift-sum and silently clamped past R, which is why it hit 229.72 LSB against
+  a measured 29.02 px displacement. A real grid_sample with explicit OOB handling cannot fail
+  that way. `GridSampleBwd` is irrelevant here (inference only).
 * **Re-measure the microbenchmark at the fused shapes.** Every existing per-op number --
   49,278 us for gather, ~38 ns/descriptor, 2.0 packets/pixel -- was taken at 992x1280 under
   `--model-type unet-inference`. Both are now wrong for the running config: the fused shapes

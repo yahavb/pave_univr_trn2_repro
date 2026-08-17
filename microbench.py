@@ -141,8 +141,44 @@ def warp_nkishift(x, flow, radius=2):
     return out.permute(2, 0, 1).unsqueeze(0).to(x.dtype)
 
 
+def warp_gridsample_nkl(x, flow):
+    """NKL grid_sample (KaenaNeuronKernelLibrary, CR-288764575) behind F.grid_sample semantics.
+
+    Grid math is copied verbatim from warp_gridsample above so this is a true A/B against the
+    reference -- the microbench already scores every op against warp_gridsample on CPU, so any
+    accuracy delta here is the kernel and not the coordinates.
+
+    Two kernel asserts shape this call: input_layout must be NHWC (the NCHW option in the
+    docstring is unimplemented) so the value is permuted in and out, and gather_method
+    "transpose" requires a 2-byte dtype, so fp32 takes the "copy" path.
+    """
+    try:
+        from nkilib.experimental.indirect.grid_sample import grid_sample
+    except ImportError as e:                                      # noqa: BLE001
+        raise SystemExit(
+            "op gridsample-nkl needs nkilib.experimental.indirect.grid_sample from "
+            "KaenaNeuronKernelLibrary (CR-288764575, OPEN at rev 3 -- unmerged, so absent from "
+            "released images). Import failed: %s" % e)
+    from torch_neuronx.nki_hop import wrap_nki
+    B, C, H, W = x.shape
+    d = flow.device
+    hor = torch.linspace(-1.0, 1.0, W, device=d, dtype=flow.dtype).view(1, 1, 1, W).expand(B, -1, H, -1)
+    ver = torch.linspace(-1.0, 1.0, H, device=d, dtype=flow.dtype).view(1, 1, H, 1).expand(B, -1, -1, W)
+    grid = torch.cat([hor, ver], 1)
+    f = torch.cat([flow[:, 0:1] / ((W - 1.0) / 2.0), flow[:, 1:2] / ((H - 1.0) / 2.0)], 1)
+    g = (grid + f).permute(0, 2, 3, 1).contiguous()
+    gm = "transpose" if x.element_size() == 2 else "copy"
+    out = wrap_nki(grid_sample)(x.permute(0, 2, 3, 1).contiguous(), g,
+                                sampling_mode="bilinear", coord_mode="minus_one_one",
+                                input_layout="NHWC", align_corners=True,
+                                padding_mode="border", max_indices_per_indirect=None,
+                                gather_method=gm)
+    return out.permute(0, 3, 1, 2)
+
+
 OPS = {
     "gridsample": warp_gridsample,
+    "gridsample-nkl": warp_gridsample_nkl,
     "gather": warp_gather,
     "transpose": transpose_only,
     "shift": shift_only,

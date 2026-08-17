@@ -66,6 +66,15 @@ spec:
                         # Both at every C so the gap is measured per site, not assumed.
                         SPECS="$SPECS gather:$C,$S"
                         SPECS="$SPECS gridsample:$C,$S"
+                        # The NKL kernel from CR-288764575. Third arm at every (C, shape) so the
+                        # comparison that matters is direct: it against ATen gridsample, the
+                        # reference it is meant to replace, at the C where ATen's descriptor rate
+                        # explodes (205 pkt/px at C=128 vs ~2.0 for gather). Set NKL=0 to drop
+                        # these arms -- the kernel is UNMERGED and absent from released images, so
+                        # it raises SystemExit on import unless the package is on PYTHONPATH.
+                        # `if`, not `[ ] &&`: a bare && as the last statement in a loop body
+                        # leaves the loop with a non-zero status, which is a set -e hazard.
+                        if [ "${NKL:-1}" = "1" ]; then SPECS="$SPECS gridsample-nkl:$C,$S"; fi
                       done
                       SPECS="$SPECS nkishift/3:3,$S"
                     done
