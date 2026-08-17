@@ -244,6 +244,42 @@ it does reach hardware DGE -- for ~6% of the work, 94% still software. And this 
 `SET=nklsweep` sweeps the cap at the 38.75%-of-work dim. **Beating gather means ns/desc below
 40.39**; if no cap does that, the CR is a win only over an implementation this model does not use.
 
+## BLOCKED: the NKL GridSample kernel needs unmerged DGE MICROCODE
+
+Every `gridsample-nkl` number measured so far ran on the **software DGE fallback**, so none of
+them is a verdict on the kernel. The fast path needs `CR-296821015`
+(`NeuronUcode`, branch `ethschan/turbo-cayman-indirect-scatter-add`, tip `496e4aa1`):
+*"Enable turbo on Cayman, support batched indirect scatter-add"* -- `turbo_imemcopy*`,
+`dge_decode.cpp`, `dge_backend_software.*`, the `cayman/q7/pool/` DSP firmware,
+`idma_data_rings_q7.hpp`, `translate_cayman+.hpp`.
+
+The evidence that we were on the fallback was in every profile and we read it as a property of
+the kernel instead of a missing dependency:
+
+| | measured |
+|---|---|
+| `software_dynamic_dma` | ~99% of gpsimd time |
+| `hardware_dynamic_dma` | **0.0 - 0.1%** |
+| ns/descriptor | 44.2 (kernel) vs 40.4 (gather) |
+| kernel config dump | `batched_indirect_gather=False, M_batch=1` |
+
+`batched_indirect_gather=False` was not only our flag: **the ucode in this image cannot do it.**
+"turbo" IS the hardware DGE path and "batched indirect scatter-add" IS the ucode side of
+`max_indices_per_indirect`.
+
+**It cannot be side-loaded the way `nkilib` was.** It is device firmware loaded by the
+runtime/driver, not a `PYTHONPATH` addition; the CR is `[DO NOT MERGE]` with a self-imposed
+blocking comment; and **both dry-run builds FAIL** (`cayman-inkling/master` and
+`kaena-runtime/ucode`), so there is no artifact to consume.
+
+So the two numbers on record are fallback measurements and must not be quoted as the kernel's
+performance: **op-level 24.06 ms** (vs gather 21.98) and **region-split 6908.5 ms** (vs ATen 98.0
+at 128x128, i.e. ~493 ms of per-call dispatch once the kernel is not fused).
+
+**Waiting on the ucode reaching the SDK/driver.** The harness is correct and cheap; re-enable with
+`WARPCMP_ARMS="nki:gridsample-nkl:neuron aten:gridsample:neuron cpu:gridsample:cpu"` once an image
+carries it. Until then the live comparison is `gridsample` on **cpu vs neuron (ATen)**.
+
 ## Still blocking a shippable result
 
 **The baseline does not reproduce.** Same command as the README gives 4125.5 ms and

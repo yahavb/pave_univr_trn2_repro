@@ -269,13 +269,29 @@ spec:
                 # Sizes must be multiples of 32: IFBlock at scale=4 has effective stride 16 and
                 # lastconv must land back on the input size exactly; Contextnet also downsamples 16x.
                 WRES_LIST="${WARPCMP_RES:-128x128 192x224 288x320}"
+                # THE NKI ARM IS OFF, and it is blocked on firmware, not on this harness.
+                # gridsample-nkl needs the DGE microcode from CR-296821015
+                # (ethschan/turbo-cayman-indirect-scatter-add): "Enable turbo on Cayman, support
+                # batched indirect scatter-add" -- turbo_imemcopy* plus the Q7 pool firmware. That
+                # CR is [DO NOT MERGE], has a self-imposed blocking comment, and BOTH dry-run
+                # builds FAIL, so there is no artifact to consume; and it is device ucode loaded by
+                # the runtime, not something that can be put on PYTHONPATH like nkilib was.
+                #
+                # Consequence: every nkl number measured so far ran on the SOFTWARE DGE fallback --
+                # software_dynamic_dma ~99%, hardware_dynamic_dma 0.0-0.1%, 44.2 ns/descriptor
+                # against gather's 40.4, and batched_indirect_gather=False because the ucode in this
+                # image cannot do it. So the op-level 24.06 ms and the region-split 6908.5 ms are
+                # both fallback measurements and NEITHER is a verdict on the kernel.
+                # Re-enable with WARPCMP_ARMS once an image carries the merged ucode:
+                #   WARPCMP_ARMS="nki:gridsample-nkl:neuron aten:gridsample:neuron cpu:gridsample:cpu"
+                WARPCMP_ARMS="${WARPCMP_ARMS:-aten:gridsample:neuron cpu:gridsample:cpu}"
                 echo "=== MODE=warpcmp  ${WRES:-$GRID halo $HALO tile $WT}  iters $WI ==="
                 echo "    THE MODEL STAYS ON NEURON in all three arms. Only the RESAMPLE REGION"
                 echo "    differs: its own torch.compile, its own backend. So the resample is the"
                 echo "    only variable, and the region boundary is a graph break in every arm."
                 echo ""
                 for WRES in $WRES_LIST; do
-                for CFG in "nki:gridsample-nkl:neuron" "aten:gridsample:neuron" "cpu:gridsample:cpu"; do
+                for CFG in $WARPCMP_ARMS; do
                   LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; RG=${Z##*:}
                   if [ "$WP" = "gridsample-nkl" ] && ! python3 -c "import nkilib.experimental.indirect.grid_sample" 2>/dev/null; then
                     echo "SKIP $LB: nkilib not importable (CR-288764575 is unmerged; upload a tar"
@@ -317,7 +333,7 @@ spec:
                 printf "  %-10s %-8s %-14s %5s %12s %12s %10s\n" size cfg warp_region rc median_ms vs_aten first_ms
                 for WRES in $WRES_LIST; do
                 A_MS=$(grep -aoE "steady state: median [0-9.]+ ms" "$R/warpcmp_aten_${WRES}.log" 2>/dev/null | head -1 | awk '{print $4}' || true)
-                for CFG in "nki:gridsample-nkl:neuron" "aten:gridsample:neuron" "cpu:gridsample:cpu"; do
+                for CFG in $WARPCMP_ARMS; do
                   LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; RG=${Z##*:}
                   f="$R/warpcmp_${LB}_${WRES}.log"; [ -f "$f" ] || continue
                   rc=$(cat "$R/rc_warpcmp_${LB}_${WRES}.txt" 2>/dev/null || echo '?')
