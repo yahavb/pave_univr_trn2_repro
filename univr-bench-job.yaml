@@ -325,11 +325,24 @@ spec:
                     f=$(find /tmp/neff_cache -name "${h}.neff" | head -1)
                     [ -n "$f" ] && cp "$f" "$UP/" 2>/dev/null || true
                   done
+                  mkdir -p "$UP/source"
                   { echo "run       : $RUN"; echo "provenance: $GIT_BRANCH@$GIT_SHA";
                     echo "config    : ${WE_RES:-tile $WE_TILE} warp $WE_WARP --warp-region eager (fullgraph 0)";
                     echo "cc        : $(neuronx-cc --version 2>&1 | head -1)";
-                    echo "ccflags   : ${NEURON_CC_FLAGS:-<unset>}"; } > "$UP/PROVENANCE.txt"
-                  echo "  inventory:"
+                    echo "ccflags   : ${NEURON_CC_FLAGS:-<unset>}";
+                    echo "cmd [A]   : python repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 --dtype fp32 --device neuron --cores 1 --warp $WE_WARP --warp-region eager --iters $WE_ITERS --perfetto ...";
+                    echo "cmd [C]   : NEURON_RT_INSPECT_ENABLE=1 SYSTEM_PROFILE=1 DEVICE_PROFILE=1 (same args, --iters 1, no --perfetto)";
+                  } > "$UP/source/PROVENANCE.txt"
+                  cp repro_unrolling_trn2.py nki_shift_warp.py microbench.py profile_roofline.py \
+                     univr-bench-job.yaml "$UP/source/" 2>/dev/null || true
+                  cp -r scripts "$UP/source/" 2>/dev/null || true
+                  ( cd "$UP/source" && find . -type f ! -name SHA256SUMS -exec sha256sum {} + \
+                      > SHA256SUMS 2>/dev/null ) || true
+                  echo "  source/: $(find "$UP/source" -type f | wc -l) files (NOT part of the upload format --"
+                  echo "    Directory Upload reads only the TOP level, so the source sits in a subdir)"
+                  tar -czf /tmp/source_we.tar.gz -C "$UP" source 2>/dev/null || true
+                  publish /tmp/source_we.tar.gz "$RUNDIR/source.tar.gz"
+                  echo "  TOP-LEVEL inventory (what the upload tool reads):"
                   for f in "$UP"/*.neff "$UP"/*.ntff "$UP"/*.pb; do
                     [ -f "$f" ] && printf "    %-52s %s bytes\n" "$(basename "$f")" "$(wc -c < "$f")"
                   done
@@ -352,8 +365,10 @@ spec:
                 printf "    %-44s %s\n" "perfetto/graph_rankNN_<hash>.pftrace.gz" "$NPFT file(s): INSIDE each graph -> ui.perfetto.dev"
                 printf "    %-44s %s\n" "perfetto/device_${LBL}.pftrace.gz" "runtime device timeline -> ui.perfetto.dev"
                 printf "    %-44s %s\n" "perfetto/trace_${LBL}.json.gz" "host trace, resample named -> ui.perfetto.dev"
-                printf "    %-44s %s\n" "explorer/upload_bundle.tar.gz" "Neuron Explorer Directory Upload"
+                printf "    %-44s %s\n" "explorer/upload_bundle.tar.gz" "Neuron Explorer Directory Upload (+ source/ subdir)"
                 printf "    %-44s %s\n" "explorer/systrace_bundle.tar.gz" "raw all-rank runtime trace"
+                printf "    %-44s %s\n" "source.tar.gz" "the .py that ran + job YAML + SHA256SUMS"
+                printf "    %-44s %s\n" "pairs/rankNN_<hash>__<MB>MB/" "Explorer 'Individual Files': .neff + .ntff"
                 printf "    %-44s %s\n" "ranking_${LBL}.txt" "per-NEFF fixability + engine mix"
                 printf "    %-44s %s\n" "optable_${LBL}.txt" "host op table, resample vs rest"
                 echo ""
