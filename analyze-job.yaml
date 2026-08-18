@@ -58,7 +58,8 @@ spec:
               echo "restoring $(basename "$T") ($(du -h "$T" | cut -f1))"
               cp "$T" /tmp/res.tar.gz
 
-              ONLY_FIRST="${ONLY_FIRST:-1}" HEAD="${HEAD:-60}" BUCKETS="${BUCKETS:-80}" \
+              MAX_PAIRS="${MAX_PAIRS:-5}" ORDER="${ORDER:-size}" \
+                HEAD="${HEAD:-60}" BUCKETS="${BUCKETS:-80}" \
                 INGEST_TIMEOUT="${INGEST_TIMEOUT:-5400}" \
                 bash "$S/analyze_trace.sh" /tmp/res.tar.gz "$W"
               REPORT="$W/timeline_report.txt"
@@ -94,9 +95,15 @@ spec:
             # WHICH run to analyze -- the directory name under /var/mdl/univr/runs
             - name: RUN
               value: "exp_univr-288x320-gridsample-fg1_20260817_193145"
-            # 1 = only the heaviest pair (the one holding most of the capture). 0 = all of them.
-            - name: ONLY_FIRST
-              value: "1"
+            # Cap the work: ingest cost tracks trace size and a big one can take most of an hour,
+            # so an uncapped run over many pairs never finishes. 0 = no cap.
+            - name: MAX_PAIRS
+              value: "5"
+            # size = biggest traces first (what is usually wanted, and where the heavy graph is).
+            # rank = the order the benchmark measured by TIME. Whatever is skipped is listed, so a
+            # capped run cannot be mistaken for full coverage.
+            - name: ORDER
+              value: "size"
             - name: HEAD
               value: "60"
             - name: BUCKETS

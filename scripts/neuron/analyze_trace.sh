@@ -11,7 +11,8 @@
 #
 # Usage:
 #   analyze_trace.sh <pairs-dir-or-results-tar> [outdir]
-#   ONLY_FIRST=0 analyze_trace.sh ./results            # every pair, not just the heaviest
+#   MAX_PAIRS=5 analyze_trace.sh ./results              # cap the work (default 5)
+#   ORDER=rank analyze_trace.sh ./results               # by measured time, not by size
 #   HEAD=200 BUCKETS=200 analyze_trace.sh ./results/pairs
 #
 # The single implementation: analyze-job.yaml calls this same script rather than repeating it.
@@ -19,7 +20,8 @@ set -uo pipefail
 
 SRC="${1:?usage: analyze_trace.sh <pairs-dir-or-results-tar> [outdir]}"
 OUT="${2:-./trace_analysis}"
-ONLY_FIRST="${ONLY_FIRST:-1}"
+MAX_PAIRS="${MAX_PAIRS:-5}"        # how many pairs to ingest at most
+ORDER="${ORDER:-size}"            # size | rank  -- which ones those are
 HEAD="${HEAD:-60}"
 BUCKETS="${BUCKETS:-80}"
 INGEST_TIMEOUT="${INGEST_TIMEOUT:-5400}"
@@ -106,16 +108,63 @@ ingest() {
   [ "$n" -gt 0 ]
 }
 
-# ORDER: honour the rank the BENCHMARK already assigned, do not re-derive a worse one.
-# Three different orderings exist and they are not the same question:
-#   rank01..rankNN in the folder names -- assigned upstream by TOTAL TIME
-#   neff_ranking.txt                   -- by FIXABILITY (wasted time, with the engine-mix gate)
-#   file size                          -- how big the compiled graph is, which is not a cost at all
-# Sorting by size was the weakest of the three and is gone. The folder prefix is used because it
-# is already there and reflects measured time; where the two disagree, neff_ranking.txt is the one
-# to trust, because rank-1 by wall time is usually an honest matmul and NOT the thing to fix.
-# PAIRS is already sorted by name, so rank01 comes first.
-for p in "${PAIRS[@]}"; do
+# ── SELECT which pairs to ingest, and CAP it. Ingest cost scales with trace size and a big one
+# can take the better part of an hour, so with many pairs an uncapped run never finishes.
+#
+# ORDER=size (default): biggest traces first -- what you asked for, and usually where the
+#   interesting graph is. Note the cost side: the biggest traces are also the SLOWEST to ingest,
+#   so this ordering front-loads the expensive ones.
+# ORDER=rank: the order the benchmark assigned by MEASURED TIME (rank01 first). Prefer this when
+#   the question is "what dominates" rather than "what is biggest", because size is how large the
+#   compiled graph is and is not itself a cost. neff_ranking.txt is better still -- it ranks by
+#   wasted time with the engine-mix gate, and exists because rank-1 by wall time is usually an
+#   honest matmul and NOT the thing to fix.
+# Size comes from `wc -c` on the .ntff, NOT `du -sb`: -b is GNU-only, and where it is missing du
+# emits nothing, every size sorts equal, and the selection silently becomes arbitrary -- a dry run
+# on a BSD userland picked the five SMALLEST traces while reporting "ordered by size". wc -c is
+# portable and stats rather than reads (10 ms on a 1.1 GB file, measured). The .ntff is the right
+# thing to measure because it is the trace, and ingest cost tracks it.
+pair_bytes() {
+  local d="$1" f n
+  f=$(ls "$d"/*.ntff 2>/dev/null | head -1)
+  [ -n "$f" ] || { echo 0; return; }
+  n=$(wc -c < "$f" 2>/dev/null | tr -d ' ')
+  case "$n" in ''|*[!0-9]*) echo 0 ;; *) echo "$n" ;; esac
+}
+if [ "$ORDER" = "size" ]; then
+  mapfile -t SEL < <(for d in "${PAIRS[@]}"; do
+      echo "$(pair_bytes "$d") $d"; done | sort -rn | cut -d' ' -f2-)
+  # If every size came back 0 the ordering is meaningless -- say so and fall back rather than
+  # analysing an arbitrary five while claiming they are the biggest.
+  if [ "$(pair_bytes "${SEL[0]}")" = "0" ]; then
+    say "WARNING: could not size any .ntff -- falling back to ORDER=rank"
+    mapfile -t SEL < <(printf '%s\n' "${PAIRS[@]}")
+  fi
+else
+  mapfile -t SEL < <(printf '%s\n' "${PAIRS[@]}")     # already name-sorted: rank01 first
+fi
+TOTAL=${#SEL[@]}
+if [ "$MAX_PAIRS" -gt 0 ] && [ "$TOTAL" -gt "$MAX_PAIRS" ]; then
+  SKIPPED=$((TOTAL - MAX_PAIRS))
+  SEL=("${SEL[@]:0:$MAX_PAIRS}")
+else
+  SKIPPED=0
+fi
+say ""
+say "selecting $((TOTAL - SKIPPED)) of $TOTAL pairs, ordered by $ORDER (MAX_PAIRS=$MAX_PAIRS):"
+for p in "${SEL[@]}"; do
+  say "  ANALYZE  $(basename "$p")  ntff $(( $(pair_bytes "$p") / 1048576 )) MB"
+done
+# NO SILENT CAPS: what was left out is stated, so a partial run cannot read as full coverage.
+if [ "$SKIPPED" -gt 0 ]; then
+  say "  NOT ANALYZED: $SKIPPED pair(s) -- raise MAX_PAIRS to include them:"
+  for d in "${PAIRS[@]}"; do
+    inc=0; for k in "${SEL[@]}"; do [ "$k" = "$d" ] && inc=1; done
+    [ "$inc" = "0" ] && say "    skipped  $(basename "$d")  ntff $(( $(pair_bytes "$d") / 1048576 )) MB"
+  done
+fi
+
+for p in "${SEL[@]}"; do
   neff=$(ls "$p"/*.neff 2>/dev/null | head -1)
   ntff=$(ls "$p"/*.ntff 2>/dev/null | head -1)
   say ""
@@ -135,7 +184,6 @@ for p in "${PAIRS[@]}"; do
     say "  INGEST PRODUCED NO TABLES -- tail of the converter's own log:"
     tail -12 "$pq/.ingest.log" 2>/dev/null | sed 's/^/    /' | tee -a "$REPORT"
   fi
-  [ "$ONLY_FIRST" = "1" ] && { say "  (ONLY_FIRST=1 -- stopping after the top-ranked pair; set 0 for all)"; break; }
 done
 
 say ""
