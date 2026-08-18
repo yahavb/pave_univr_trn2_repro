@@ -93,19 +93,32 @@ ingest() {
   timeout "$INGEST_TIMEOUT" "$PROF" view -n "$neff" -s "$ntff" \
       --output-format parquet --output-file "$out" \
       --ignore-instruction-hierarchy --ignore-event-trace >"$out/.ingest.log" 2>&1 &
+  # STABILITY IS ONLY MEANINGFUL ONCE REAL DATA IS ON DISK. The converter writes all 47 table
+  # HEADERS immediately -- about 20 KB -- then parses for a long time before any rows land. An
+  # earlier version read "size unchanged for 30 s" as finished, killed it during that parse, and
+  # left 47 truncated files that every reader rejected with InvalidInputException. So ignore
+  # stability until the output passes a floor well above header-only, and require a much longer
+  # quiet period. du -sk not -sb: -b is GNU-only.
   local pid=$! prev=-1 cur stable=0 i
-  for i in $(seq 1 1080); do            # up to 90 min at 5 s
+  local MIN_BYTES="${INGEST_MIN_BYTES:-2000000}"
+  local NEED_STABLE="${INGEST_STABLE_CHECKS:-36}"
+  for i in $(seq 1 1080); do
     kill -0 "$pid" 2>/dev/null || break
-    cur=$(du -sb "$out" 2>/dev/null | cut -f1)
-    if [ "$cur" = "$prev" ] && [ "$cur" != "0" ]; then
-      stable=$((stable+1)); [ "$stable" -ge 6 ] && break
+    cur=$(du -sk "$out" 2>/dev/null | cut -f1); cur=$(( ${cur:-0} * 1024 ))
+    if [ "$cur" -ge "$MIN_BYTES" ] && [ "$cur" = "$prev" ]; then
+      stable=$((stable+1)); [ "$stable" -ge "$NEED_STABLE" ] && break
     else stable=0; fi
     prev="$cur"; sleep 5
   done
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
   local n; n=$(ls "$out"/*.parquet 2>/dev/null | wc -l)
   say "    parquet tables: $n   size $(du -sh "$out" 2>/dev/null | cut -f1)"
-  [ "$n" -gt 0 ]
+  # PRESENCE IS NOT SUCCESS: 47 header-only files counted as a win once and the report that
+  # followed was built on nothing. A reader has to be able to open a table AND find rows in it.
+  # PIPESTATUS, not the pipeline status: piping to tee would make this return tee's 0 and every
+  # failed ingest would read as a success -- the exact silent-success this check exists to stop.
+  "$PY" "$HERE/pq_check.py" "$out" 2>&1 | tee -a "$REPORT"
+  return "${PIPESTATUS[0]}"
 }
 
 # ── SELECT which pairs to ingest, and CAP it. Ingest cost scales with trace size and a big one
