@@ -175,6 +175,31 @@ for p in "${SEL[@]}"; do
   fi
   say "  neff $(du -h "$neff" | cut -f1)   ntff $(du -h "$ntff" | cut -f1)"
   h=$(basename "$neff" .neff); pq="$OUT/pq_$h"
+
+  # ── Try to put THIS PAIR's timeline into Perfetto.
+  # system_profile.pftrace comes from the runtime system-trace DIRECTORY and has no connection to
+  # these pairs: it shows WHEN things ran, not what ran inside a graph. Converting a pair directly
+  # would put the instruction timeline in the viewer, which is the thing worth looking at.
+  # Whether `view -n/-s` accepts the perfetto format for a PAIR is NOT established -- only
+  # summary-json, summary-text and parquet are confirmed. So attempt it and report the outcome
+  # instead of claiming the artifact exists.
+  pft="$OUT/${h}.pftrace"
+  if timeout 1800 "$PROF" view -n "$neff" -s "$ntff" \
+        --output-format perfetto --output-file "$pft" >"$OUT/.pft_$h.log" 2>&1 && [ -s "$pft" ]; then
+    gzip -f "$pft"
+    say "  PAIR TIMELINE -> $(basename "$pft").gz ($(du -h "$pft.gz" | cut -f1)) -- open in ui.perfetto.dev"
+  else
+    # some builds ignore --output-file and drop the file beside the inputs
+    alt=$(find "$(dirname "$neff")" "$OUT" -maxdepth 1 -name '*.pftrace' 2>/dev/null | head -1)
+    if [ -n "${alt:-}" ] && [ -s "$alt" ]; then
+      gzip -f "$alt"; say "  PAIR TIMELINE -> ${alt}.gz -- open in ui.perfetto.dev"
+    else
+      say "  no per-pair pftrace: this build does not emit perfetto from a neff+ntff pair. Reason:"
+      tail -4 "$OUT/.pft_$h.log" 2>/dev/null | sed 's/^/    /' | tee -a "$REPORT"
+      say "  the instruction detail is still produced as tables below"
+    fi
+  fi
+
   if ingest "$neff" "$ntff" "$pq"; then
     "$PY" "$HERE/pq_timeline.py" "$pq" "$(basename "$p")" \
         --head "$HEAD" --buckets "$BUCKETS" 2>&1 | tee -a "$REPORT"
