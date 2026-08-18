@@ -16,8 +16,11 @@ univr_warpop_*/
 *.neff
 *.pftrace
 *.pftrace.gz
-trace_rank0*.json
-trace_rank0*.json.gz
+trace_rank*.json
+trace_rank*.json.gz
+system_profile*.pftrace*
+timeline_*.tar.gz
+trace_analysis/
 results/
 upload/
 run_*/
