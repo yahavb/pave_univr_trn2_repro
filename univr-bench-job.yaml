@@ -1,28 +1,9 @@
-# UniVR 4K unrolling -- Neuron 3-run benchmark, adopting /neuron-3run-benchmark.
-#
-# Replaces the ad-hoc accuracy-triage/prod/bigtile jobs with the skill's mandatory flow and
-# its archive layout. Three things this buys that the old jobs did not have:
-#
-#   1. THE NEFF CACHE SURVIVES THE POD. Every previous job kept it at /tmp/neff_cache on the
-#      container's ephemeral layer, so it died with the pod -- univr-accuracy-triage-gmnpq lost
-#      ~3.5 h of 704x768 compiles that way, and every earlier run threw its compiles away too.
-#      Here the cache is restored from ONE tar object on the PVC and re-archived after EVERY
-#      successful compile, so a pod death costs one tile, not the set.
-#   2. A CLEAN latency number separate from a profiled one. The skill's rule: never report a
-#      profiled run's wall clock. Run 2 is the latency; run 3 is the breakdown.
-#   3. An archive split BY CONSUMER, so each artifact is one action for a human.
-#
-# S3-FUSE IS NOT POSIX. /var/mdl is Mountpoint-for-S3: every file open is a separate S3 GET, so
-# `cp -r`, `tar` over a directory, `find` or a glob on the mount stalls for minutes to hours with
-# no error. Every input and output crosses the mount as ONE tar object, extracted locally.
 apiVersion: batch/v1
 kind: Job
 metadata:
   name: univr-bench
   namespace: default
 spec:
-  # backoffLimit belongs HERE, on Job.spec. Under spec.template.spec the API server rejected one
-  # manifest outright and SILENTLY ignored it in another, so the retry simply did not exist.
   backoffLimit: 0
   template:
     metadata:
@@ -31,13 +12,6 @@ spec:
     spec:
       restartPolicy: Never
       nodeSelector:
-        # No kubernetes.io/hostname pin. Two consequences, both real:
-        #   * ip-192-168-192-40 cannot mount this PVC (the Mountpoint pod and the CSI node driver
-        #     never finish their /comm/mount.sock handshake; the pod waits 120 s and restarts). A
-        #     job landing there sits Pending on MountVolume.SetUp indefinitely.
-        #   * the image is :latest with IfNotPresent, so a different node can hold a DIFFERENT
-        #     neuronx-cc. Observed: 2.26.6360.0 on .189 vs 2.27.2878.0 elsewhere. The provenance
-        #     block prints the version -- read it before comparing any number to a past run.
         node-type: trn3-dev1
       resourceClaims:
         - name: neurons
@@ -57,9 +31,6 @@ spec:
               git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
               cd REPRO
 
-              # ── PROVENANCE part 1: which code ──
-              # A run that does not say what it ran is unfalsifiable. git clone does not echo the
-              # branch and a cold compile only proves the cache was not stale.
               GIT_SHA=$(git rev-parse HEAD); GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
               echo "┌── PROVENANCE ──"
               echo "│ branch : $GIT_BRANCH (requested: $BRANCH)"
@@ -69,36 +40,13 @@ spec:
               echo "│ ccflags: ${NEURON_CC_FLAGS:-<unset>}"
               echo "└────────────────"
 
-              # ── PROVENANCE part 2: feature confirmation ──
-              # Proves the dynamo recompile-limit fix is in the code that ran. This model needs
-              # exactly 8 graphs and dynamo's cache_size_limit defaults to 8, so it sat ON the
-              # limit and died with FailOnRecompileLimitHit under fullgraph. One tile never trips
-              # it; 8 cores always does. If these print 8/64 instead of 64/256, STOP.
               PROBE='import torch,repro_unrolling_trn2; print("cache_size_limit="+str(torch._dynamo.config.cache_size_limit), "accumulated="+str(torch._dynamo.config.accumulated_cache_size_limit))'
               echo "PROVENANCE FEATURE: $(python3 -c "$PROBE" 2>&1 | tail -1)"
               echo ""
 
-              # ============================ configuration ============================
               GRID="${GRID:-4x8}"; HALO="${HALO:-128}"; WARP="${WARP:-gather}"
               CORES="${CORES:-8}"; ITERS="${ITERS:-5}"
-              # FULLGRAPH=0 is what makes WARP=gridsample runnable at all. gridsample is the
-              # resample REFERENCE (every other warp is scored against it) and the resample is the
-              # largest device cost -- 614.2 ms of 973.2 ms device-active, 63.1%, against 36.9% for
-              # all 54 convs. It was abandoned for ONE reason: its FUSED graph exceeds compiler
-              # memory (OOM at 169 and 94 min at 1500Gi), because it issues 3-205x more DMA
-              # descriptors than gather. Allowing graph breaks removes that constraint.
-              # NOT valid with WARP=nki/nki-dyn -- the script refuses it, because a break around
-              # the view(torch.uint32) index bitcast silently corrupts which pixels are sampled.
               FULLGRAPH="${FULLGRAPH:-1}"
-              # The 8 (padded shape x triplet timestamp) slots a frame needs, one representative
-              # tile each, LARGEST FIRST. run_tiled picks the pass per tile from the merge seam --
-              # need_f = (oy+vy) > H/2, need_b = oy < H/2 -- and H/2 = 864 lands exactly on the
-              # row1/row2 boundary (4 rows x 432), so no tile needs both and each compiles exactly
-              # ONE graph. Verified against plan_tiles(1728,4096,4,8,128); measured +1 NEFF/tile.
-              #   9 /17  704x768  540,672 px      8 /16  704x640  450,560 px
-              #   1 /25  576x768  442,368 px      0 /24  576x640  368,640 px
-              # Largest first so an unfusable shape is found in ~1 h instead of after 8: a frame
-              # needs EVERY shape, so one missing graph makes the whole set worthless.
               PREWARM_TILES="${PREWARM_TILES:-9 17 8 16 1 25 0 24}"
               TOPN="${TOPN:-5}"
               REFERENCE="README trn2 eager 3673.3 ms / 0.64 LSB; g6e L40S 351.1 ms (161 ms ONNX+TRT)"
@@ -110,7 +58,6 @@ spec:
               RUNDIR="$PVC/runs/$RUN"
               CACHE_TGZ="$PVC/neff_cache_${CFG}.tar.gz"
 
-              # Local scratch. EVERYTHING is generated here and crosses the mount as one object.
               R=/tmp/results; rm -rf "$R"; mkdir -p "$R/explorer" "$R/perfetto" "$R/pairs"
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
               mkdir -p /tmp/neff_cache
@@ -118,15 +65,9 @@ spec:
               echo "════════════ NEURON 3-RUN BENCHMARK -- UniVR 4K unrolling ════════════"
               echo "  config    : $GRID halo $HALO warp $WARP  ${CORES} cores  ${ITERS} iters  fp32"
               echo "  reference : $REFERENCE"
-              # NOT printing the run dir here: RES may rewrite RUNDIR below, and printing it
-              # twice -- once wrong -- is what made it impossible to tell from a log which
-              # directory the artifacts actually went to. It is printed ONCE, after the override.
               echo "══════════════════════════════════════════════════════════════════════"
               echo ""
 
-              # ── publish helper: ONE object across the mount, verified by size, never 0 bytes ──
-              # wc -c not stat -c%s: stat -c is GNU-only and its absent-fallback makes a
-              # SUCCESSFUL copy report a mismatch.
               mkdir -p "$RUNDIR/explorer" "$RUNDIR/perfetto" || true
               publish() {
                 local src="$1" dst="$2"
@@ -142,8 +83,6 @@ spec:
                 fi
               }
 
-              # Archive the cache as ONE object. Called after EVERY successful compile, which is
-              # the whole point: gmnpq died holding ~3.5 h of uncommitted compiles.
               archive_cache() {
                 local n; n=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
                 [ "$n" -gt 0 ] || return 0
@@ -152,10 +91,6 @@ spec:
                 echo "  cache archived: $n NEFFs -> $CACHE_TGZ"
               }
 
-              # The archive MUST be a trap, not the last block: under set -euo pipefail any earlier
-              # failure skips a trailing archive and takes every artifact with it. Observed
-              # elsewhere: an unguarded glob over an empty pairs/ exited 2, pipefail propagated,
-              # and a 3.9 GB trace died with the pod.
               finalize() {
                 echo ""
                 echo "=== FINALIZE (trap EXIT -- runs even on failure) ==="
@@ -167,10 +102,8 @@ spec:
               }
               trap finalize EXIT
 
-              # ─────────────── [1/3] BUILD/LOAD: restore cache, then compile what is missing ──────
               echo "┌────────────── NEFF CACHE ──────────────"
               if [ -f "$CACHE_TGZ" ]; then
-                # Single object off the mount, extracted LOCALLY. Never tar/extract in place on S3.
                 cp "$CACHE_TGZ" /tmp/restore.tar.gz && tar -xzf /tmp/restore.tar.gz -C /tmp \
                   || echo "│ WARNING: restore failed"
                 echo "│ SOURCE : $CACHE_TGZ ($(du -h "$CACHE_TGZ" | cut -f1))"
@@ -182,13 +115,6 @@ spec:
               echo "└─────────────────────────────────────────"
               echo ""
 
-              # PROFILER CLI, resolved ONCE and early -- it is used from [3/3c] onward, and
-              # defining it in [4] meant `set -u` would have killed the run at [3/3c].
-              # neuron-profile is DEPRECATED on this image (cc 2.27): every capture failed with a
-              # banner pointing at neuron-explorer, and that silently cost a whole microbench run
-              # its descriptor data. Prefer neuron-explorer, fall back for older images. This is the
-              # CAPTURE/VIEW subcommand -- NOT the neuron-explorer view SERVER (--ingest-only,
-              # :3001/:3002), which hangs on big DMA NEFFs and must never be used.
               PROF=neuron-explorer
               command -v "$PROF" >/dev/null 2>&1 || PROF=neuron-profile
               echo "profiler CLI: $PROF"
@@ -197,32 +123,10 @@ spec:
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
               BASE="--height 1728 --width 4096 --tiles $GRID --halo $HALO --bar 3 --device neuron --dtype fp32 --fullgraph $FULLGRAPH"
 
-              # ── RES: run the WHOLE 3-run flow at a REDUCED resolution ────────────────────────
-              # One small tile instead of the 4K frame, so the compile is affordable and the
-              # profiler artifacts are small enough to actually collect. Everything downstream --
-              # the clean run, the runtime trace_info.pb bundle, the perfetto trace, the per-NEFF
-              # ranking and the pairs -- is unchanged; only the geometry shrinks.
-              #
-              # Extrapolation is legitimate for the WORK MIX and NOT for measured ratios. The mix is
-              # exactly scale-invariant (90.04% of pixel-warps at C=3 at every size, because each
-              # Contextnet level is a fixed fraction of tile area). But the warpcmp ladder showed
-              # cpu/aten drifting 0.851 -> 0.924 -> 0.967 with size, so a RATIO measured at one size
-              # does not transfer. Treat these as a profile of the op mix, not a latency forecast.
-              #
-              # Sizes must be multiples of 32: IFBlock at scale=4 has effective stride 16 and
-              # lastconv must land back on the input size exactly; Contextnet also downsamples 16x.
-              #   128x128  16,384 px    192x224  43,008 px    288x320  92,160 px
-              #   576x640 368,640 px = the real halo-64 tile, for reference
-              #
-              # NOTE ATen gridsample under fullgraph=True OOM-killed at the PRODUCTION tile (169 and
-              # 94 min at 1500Gi). At these sizes it may compile -- that is part of what this run
-              # tests, and it fails cheaply rather than after hours if it does not.
               RES="${RES:-}"
               SKIP_PROBE=0
               if [ -n "$RES" ]; then
                 RH=${RES%%x*}; RW=${RES##*x}
-                # No golden at a reduced size, so random weights and NO --gt: timing and
-                # descriptors are valid, absolute accuracy is not and none is claimed.
                 REF="--random-weights"
                 BASE="--height $RH --width $RW --tiles 1x1 --bar 3 --device neuron --dtype fp32 --fullgraph $FULLGRAPH"
                 CORES=1
@@ -234,18 +138,9 @@ spec:
                 mkdir -p "$RUNDIR/explorer" "$RUNDIR/perfetto" || true
                 echo "── REDUCED: ${RH}x${RW} = $((RH*RW)) px, 1x1, 1 core, random weights"
               fi
-              # ONE run dir in the log, after any override, so it is unambiguous which directory
-              # every artifact lands in. finalize() reads RUNDIR when it runs, so this is the value
-              # that is actually used.
               echo "  run dir   : $RUNDIR"
               echo ""
 
-              # ── nkilib restore: the NKL kernel (CR-288764575) is UNMERGED, so it is in no
-              # released image. ONE tar object off the S3-FUSE mount, extracted locally, then TEST
-              # the import and let the answer decide -- never assume, and never run an arm that can
-              # only fail. A tar built from a branch WITHOUT the CR imports fine and still lacks
-              # the kernel, which is exactly what happened three runs in a row; verify with
-              #   tar -tzf <tar> | grep grid_sample
               NKILIB_TGZ="${NKILIB_TGZ:-$PVC/nkilib.tar.gz}"
               if [ -f "$NKILIB_TGZ" ]; then
                 cp "$NKILIB_TGZ" /tmp/nkilib.tar.gz && mkdir -p /tmp/nkilib \
@@ -262,39 +157,6 @@ spec:
               fi
               echo ""
 
-              # ── MODE=warpeager: OPEN THE RESAMPLE, keep the rest compiled ───────────────────
-              # THE QUESTION: are the hotspots actually the gridsample ops? Under
-              # torch.compile(fullgraph=True) that is UNANSWERABLE from any trace taken here. The
-              # tile is one graph, so torch.profiler holds "Torch-Compiled Region" and no ops, and
-              # converting the preserved NEFF+NTFF pair gives device instructions with no Python
-              # attribution -- the 7.4 GB graph.pftrace shows WHAT ran and cannot say WHICH CALL
-              # issued it.
-              #
-              # So run the resample EAGER and everything else COMPILED: --warp-region eager. The
-              # region boundary is a real graph break (torch._dynamo.disable), so the 14 resample
-              # calls per forward dispatch op by op with a `resample:C<c>:<h>x<w>` span around each,
-              # while the 54 convs stay inside their neuron graph. Two artifacts come out of it:
-              #
-              #   HOST  trace_warpeager.json.gz -- names aten::grid_sampler_2d, its shapes and its
-              #         call count, per site. pf_op_summary.py buckets every op by whether a
-              #         resample: span CONTAINS it, which is the only sound attribution: the
-              #         lowering is index/clamp/mul arithmetic whose op names are shared with the
-              #         convs, so a name-based bucket both misses its arithmetic and steals theirs.
-              #   DEVICE the eager region compiles its OWN NEFFs -- one per (C, HxW) site instead of
-              #         one fused tile -- so the per-NEFF sweep prices the resample on device
-              #         directly. matmul~0 + DMA-dominated NEFFs are the resample; the convs carry
-              #         the matmul.
-              #
-              # WHAT IT DOES NOT ANSWER. This is not the production config: fullgraph=0 plus 14
-              # graph breaks per forward is a different regime, and the shares here are of THIS
-              # run's wall, not of the fused frame's. It says which ops the resample is made of and
-              # what they cost on device when they stand alone; it does not predict the fused
-              # frame's latency. The fused number stays MODE=full.
-              #
-              # OWN NEFF CACHE, and /tmp/neff_cache is WIPED first. The fullgraph cache restored
-              # above holds whole-tile graphs this run never executes, and [4] ranks every NEFF in
-              # the directory -- mixing them would attribute a fused graph's device time to a run
-              # that never called it.
               if [ "${MODE:-full}" = "warpeager" ]; then
                 WE_RES="${WARPEAGER_RES:-288x320}"
                 WE_WARP="${WARPEAGER_WARP:-gridsample}"
@@ -311,7 +173,7 @@ spec:
                 RUN="exp_univr-${LBL}_${TS}"
                 RUNDIR="$PVC/runs/$RUN"
                 CACHE_TGZ="$PVC/neff_cache_${LBL}.tar.gz"
-                mkdir -p "$RUNDIR/perfetto" "$RUNDIR/pairs" || true
+                mkdir -p "$RUNDIR/perfetto" "$RUNDIR/pairs" "$RUNDIR/explorer" || true
                 rm -rf /tmp/neff_cache; mkdir -p /tmp/neff_cache
                 if [ -f "$CACHE_TGZ" ]; then
                   cp "$CACHE_TGZ" /tmp/we_restore.tar.gz \
@@ -321,17 +183,12 @@ spec:
                   echo "cache: none at $CACHE_TGZ -- cold compile expected"
                 fi
                 echo "=== MODE=warpeager  ${WE_RES:-$GRID halo $HALO tile $WE_TILE}  warp $WE_WARP  iters $WE_ITERS ==="
-                # RES drives MODE=full's geometry and already rewrote REF to --random-weights above.
-                # This mode has its own WARPEAGER_RES, so say plainly that RES did nothing here
-                # rather than let two size knobs look like they agree.
                 [ -n "$RES" ] && echo "  NOTE RES=$RES is NOT used in this mode (WARPEAGER_RES is), but it did"
                 [ -n "$RES" ] && echo "       force --random-weights, so a cleared WARPEAGER_RES runs the real tile"
                 [ -n "$RES" ] && echo "       WITHOUT the golden. Clear RES too for a scored full-tile run."
                 echo "  run dir   : $RUNDIR"
                 echo ""
 
-                # ── [A] HOST ATTRIBUTION: torch.profiler over the timed loop, region eager.
-                # --perfetto is what installs the per-call span, so it is not optional here.
                 echo "--- [A] host trace with the resample OPEN (--warp-region eager --perfetto) ---"
                 set +e
                 python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
@@ -353,17 +210,10 @@ spec:
 
                 echo ""
                 echo "--- [B] op table: is the hotspot the resample? ---"
-                # The verdict table. It also states its own limit: with no NeuronProfiler rows this
-                # is HOST time, so a large share can be dispatch and a small one can hide device
-                # work behind the sync line. The device answer is [D].
                 python3 scripts/neuron/pf_op_summary.py "$R/perfetto/trace_${LBL}.json.gz" --top 25 \
                     2>&1 | tee "$R/optable_${LBL}.txt" || true
                 publish "$R/optable_${LBL}.txt" "$RUNDIR/optable_${LBL}.txt"
 
-                # ── [C] DEVICE TIMELINE for the same configuration, from the RUNTIME trace. A
-                # SEPARATE run, like [3/3a] and [3/3b] are: torch.profiler and the runtime inspector
-                # both instrument the same loop and running them together mixes two overheads into
-                # one number.
                 echo ""
                 echo "--- [C] runtime system trace -> device timeline ---"
                 SYSTRACE=/tmp/systrace_we; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
@@ -392,9 +242,6 @@ spec:
                   tail -6 "$R/perfetto/view_${LBL}.log" 2>/dev/null | sed 's/^/    /' || true
                 fi
 
-                # ── [D] PER-NEFF: with the region eager the resample has its own graphs, so this
-                # is where its DEVICE cost lives. The engine mix separates them from the body:
-                # matmul~0 + DMA-dominated is the resample, matmul>0 with tensor% high is the convs.
                 echo ""
                 echo "--- [D] per-NEFF engine breakdown (the resample now has its OWN NEFFs) ---"
                 POUT=/tmp/perneff_we; rm -rf "$POUT"; mkdir -p "$POUT"
@@ -415,8 +262,6 @@ spec:
                 python3 scripts/neuron/rank_neffs.py "$POUT" 2>&1 | tee "$R/ranking_${LBL}.txt" || true
                 publish "$R/perneff_${LBL}.txt" "$RUNDIR/perneff_${LBL}.txt"
                 publish "$R/ranking_${LBL}.txt" "$RUNDIR/ranking_${LBL}.txt"
-                # PAIRS, pre-joined: a resample NEFF is small, so its pair is cheap to keep and it
-                # is the one graph worth converting to a per-NEFF perfetto timeline by hand.
                 i=0
                 for hash in $(python3 scripts/neuron/top_neffs.py "$POUT" "${TOPN:-5}" 2>/dev/null || true); do
                   i=$((i+1))
@@ -431,9 +276,87 @@ spec:
                 [ "$i" = "0" ] && echo "  pairs/ EMPTY -- expected if the capture sweep returned 0/N"
 
                 echo ""
+                echo "--- [E] per-NEFF -> graph.pftrace (what ran INSIDE each graph) ---"
+                j=0; NPFT=0
+                for pd in "$R"/pairs/rank*/; do
+                  [ -d "$pd" ] || continue
+                  nf=$(find "$pd" -maxdepth 1 -name '*.neff' | head -1)
+                  nt=$(find "$pd" -maxdepth 1 -name '*.ntff' | head -1)
+                  [ -n "$nf" ] && [ -n "$nt" ] || continue
+                  h=$(basename "$nf" .neff); j=$((j+1))
+                  G="$R/perfetto/graph_$(printf 'rank%02d' $j)_${h:0:8}.pftrace"
+                  set +e
+                  timeout 1800 "$PROF" view -n "$nf" -s "$nt" --output-format perfetto \
+                      --output-file "$G" > "$R/perfetto/pft_${h}.log" 2>&1
+                  prc=$?
+                  set -e
+                  if [ ! -s "$G" ]; then
+                    alt=$(find "$pd" "$R/perfetto" "$(dirname "$nf")" -maxdepth 1 -name '*.pftrace' 2>/dev/null | head -1)
+                    if [ -n "${alt:-}" ] && [ -s "$alt" ] && [ "$alt" != "$G" ]; then mv "$alt" "$G"; fi
+                  fi
+                  if [ -s "$G" ]; then
+                    gzip -f "$G"
+                    echo "  $(basename "$G").gz  $(du -h "${G}.gz" | cut -f1)  -- ui.perfetto.dev"
+                    publish "${G}.gz" "$RUNDIR/perfetto/$(basename "${G}.gz")"
+                    NPFT=$((NPFT+1))
+                  else
+                    echo "  NO pftrace for ${h:0:8} (rc=$prc); tail of the view log:"
+                    tail -4 "$R/perfetto/pft_${h}.log" 2>/dev/null | sed 's/^/    /' || true
+                  fi
+                  publish "$R/perfetto/pft_${h}.log" "$RUNDIR/perfetto/pft_${h}.log"
+                done
+                [ "$j" = "0" ] && echo "  nothing to convert: [D] preserved no pairs"
+
+                echo ""
+                echo "--- [F] Neuron Explorer bundle (Directory Upload) ---"
+                BEST=$(find "$SYSTRACE" -name 'trace_info.pb' -printf '%s %h\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}' || true)
+                if [ -n "${BEST:-}" ]; then
+                  UP=/tmp/upload_bundle_we; rm -rf "$UP"; mkdir -p "$UP"
+                  cp "$BEST"/* "$UP/" 2>/dev/null || true
+                  for pd in "$R"/pairs/rank*/; do
+                    [ -d "$pd" ] || continue
+                    for f in "$pd"*.neff "$pd"*.ntff; do
+                      [ -f "$f" ] && cp "$f" "$UP/" 2>/dev/null || true
+                    done
+                  done
+                  for nt in "$UP"/*.ntff; do
+                    [ -f "$nt" ] || continue
+                    h=$(basename "$nt" .ntff); h=${h%%_rank_*}
+                    f=$(find /tmp/neff_cache -name "${h}.neff" | head -1)
+                    [ -n "$f" ] && cp "$f" "$UP/" 2>/dev/null || true
+                  done
+                  { echo "run       : $RUN"; echo "provenance: $GIT_BRANCH@$GIT_SHA";
+                    echo "config    : ${WE_RES:-tile $WE_TILE} warp $WE_WARP --warp-region eager (fullgraph 0)";
+                    echo "cc        : $(neuronx-cc --version 2>&1 | head -1)";
+                    echo "ccflags   : ${NEURON_CC_FLAGS:-<unset>}"; } > "$UP/PROVENANCE.txt"
+                  echo "  inventory:"
+                  for f in "$UP"/*.neff "$UP"/*.ntff "$UP"/*.pb; do
+                    [ -f "$f" ] && printf "    %-52s %s bytes\n" "$(basename "$f")" "$(wc -c < "$f")"
+                  done
+                  echo "  files $(ls "$UP" | wc -l)   trace_info.pb $(wc -c < "$UP/trace_info.pb" 2>/dev/null || echo MISSING) bytes"
+                  tar -czf /tmp/upload_bundle_we.tar.gz -C "$UP" . 2>/dev/null || true
+                  publish /tmp/upload_bundle_we.tar.gz "$RUNDIR/explorer/upload_bundle.tar.gz"
+                else
+                  echo "  MISSING trace_info.pb -- a Directory Upload would be REJECTED."
+                  echo "  It comes from the RUNTIME env vars in [C], not from capture; check ${LBL}_inspect.log."
+                fi
+                tar -czf /tmp/systrace_bundle_we.tar.gz -C "$SYSTRACE" . 2>/dev/null || true
+                publish /tmp/systrace_bundle_we.tar.gz "$RUNDIR/explorer/systrace_bundle.tar.gz"
+
+                echo ""
                 echo "################ WARPEAGER SUMMARY ################"
                 grep -aE "RESAMPLE spans|TRACED WALL|VERDICT INPUT|MODEL THREAD" \
                   "$R/optable_${LBL}.txt" 2>/dev/null | sed 's/^/  /' || true
+                echo ""
+                echo "  ARTIFACTS in $RUNDIR"
+                printf "    %-44s %s\n" "perfetto/graph_rankNN_<hash>.pftrace.gz" "$NPFT file(s): INSIDE each graph -> ui.perfetto.dev"
+                printf "    %-44s %s\n" "perfetto/device_${LBL}.pftrace.gz" "runtime device timeline -> ui.perfetto.dev"
+                printf "    %-44s %s\n" "perfetto/trace_${LBL}.json.gz" "host trace, resample named -> ui.perfetto.dev"
+                printf "    %-44s %s\n" "explorer/upload_bundle.tar.gz" "Neuron Explorer Directory Upload"
+                printf "    %-44s %s\n" "explorer/systrace_bundle.tar.gz" "raw all-rank runtime trace"
+                printf "    %-44s %s\n" "ranking_${LBL}.txt" "per-NEFF fixability + engine mix"
+                printf "    %-44s %s\n" "optable_${LBL}.txt" "host op table, resample vs rest"
+                echo ""
                 echo "  READ IT THIS WAY: the host share above says how much of THIS run's wall the"
                 echo "  resample spans cover; ranking_${LBL}.txt says what its OWN NEFFs cost on"
                 echo "  device. Neither is the fused frame -- fullgraph=0 with 14 breaks per forward"
@@ -443,84 +366,9 @@ spec:
                 exit 0
               fi
 
-              # ── MODE=warpcmp: the SAME MODEL, one tile, once per resample config ────────────
-              # This is the model, not a microbenchmark: repro_unrolling_trn2.py running its real
-              # op sequence -- 14 warps and 54 convs -- so it prices what no isolated op can:
-              # the two NHWC permutes the NKL kernel adds per call, and the interaction with the
-              # convs around them.
-              #
-              #   nki    --warp gridsample-nkl --device neuron --fullgraph 1
-              #   aten   --warp gridsample     --device neuron --fullgraph 0
-              #   cpu    --warp gridsample     --device cpu
-              #
-              # ONE OP, THREE LOWERINGS -- gridsample throughout, so the only variable is where and
-              # how it runs. No gather, which is a different formulation entirely.
-              #
-              # TILE: the largest shape of the least-padding geometry that works. At 4x8 halo 64
-              # that is tile 9, 576x640 = 368,640 px. Padding ratio 1.535x against h128's 2.130x,
-              # and the smaller-padding alternatives are all dead (2x8 h64 OOM, 2x4 h128 OOM,
-              # 4x8 h48 fuses 0 of 3).
-              #
-              # aten MUST take --fullgraph 0: ATen grid_sample's fused graph exceeds compiler
-              # memory, OOM-killed at 169 min and again at 94 min at 1500Gi. nki keeps fullgraph=1
-              # because a single NKI call fuses, so adopting it would not cost the fused config --
-              # that asymmetry is itself part of the answer.
               if [ "${MODE:-full}" = "warpcmp" ]; then
                 WT="${WARPCMP_TILE:-9}"; WI="${WARPCMP_ITERS:-3}"
-                # ALL THREE ARMS AT THE SAME fullgraph SETTING, and it has to be 0.
-                # This is the control. ATen grid_sample CANNOT compile fused -- its graph exceeds
-                # compiler memory, OOM-killed at 169 min and again at 94 min at 1500Gi -- so the
-                # only regime all three can share is fullgraph=0: graph breaks allowed, the
-                # resample left to whatever it lowers to, the rest compiled. Running nki at
-                # fullgraph=1 and aten at 0, as an earlier version did, meant the compilation
-                # regime varied alongside the resample and the resample was NOT the only variable.
-                #
-                # Consequence to keep in view: fullgraph=0 is NOT the production config, which is
-                # fullgraph=True. These numbers compare the three lowerings to each other; they do
-                # not predict the fused frame. The fused-config datapoint is the separate
-                # MODE=full run, and nki is the only one of the three that can even produce it.
-                # REDUCED MODE: prove the ratio fast, then confirm at full size. Set
-                # WARPCMP_RES=HxW to run ONE small tile instead of a real 4K tile.
-                # This is justified by our own data, not by hope: the op-level arms measured the
-                # gridsample/gather ratio at 2.94, 2.94 and 2.95 across three different dims, with
-                # pkt/px 1.006 vs 3.004 at every one. The cost law is PER PIXEL, so the RATIO is
-                # dim-invariant in the measured range even though the absolutes are not.
-                # Legal sizes must be multiples of 32: IFBlock at scale=4 does interpolate(1/4)
-                # then two stride-2 convs (effective stride 16) and lastconv must land back on the
-                # input size exactly, and Contextnet also downsamples 16x. 576x640 is the real
-                # tile; 288x320 is a quarter of its pixels; 192x224 is about a ninth.
-                # Random weights, since a reduced frame has no golden -- so RATIOS ONLY, and no
-                # accuracy claim. max_LSB is blank by design in this mode.
-                # A LADDER of sizes, not one. The work distribution is EXACTLY scale-invariant --
-                # 90.04% C=3 / 7.50% C=16 / 1.88% / 0.47% / 0.12% at every size, because each
-                # Contextnet level is a fixed fraction of the tile area -- so a uniformly scaled
-                # tile reflects production's work mix precisely and only the absolutes scale, as
-                # H*W. That justifies extrapolation on paper. Running a LADDER DEMONSTRATES it: if
-                # the nki:aten ratio is stable across 128x128, 192x224 and 288x320, extrapolating
-                # to the real 576x640 tile is an empirical claim rather than an assumption. If it
-                # drifts with size, extrapolation is invalid and the log says so.
-                #   128x128  x22.5 to the production tile
-                #   192x224   x8.6
-                #   288x320   x4.0
-                #   576x640   x1    the real tile (WARPCMP_RES="" runs it via --only-tile)
-                # Sizes must be multiples of 32: IFBlock at scale=4 has effective stride 16 and
-                # lastconv must land back on the input size exactly; Contextnet also downsamples 16x.
                 WRES_LIST="${WARPCMP_RES:-128x128 192x224 288x320}"
-                # THE NKI ARM IS OFF, and it is blocked on firmware, not on this harness.
-                # gridsample-nkl needs the DGE microcode from CR-296821015
-                # (ethschan/turbo-cayman-indirect-scatter-add): "Enable turbo on Cayman, support
-                # batched indirect scatter-add" -- turbo_imemcopy* plus the Q7 pool firmware. That
-                # CR is [DO NOT MERGE], has a self-imposed blocking comment, and BOTH dry-run
-                # builds FAIL, so there is no artifact to consume; and it is device ucode loaded by
-                # the runtime, not something that can be put on PYTHONPATH like nkilib was.
-                #
-                # Consequence: every nkl number measured so far ran on the SOFTWARE DGE fallback --
-                # software_dynamic_dma ~99%, hardware_dynamic_dma 0.0-0.1%, 44.2 ns/descriptor
-                # against gather's 40.4, and batched_indirect_gather=False because the ucode in this
-                # image cannot do it. So the op-level 24.06 ms and the region-split 6908.5 ms are
-                # both fallback measurements and NEITHER is a verdict on the kernel.
-                # Re-enable with WARPCMP_ARMS once an image carries the merged ucode:
-                #   WARPCMP_ARMS="nki:gridsample-nkl:neuron aten:gridsample:neuron cpu:gridsample:cpu"
                 WARPCMP_ARMS="${WARPCMP_ARMS:-aten:gridsample:neuron cpu:gridsample:cpu}"
                 echo "=== MODE=warpcmp  ${WRES:-$GRID halo $HALO tile $WT}  iters $WI ==="
                 echo "    THE MODEL STAYS ON NEURON in all three arms. Only the RESAMPLE REGION"
@@ -586,37 +434,15 @@ spec:
                     "$WRES" "$LB" "$RGL" "$rc" "${MS:--}" "$VS" "${FI:--}"
                 done
                 done
-                echo ""
-                echo "  vs_aten is the RATIO, and it is the point: if it is stable down the size"
-                echo "  column then extrapolating to the real 576x640 tile (x22.5 / x8.6 / x4.0)"
-                echo "  is empirical, not assumed. If it DRIFTS with size, extrapolation is invalid"
-                echo "  and only the largest row can be trusted."
-                echo "  The work mix is exactly scale-invariant (90.04% of pixel-warps at C=3 at"
-                echo "  every size), which is why a scaled tile reflects production at all."
-                echo "  max_LSB is absent by design: random weights, so no golden. RATIOS ONLY."
-                echo "  median_ms is ONE TILE of $GRID halo $HALO: 14 warps + 54 convs, the real"
-                echo "  sequence. x32 tiles / cores for a frame -- but the cpu arm's threads are"
-                echo "  ALREADY spent inside its number, so it does not divide by 8 the way the"
-                echo "  device arms do. That asymmetry is what makes a per-call cpu win evaporate"
-                echo "  at frame scale."
-                echo "  first_ms is compile+warmup, not latency."
                 exit 0
               fi
 
               echo "=== [1/3] BUILD/LOAD -- serial compile probe, ONE graph at a time (not timed) ==="
               if [ "$SKIP_PROBE" = "1" ]; then
-                # At 1x1 there is exactly ONE padded shape and ONE timestamp, so the 8-slot probe
-                # has nothing to probe -- the clean run below compiles it. The probe exists for the
-                # 4K frame, where 8 concurrent cold compiles OOMKilled two pods.
                 echo "  SKIPPED: reduced geometry has a single shape; the clean run compiles it"
                 PW_ALL=1
               else
               echo "tiles (largest shape first): $PREWARM_TILES"
-              # SERIAL IS LOAD-BEARING. torch.compile is LAZY: neuronx-cc does not run until first
-              # call, inside run_tiled's ThreadPoolExecutor(max_workers=ncore). So --cores 8 on a
-              # cold cache runs EIGHT CONCURRENT compiles and peaks at the sum of eight -- that is
-              # what OOMKilled univr-accuracy-triage-rh7rz (8 h) and -jcbd4 (5 h32m), NOT the tile
-              # shape. Every FUSES verdict on record was taken one compile at a time.
               PW_ALL=1
               for T in $PREWARM_TILES; do
                 TAG="pw_${CFG}_t${T}"
@@ -639,9 +465,6 @@ spec:
                 else
                   PW_ALL=0
                   echo "  tile $T  ${SH:--}  FAILED rc=$rc  ${MIN} min  cache=$A2"
-                  # || true is REQUIRED: under pipefail a grep that matches nothing exits 1 and
-                  # set -e would kill the job right before the artifacts get published. An OOM
-                  # leaves no in=/out= operand, so no-match is the EXPECTED case here.
                   { grep -aoE "got in=[0-9]+ and out=[0-9]+|Instructions generated by compiler [0-9]+ exceeds the typical limit of [0-9]+|MemoryError|Killed" \
                     "$R/${TAG}.log" || true; } | head -2 | sed 's/^/      /'
                   echo "  ==> a required graph is missing; abandoning the remaining probe tiles"
@@ -656,18 +479,10 @@ spec:
 
               T_CLEAN=""; LSB=""; PSNR=""; GATE=""
               if [ "$PW_ALL" != "1" ]; then
-                echo "=== [2/3] and [3/3] SKIPPED: a required graph is missing ==="
-                echo "  A frame needs every distinct (shape x timestamp). Tiles of a missing shape"
-                echo "  are never written and the run dies with uncovered pixels (rc=139)."
-                echo "  rc=137/Killed above is a REAL per-compile OOM at a named shape -- the"
-                echo "  serial ceiling result the two concurrent-compile OOMs could not establish."
+                echo "  "
               else
 
-              # ─────────────── [2/3] CLEAN RUN -- THE latency. No profiler, no INSPECT. ───────────
               echo "=== [2/3] CLEAN RUN (NO profiler) -- median of $ITERS = THE REAL LATENCY ==="
-              # --save-ref is the output-correctness gate: latency on a model producing garbage is
-              # worthless, and a faster config is often faster because it computes less. It writes
-              # npy + PNG preview + a sha256 provenance manifest.
               set +e
               python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \
                   --cores "$CORES" --warp "$WARP" --iters "$ITERS" \
@@ -684,23 +499,10 @@ spec:
               echo "  NEFFs now $NEW (was $CACHE_BEFORE at entry, expected +0 after the probe --"
               echo "  any increase means the probe missed a slot and compiles ran CONCURRENTLY here)"
               archive_cache
-              # Publish the artifact the MOMENT it exists: the profiling stages run longer than the
-              # workload and fail more often, and a frame that finished should not be hostage.
               publish "$R/frame_${CFG}_${WARP}.png" "$RUNDIR/frame_${CFG}_${WARP}.png"
               publish "$R/frame_${CFG}_${WARP}.json" "$RUNDIR/frame_${CFG}_${WARP}.json"
-              echo ""
-              echo "  ##################################################################"
-              echo "  #  VALIDATE THE OUTPUT before trusting any number above.         #"
-              echo "  #  kubectl cp <pod>:$R/frame_${CFG}_${WARP}.png ./f.png && open ./f.png"
-              echo "  #  provenance: $GIT_BRANCH@$GIT_SHA                              #"
-              echo "  ##################################################################"
-              echo ""
 
-              # ─────────────── [3/3] PROFILED RUNS -- overhead delta + the two bundles ───────────
               echo "=== [3/3a] PROFILED RUN -- runtime system trace (trace_info.pb) ==="
-              # trace_info.pb comes from the RUNTIME, not from neuron-profile capture (capture only
-              # ever emits .ntff). If OUTPUT_DIR is unset the runtime writes to ./output and it is
-              # lost with the pod, so it is always set explicitly.
               SYSTRACE=/tmp/systrace; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
               set +e
               NEURON_RT_INSPECT_ENABLE=1 \
@@ -716,10 +518,6 @@ spec:
               echo "  rank subdirs       : $(find "$SYSTRACE" -maxdepth 1 -type d -name 'i-*' | wc -l)"
               echo ""
 
-              # COMPILED, fullgraph=True, like every other stage. torch.profiler cannot see inside
-              # a single compiled graph -- a measured trace held two "Torch-Compiled Region" entries
-              # and no ops -- so this file is kept only for the host-side picture. The Perfetto
-              # trace with real device activity comes from [3/3c] below, off the runtime trace.
               echo "=== [3/3b] PROFILED RUN -- torch.profiler (host view only) ==="
               set +e
               python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \
@@ -729,12 +527,6 @@ spec:
               set -e
               publish "$R/perfetto/trace_rank0.json.gz" "$RUNDIR/perfetto/trace_rank0.json.gz"
 
-              # The torch.profiler route above fell back to "CPU rows only" because the
-              # NeuronProfiler import failed, so it carries no DEVICE timeline -- hence ~0 MB.
-              # The runtime system trace already holds the device timeline, and the profiler CLI
-              # converts it straight to a Perfetto trace. This is the artifact to drag into
-              # ui.perfetto.dev for device activity; the torch.profiler json is still worth keeping
-              # because it is the only one that names the PYTHON LINE behind a copy or a DMA.
               echo "--- [3/3c] systrace -> perfetto (device timeline, via $PROF view -d) ---"
               set +e
               timeout 900 "$PROF" view -d "$SYSTRACE" --output-format perfetto \
@@ -751,11 +543,7 @@ spec:
               fi
               echo ""
 
-              # ─────────────── [4] per-NEFF: capture -> summary-json -> rank by FIXABILITY ───────
               echo "=== [4] per-NEFF engine breakdown + fixability ranking ==="
-              # NEVER the neuron-explorer view SERVER (--ingest-only, the
-              # :3001/:3002/:8086 UI, SQL-over-curl) -- it hangs on big DMA NEFFs on this image.
-              # Only summary-json and summary-text work; --output-format json returns EMPTY.
               POUT=/tmp/perneff; rm -rf "$POUT"; mkdir -p "$POUT"
 
               mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)
@@ -771,13 +559,7 @@ spec:
                 [ -s "$POUT/${hash}.json" ] && OK=$((OK+1))
               done
               echo "  captured+viewed OK: $OK / ${#NEFFS[@]}"
-              # 0 / N is EXPECTED on a collective-bearing model (--single-io deadlocks the
-              # multi-rank bootstrap). It costs the pairs/, not the system bundle, which is why
-              # [3/3a] runs first.
               python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$R/perneff_breakdown.txt" || true
-              # Rank by FIXABILITY (time-weighted idle), not wall time, with the engine-mix gate:
-              # a NEFF with matmul>0 and tensor%>~40 is REAL COMPUTE and is not fixable no matter
-              # what its source line looks like.
               python3 scripts/neuron/rank_neffs.py "$POUT" 2>&1 | tee "$R/neff_ranking.txt" || true
               publish "$R/neff_ranking.txt" "$RUNDIR/neff_ranking.txt"
 
@@ -792,13 +574,8 @@ spec:
                 echo "  no dominant NEFF (capture sweep returned nothing) -- skip"
               fi
 
-              # ─────────────── [5] pairs/: pre-joined, rank-ordered. NEVER split a pair. ─────────
               echo ""
               echo "=== [5] preserve top-$TOPN heavy NEFF+NTFF pairs, PRE-JOINED ==="
-              # The .neff and its .ntff must never land in different dirs -- that join is the
-              # atomic unit of per-NEFF analysis, and reconstructing it by filename stem is where
-              # wrong attribution creeps in. Use ONLY the no-suffix <hash>.ntff: the per-rank
-              # profiler also emits <hash>_rank_0..N.ntff decoys on the same stem.
               i=0
               for hash in $(python3 scripts/neuron/top_neffs.py "$POUT" "$TOPN" 2>/dev/null || true); do
                 i=$((i+1))
@@ -813,36 +590,18 @@ spec:
               done
               [ "$i" = "0" ] && echo "  pairs/ EMPTY -- expected if the capture sweep returned 0/N"
 
-              # ─────────────── [6] explorer/: one-rank upload bundle + the raw all-rank tar ──────
               echo ""
               echo "=== [6] explorer bundles ==="
-              # ONE rank, not all of them: an SPMD model runs the identical graph on every rank, so
-              # one rank's trace IS the trace (a 32-rank tree measured 5409 files / ~3.9 GB). Pick
-              # the LARGEST trace_info.pb -- size tracks event count and the default 3M buffer
-              # drops events on a deep model, so the largest is the least truncated.
               BEST=$(find "$SYSTRACE" -name 'trace_info.pb' -printf '%s %h\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}' || true)
               if [ -n "${BEST:-}" ]; then
                 UP=/tmp/upload_bundle; rm -rf "$UP"; mkdir -p "$UP"
                 cp "$BEST"/* "$UP/" 2>/dev/null || true
-                # The Directory Upload mode requires trace_info.pb and OPTIONALLY accepts *.pb,
-                # .ntff and .neff -- include them so one upload also serves device- and
-                # instruction-level analysis. Pair by content hash: the cache is
-                # content-addressed, so a hash names its NEFF exactly. Reading a .ntff against the
-                # WRONG .neff yields attribution that is confidently wrong, worse than none.
-                # The runtime names its NEFFs neff_<id>_vnc_<n>.neff -- NOT content-addressed --
-                # so pairing an .ntff stem against <hash>.neff in the cache NEVER matched and the
-                # bundle came out with only the 4 small runtime NEFFs. The NEFF that matters is the
-                # content-addressed one the per-NEFF sweep captured: 44 MB, 764 ms, ~42% of the
-                # whole capture sum. Copy the preserved pairs in directly -- the Directory Upload
-                # mode takes .neff and .ntff as optional inputs, and including them is what makes
-                # ONE upload serve system-, device- AND instruction-level analysis.
                 for pd in "$R"/pairs/rank*/; do
                   [ -d "$pd" ] || continue
                   for f in "$pd"*.neff "$pd"*.ntff; do
                     [ -f "$f" ] && cp "$f" "$UP/" 2>/dev/null || true
                   done
                 done
-                # Whatever the runtime itself dumped, paired by its own naming, kept as well.
                 for nt in "$UP"/*.ntff; do
                   [ -f "$nt" ] || continue
                   h=$(basename "$nt" .ntff); h=${h%%_rank_*}
@@ -864,9 +623,8 @@ spec:
               tar -czf /tmp/systrace_bundle.tar.gz -C "$SYSTRACE" . 2>/dev/null || true
               publish /tmp/systrace_bundle.tar.gz "$RUNDIR/explorer/systrace_bundle.tar.gz"
 
-              fi   # end PW_ALL guard
+              fi
 
-              # ─────────────── the report ───────────────
               echo ""
               echo "################ UNIVR BENCH -- $RUN"
               echo "  provenance   : $GIT_BRANCH@${GIT_SHA:0:8}   cc $(neuronx-cc --version 2>&1 | head -1 | awk '{print $NF}')"
@@ -880,7 +638,6 @@ spec:
               echo ""
               echo "  probe (serial, one graph at a time):"
               printf "    %-6s %-10s %9s %5s %6s\n" tile padded px rc min
-              # Guard the redirect: an absent probe_table.txt would make set -e abort the report.
               if [ -f "$R/probe_table.txt" ]; then
                 while read -r t sh rc mn; do
                   px=$(echo "$sh" | awk -Fx 'NF==2{print $1*$2}')
@@ -889,30 +646,6 @@ spec:
               else
                 echo "    (no probe rows)"
               fi
-              echo ""
-              echo "  HOW TO OPEN EACH ARTIFACT (one action each, nothing to reconcile):"
-              echo "   * explorer/upload_bundle.tar.gz -> untar, then neuron-explorer"
-              echo "     'Directory Upload For System Profile'. WHEN ops run + inter-NEFF gaps."
-              echo "   * perfetto/system_profile.pftrace.gz -> drag into ui.perfetto.dev. THE"
-              echo "     DEVICE TIMELINE, converted from the runtime system trace."
-              echo "   * perfetto/trace_rank0.json.gz  -> also ui.perfetto.dev. Names the PYTHON"
-              echo "     LINE behind a copy or DMA, but carries no device rows unless a"
-              echo "     NeuronProfiler was importable -- the log says which."
-              echo "     The ONLY artifact that names the Python line behind a copy or DMA."
-              echo "   * pairs/rankNN_*/              -> 'Individual Files': the .neff and .ntff in"
-              echo "     that folder are the only two files there. WHAT op inside a hot NEFF."
-              echo "   * neff_ranking.txt             -> start analysis HERE, not from a wall of hashes."
-              echo "   * frame_*.png                  -> eyeball it. No latency number counts until you do."
-              echo ""
-              echo "  CAVEATS that decide whether these numbers are comparable:"
-              echo "   * engine SHARES are stable across runs; absolute single-io us are NOISE (a"
-              echo "     NEFF measured 535,000 us in one capture and vanished in the next)."
-              echo "   * latency comes from run [2/3] ONLY. Never quote [3/3]'s wall clock."
-              echo "   * the eager baseline (3673.3 ms / 0.64 LSB) CANNOT be reproduced here: the"
-              echo "     eager path was removed from the script. Fused compares only to fused."
-              echo "   * check the cc version against the run you are comparing to. :latest differs"
-              echo "     per node (2.26.6360.0 vs 2.27.2878.0 observed)."
-              echo "Done."
           resources:
             claims:
               - name: neurons
@@ -921,9 +654,6 @@ spec:
               memory: 248Gi
             limits:
               cpu: 150
-              # 1800Gi, matching prod-4x8-halo64 -- the only 8-core run that ever completed. The
-              # serial probe should keep compile memory well under this, but there is no reason to
-              # run below the one level known to work.
               memory: 1800Gi
           volumeMounts:
             - name: dshm
@@ -935,62 +665,26 @@ spec:
               value: "1"
             - name: BRANCH
               value: "main"
-            # MODE=warpcmp: the same MODEL, one tile, once per resample config -- nki / aten / cpu.
-            # MODE=warpeager: the resample EAGER, everything else compiled, so a trace can NAME the
-            #   gridsample ops. Answers "is the hotspot the resample", which fullgraph=True makes
-            #   unanswerable (one graph -> "Torch-Compiled Region" and no ops). NOT a latency config.
-            # MODE=full (default): the 3-run benchmark, serial 8-graph probe then the 8-core arm.
-            # full = the 3-run benchmark: build/load, CLEAN run (the only latency), then the
-            # profiled runs that produce the explorer bundle and the perfetto trace.
             - name: MODE
               value: "full"
-            # 64, not 128: the least-padding geometry that actually works (padded/valid 1.535x vs
-            # h128's 2.130x, so h128 is 39% more resample work) and the config that measured
-            # 3900.5 ms. Use 128 for accuracy questions, which is what the triage needed it for.
             - name: HALO
               value: "64"
             - name: GRID
               value: "4x8"
-            # REDUCED resolution for the whole flow: one small tile, so the compile is affordable
-            # and the profiler artifacts are collectable. 128x128 / 192x224 / 288x320 are the
-            # ladder sizes; 576x640 is the real halo-64 tile. Multiples of 32 only.
-            # Clear RES to run the real 4K frame.
             - name: RES
               value: "288x320"
             - name: WARP
               value: "gridsample"
-            # fullgraph=1: ONE fused graph, no --warp-region. ATen gridsample OOM-killed at the
-            # PRODUCTION tile this way (169 and 94 min); at 288x320 it may well compile, and that
-            # is part of what this run answers.
             - name: FULLGRAPH
               value: "1"
-            # tile 9 = 576x640 = 368,640 px, the LARGEST shape at 4x8 halo 64
             - name: WARPCMP_TILE
               value: "9"
-            # REDUCED MODE, to cut turnaround. Set to HxW (multiple of 32) to run ONE small tile
-            # with random weights instead of a real 4K tile: 288x320 is a quarter of 576x640's
-            # pixels, 192x224 about a ninth. Justified because the cost law is per-pixel and the
-            # measured gridsample/gather ratio held at 2.94/2.94/2.95 across three dims. Prove the
-            # RATIO here, then clear WARPCMP_RES to confirm the absolutes at the real tile.
-            # Random weights => no golden => max_LSB is blank by design. Ratios only.
-            # A LADDER, smallest first: prove the ratio cheap, then watch whether it holds as
-            # size grows. If nki:aten is stable across all three, extrapolating to the real
-            # 576x640 tile (x22.5 / x8.6 / x4.0 respectively) is empirical rather than assumed.
-            # The work distribution is EXACTLY scale-invariant (90.04% of pixel-warps at C=3 at
-            # every size), which is why this works at all.
             - name: WARPCMP_RES
               value: "128x128 192x224 288x320"
-            # MODE=warpeager knobs. ONE size, not a ladder: this mode is an attribution run, not a
-            # ratio measurement, so a second size buys nothing. 288x320 keeps the 14 sites at their
-            # real C values (3/16/32/64/128) and the compile affordable. Clear WARPEAGER_RES to run
-            # the real 4x8 halo-64 tile WARPEAGER_TILE with the golden weights instead.
             - name: WARPEAGER_RES
               value: "288x320"
             - name: WARPEAGER_WARP
               value: "gridsample"
-            # 3 iterations, so the per-site table averages over 42 calls rather than 14 and one
-            # cold call cannot set the mean. The first call is excluded already: it is the
-            # compile/warmup call, before the timed loop the profiler wraps.
             - name: WARPEAGER_ITERS
               value: "3"
             - name: WARPEAGER_TILE
@@ -1001,24 +695,14 @@ spec:
               value: "8"
             - name: NEURON_RT_VISIBLE_CORES
               value: "0-7"
-            # MUST NOT contain --model-type unet-inference: it is the single cause of the
-            # NCC_EBIR033 DMA rejection. 8 arms on one fixed shape, every arm carrying it rejected
-            # at the identical in=23,040 and every arm without it fused. The VALUE is what matters
-            # -- transformer and generic both work; --lnc is irrelevant to it.
             - name: NEURON_CC_FLAGS
               value: "--lnc 1"
-            # Required at COMPILE time, not just at capture time, or
-            # Instruction.bir_debug_info_source_location is NULL on every row and step [5] cannot
-            # trace a hot instruction back to a source line.
             - name: XLA_IR_DEBUG
               value: "1"
             - name: XLA_HLO_DEBUG
               value: "1"
             - name: NEURON_FRAMEWORK_DEBUG
               value: "1"
-            # NEURON_RT_INSPECT_* are deliberately NOT set here. Inspect writes trace data on every
-            # dispatch, which would distort the [2/3] median that is the whole point. Stage [3/3a]
-            # exports them itself, on its own short run.
             - name: TORCH_NEURONX_NEFF_CACHE_DIR
               value: "/tmp/neff_cache"
             - name: OMP_NUM_THREADS
