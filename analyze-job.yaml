@@ -45,6 +45,34 @@ spec:
               echo "commit $(cd REPRO && git rev-parse HEAD)"
               S=/tmp/REPRO/scripts/neuron
 
+              # THE src= LINE NUMBERS IN THE REPORT BELONG TO THE COMMIT THAT BUILT THE NEFF, not to
+              # whatever main is today. Resolving them against a newer checkout silently points at
+              # the wrong lines -- an earlier report named `super().__init__()` and two `deconv(...)`
+              # constructor lines as the DMA sites, which is nonsense produced by a 28-line drift.
+              # The run's own source.tar.gz records the sha, so use it and say which one won.
+              NEFF_SHA=""
+              if [ -f "$SRC/source.tar.gz" ]; then
+                cp "$SRC/source.tar.gz" /tmp/runsrc.tar.gz \
+                  && mkdir -p /tmp/runsrc && tar -xzf /tmp/runsrc.tar.gz -C /tmp/runsrc \
+                  && NEFF_SHA=$(sed -n 's/^provenance *: *[^@]*@\([0-9a-f]\{7,40\}\).*/\1/p' \
+                       /tmp/runsrc/source/PROVENANCE.txt 2>/dev/null | head -1)
+              fi
+              if [ -n "${NEFF_SHA:-}" ]; then
+                if (cd REPRO && git checkout -q "$NEFF_SHA" 2>/dev/null); then
+                  echo "src= lines resolve against $NEFF_SHA (the commit that BUILT these NEFFs)"
+                else
+                  echo "WARNING: $NEFF_SHA not fetchable; src= lines are resolved against $(cd REPRO && git rev-parse --short HEAD) and MAY BE WRONG"
+                fi
+                # The ANALYSIS scripts must stay at the version being run, only the SOURCE view moves.
+                git clone -q -b "${BRANCH:-main}" \
+                  https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git TOOLS
+                S=/tmp/TOOLS/scripts/neuron
+              else
+                echo "WARNING: no source.tar.gz/PROVENANCE.txt in the run dir, so the commit that"
+                echo "  built these NEFFs is UNKNOWN. Every src=<file>:<line> below is resolved"
+                echo "  against $(cd REPRO && git rev-parse --short HEAD) and may name the wrong line."
+              fi
+
               # ONE implementation: the same script you can run directly on any Linux host with the
               # SDK. Duplicating the ingest loop here would let the two drift, and a drifted
               # analysis still looks authoritative.
@@ -94,8 +122,8 @@ spec:
               echo "Done."
           resources:
             requests:
-              cpu: 16
-              memory: 64Gi
+              cpu: 32
+              memory: 128Gi
             limits:
               cpu: 48
               # A 1.1 GB trace expands substantially in memory during conversion; this is the
@@ -111,7 +139,7 @@ spec:
               value: "1"
             # WHICH run to analyze -- the directory name under /var/mdl/univr/runs
             - name: RUN
-              value: "exp_univr-288x320-gridsample-fg1_20260817_193145"
+              value: "exp_univr-warpeager_gridsample_288x320_20260818_122633"
             # Cap the work: ingest cost tracks trace size and a big one can take most of an hour,
             # so an uncapped run over many pairs never finishes. 0 = no cap.
             - name: MAX_PAIRS
