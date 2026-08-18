@@ -118,7 +118,9 @@ spec:
               echo "════════════ NEURON 3-RUN BENCHMARK -- UniVR 4K unrolling ════════════"
               echo "  config    : $GRID halo $HALO warp $WARP  ${CORES} cores  ${ITERS} iters  fp32"
               echo "  reference : $REFERENCE"
-              echo "  run dir   : $RUNDIR"
+              # NOT printing the run dir here: RES may rewrite RUNDIR below, and printing it
+              # twice -- once wrong -- is what made it impossible to tell from a log which
+              # directory the artifacts actually went to. It is printed ONCE, after the override.
               echo "══════════════════════════════════════════════════════════════════════"
               echo ""
 
@@ -231,9 +233,12 @@ spec:
                 CACHE_TGZ="$PVC/neff_cache_${RES}_fg${FULLGRAPH}.tar.gz"
                 mkdir -p "$RUNDIR/explorer" "$RUNDIR/perfetto" || true
                 echo "── REDUCED: ${RH}x${RW} = $((RH*RW)) px, 1x1, 1 core, random weights"
-                echo "   run dir $RUNDIR"
-                echo ""
               fi
+              # ONE run dir in the log, after any override, so it is unambiguous which directory
+              # every artifact lands in. finalize() reads RUNDIR when it runs, so this is the value
+              # that is actually used.
+              echo "  run dir   : $RUNDIR"
+              echo ""
 
               # ── nkilib restore: the NKL kernel (CR-288764575) is UNMERGED, so it is in no
               # released image. ONE tar object off the S3-FUSE mount, extracted locally, then TEST
