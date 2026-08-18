@@ -681,7 +681,7 @@ spec:
             - name: BRANCH
               value: "main"
             - name: MODE
-              value: "full"
+              value: "warpeager"
             - name: HALO
               value: "64"
             - name: GRID
