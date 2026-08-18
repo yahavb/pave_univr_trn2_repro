@@ -8,3 +8,18 @@ univr_microbench_*/
 univr_warpop_*/
 *.ntff
 *.tar.gz
+
+# Downloaded run artifacts. NEVER commit these -- a NEFF is tens of MB and GitHub
+# rejects at 100 MB. `git add -A` in this repo committed a 44 MB .neff once; use
+# explicit paths.
+.DS_Store
+*.neff
+*.pftrace
+*.pftrace.gz
+trace_rank0*.json
+trace_rank0*.json.gz
+results/
+upload/
+run_*/
+frame_*.png
+frame_*.npy
