@@ -158,7 +158,11 @@ spec:
               echo ""
 
               if [ "${MODE:-full}" = "warpeager" ]; then
-                WE_RES="${WARPEAGER_RES:-288x320}"
+                # NO COLON in the default: ${VAR:-d} substitutes d when VAR is unset OR EMPTY, so
+                # clearing WARPEAGER_RES to ask for the real tile silently ran 288x320 instead --
+                # a whole run at the wrong geometry that still logged as a success. ${VAR-d} honours
+                # an explicitly empty value, which is the only way to SAY "full tile".
+                WE_RES="${WARPEAGER_RES-288x320}"
                 WE_WARP="${WARPEAGER_WARP:-gridsample}"
                 WE_ITERS="${WARPEAGER_ITERS:-3}"
                 WE_TILE="${WARPEAGER_TILE:-9}"
@@ -183,6 +187,11 @@ spec:
                   echo "cache: none at $CACHE_TGZ -- cold compile expected"
                 fi
                 echo "=== MODE=warpeager  ${WE_RES:-$GRID halo $HALO tile $WE_TILE}  warp $WE_WARP  iters $WE_ITERS ==="
+                if [ -n "$WE_RES" ]; then
+                  echo "  geometry  : REDUCED ${WE_RES} 1x1, random weights (WARPEAGER_RES is set)"
+                else
+                  echo "  geometry  : REAL TILE $GRID halo $HALO --only-tile $WE_TILE, golden weights"
+                fi
                 [ -n "$RES" ] && echo "  NOTE RES=$RES is NOT used in this mode (WARPEAGER_RES is), but it did"
                 [ -n "$RES" ] && echo "       force --random-weights, so a cleared WARPEAGER_RES runs the real tile"
                 [ -n "$RES" ] && echo "       WITHOUT the golden. Clear RES too for a scored full-tile run."
@@ -383,7 +392,9 @@ spec:
 
               if [ "${MODE:-full}" = "warpcmp" ]; then
                 WT="${WARPCMP_TILE:-9}"; WI="${WARPCMP_ITERS:-3}"
-                WRES_LIST="${WARPCMP_RES:-128x128 192x224 288x320}"
+                # Same no-colon rule as WARPEAGER_RES: WARPCMP_RES="" means the REAL tile via
+                # --only-tile, and with :- it would have silently re-run the reduced ladder.
+                WRES_LIST="${WARPCMP_RES-128x128 192x224 288x320}"
                 WARPCMP_ARMS="${WARPCMP_ARMS:-aten:gridsample:neuron cpu:gridsample:cpu}"
                 echo "=== MODE=warpcmp  ${WRES:-$GRID halo $HALO tile $WT}  iters $WI ==="
                 echo "    THE MODEL STAYS ON NEURON in all three arms. Only the RESAMPLE REGION"
