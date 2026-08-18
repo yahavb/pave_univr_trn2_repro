@@ -203,6 +203,22 @@ for p in "${SEL[@]}"; do
   if ingest "$neff" "$ntff" "$pq"; then
     "$PY" "$HERE/pq_timeline.py" "$pq" "$(basename "$p")" \
         --head "$HEAD" --buckets "$BUCKETS" 2>&1 | tee -a "$REPORT"
+    # ── WHAT RAN INSIDE THE GRAPH, in ui.perfetto.dev.
+    # The runtime's system trace converts to Perfetto directly but shows WHEN graphs ran, not what
+    # ran inside one. Try the tool's own pair->perfetto conversion first; only summary and table
+    # formats are confirmed for a pair, so if it declines, build the trace from the instruction
+    # table instead -- deterministic, since the conversion is ours: one slice per instruction, one
+    # track per engine, source location attached to each slice.
+    PFT="$OUT/${h}_pair.pftrace"
+    if timeout 1800 "$PROF" view -n "$neff" -s "$ntff" --output-format perfetto \
+          --output-file "$PFT" >"$OUT/.pft_$h.log" 2>&1 && [ -s "$PFT" ]; then
+      gzip -f "$PFT"
+      say "  PERFETTO (tool) -> ${PFT}.gz  -- open at https://ui.perfetto.dev"
+    else
+      say "  tool declined perfetto for a pair; building it from the instruction table:"
+      "$PY" "$HERE/pq_to_perfetto.py" "$pq" "$OUT/${h}_pair.json.gz" \
+          --scale "${PFT_SCALE:-0.001}" 2>&1 | tee -a "$REPORT"
+    fi
     [ -f "$HERE/pq_dma_report.py" ] && "$PY" "$HERE/pq_dma_report.py" "$pq" "$h" 2>&1 | tee -a "$REPORT"
     [ -f "$HERE/pq_pad_shapes.py" ] && "$PY" "$HERE/pq_pad_shapes.py" "$pq" "$h" 2>&1 | tee -a "$REPORT"
   else
