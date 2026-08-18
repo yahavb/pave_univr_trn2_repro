@@ -530,10 +530,17 @@ spec:
               echo "  rank subdirs       : $(find "$SYSTRACE" -maxdepth 1 -type d -name 'i-*' | wc -l)"
               echo ""
 
-              echo "=== [3/3b] PROFILED RUN -- torch.profiler -> perfetto (names the Python line) ==="
+              # EAGER, deliberately. Under torch.compile the model's PyTorch ops are fused into
+              # "Torch-Compiled Region" entries and the individual convs, grid_sample and
+              # interpolate DO NOT APPEAR in the trace -- a measured one carried 1,411 Python
+              # frames, 24 aten events, and 99.6% of its 760 ms inside a single opaque .cpu() wait.
+              # Eager dispatches each op separately, which is the only way the profiler can name
+              # them. The latency from THIS run is meaningless and is not used: [2/3] is the
+              # latency, this is the op inventory.
+              echo "=== [3/3b] PROFILED RUN -- EAGER + torch.profiler -> perfetto (names the ops) ==="
               set +e
               python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \
-                  --cores "$CORES" --warp "$WARP" --iters 1 \
+                  --cores "$CORES" --warp "$WARP" --iters 1 --compile 0 \
                   --perfetto "$R/perfetto/trace_rank0.json" \
                   2>&1 | tee "$R/perfetto.log" | grep -aiE "perfetto|median|FAILED" || true
               set -e

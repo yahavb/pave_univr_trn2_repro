@@ -1454,6 +1454,15 @@ def main():
     ap.add_argument("--save-ref", metavar="PATH.npy",
                     help="save this run's output as an fp32 reference + PNG preview + provenance "
                          "manifest, for use as --gt on another device")
+    ap.add_argument("--compile", type=int, choices=(0, 1), default=1,
+                    help="1 (default) = torch.compile the model. 0 = run EAGER, every native "
+                         "PyTorch op dispatching individually. Use 0 with --perfetto: under "
+                         "torch.compile the ops are fused into 'Torch-Compiled Region' entries and "
+                         "the individual convs / grid_sample / interpolate DO NOT APPEAR in the "
+                         "trace at all -- a measured trace held 1,411 Python frames and only 24 "
+                         "aten events, with 99.6%% of its 760 ms inside one opaque .cpu() wait. "
+                         "Eager is the only way a profiler can see the operations. Latency from an "
+                         "eager run is NOT comparable to a compiled one.")
     ap.add_argument("--warp-region", choices=("none", "neuron", "cpu"), default="none",
                     help="compile the RESAMPLE as its own region with its own backend, separate "
                          "from the model. none = inline in the model graph (default). neuron = its "
@@ -1570,10 +1579,10 @@ def main():
                  "view(torch.uint32) index bitcast silently corrupts which pixels are sampled. "
                  "Use --warp gridsample or gather with --fullgraph 0, or keep --fullgraph 1."
                  % a.warp)
-    if a.record_flow and a.fullgraph == 1:
+    if a.record_flow and a.fullgraph == 1 and a.compile:
         ap.error("--record-flow cannot run under fullgraph=True: it appends to a Python list and "
-                 "syncs to host inside the warp, which dynamo cannot trace. Pass --fullgraph 0 to "
-                 "re-enable it -- the break it needs is exactly what fullgraph forbids.")
+                 "syncs to host inside the warp, which dynamo cannot trace. Pass --fullgraph 0 or "
+                 "--compile 0 to re-enable it -- eager needs no tracing at all.")
     if a.warp == "shiftwarp":
         if a.device != "neuron":
             ap.error("--warp shiftwarp requires --device neuron")
@@ -1653,6 +1662,12 @@ def main():
         an unguarded break around the view(torch.uint32) index bitcast in the warp corrupts
         which pixels get sampled. That bitcast is in the NKI warps ONLY, so --fullgraph 0 is
         gated to the warps without it (see the guard in main())."""
+        if not a.compile:
+            # EAGER on purpose: the ops must dispatch one at a time to be individually
+            # observable. Nothing is wrapped, so the profiler sees conv2d, grid_sample,
+            # interpolate and the rest by name, with shapes and the Python line.
+            print("  EAGER[%s] -- no torch.compile, ops dispatch individually" % (tag or "model"))
+            return m
         fg = bool(a.fullgraph)
         # backend="neuron" is only valid ON neuron. --device cpu exists so the SAME model and the
         # SAME op sequence can be run on the host, which makes device-vs-host a controlled
