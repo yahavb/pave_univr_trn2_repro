@@ -67,8 +67,18 @@ if [ "${#PAIRS[@]}" -eq 0 ]; then
   say "no rank*/ pair directories under $ROOT"
   exit 1
 fi
+# If the fixability ranking travelled with the results, print its head: it is the ordering that
+# should drive which pair to open, and showing it lets the choice be checked rather than trusted.
+RANKF=$(find "$ROOT" -name 'neff_ranking.txt' | head -1)
+if [ -n "${RANKF:-}" ]; then
+  say ""
+  say "fixability ranking (from the benchmark -- the ordering that SHOULD drive the choice):"
+  head -12 "$RANKF" | sed 's/^/  /' | tee -a "$REPORT" >/dev/null
+  head -12 "$RANKF" | sed 's/^/  /'
+fi
+
 say ""
-say "pairs found:"
+say "pairs found (processed in rank order):"
 for p in "${PAIRS[@]}"; do say "  $(basename "$p")  [$(ls "$p" | tr '\n' ' ')]"; done
 
 # ── ingest one pair to parquet.
@@ -96,9 +106,16 @@ ingest() {
   [ "$n" -gt 0 ]
 }
 
-# LARGEST FIRST: the heavy graph is the point, and the small ones add little once it is decoded.
-# If the big one cannot be ingested the log says so and the rest still run.
-for p in $(for d in "${PAIRS[@]}"; do echo "$(du -sb "$d" | cut -f1) $d"; done | sort -rn | cut -d' ' -f2-); do
+# ORDER: honour the rank the BENCHMARK already assigned, do not re-derive a worse one.
+# Three different orderings exist and they are not the same question:
+#   rank01..rankNN in the folder names -- assigned upstream by TOTAL TIME
+#   neff_ranking.txt                   -- by FIXABILITY (wasted time, with the engine-mix gate)
+#   file size                          -- how big the compiled graph is, which is not a cost at all
+# Sorting by size was the weakest of the three and is gone. The folder prefix is used because it
+# is already there and reflects measured time; where the two disagree, neff_ranking.txt is the one
+# to trust, because rank-1 by wall time is usually an honest matmul and NOT the thing to fix.
+# PAIRS is already sorted by name, so rank01 comes first.
+for p in "${PAIRS[@]}"; do
   neff=$(ls "$p"/*.neff 2>/dev/null | head -1)
   ntff=$(ls "$p"/*.ntff 2>/dev/null | head -1)
   say ""
@@ -118,7 +135,7 @@ for p in $(for d in "${PAIRS[@]}"; do echo "$(du -sb "$d" | cut -f1) $d"; done |
     say "  INGEST PRODUCED NO TABLES -- tail of the converter's own log:"
     tail -12 "$pq/.ingest.log" 2>/dev/null | sed 's/^/    /' | tee -a "$REPORT"
   fi
-  [ "$ONLY_FIRST" = "1" ] && { say "  (ONLY_FIRST=1 -- stopping after the heaviest pair)"; break; }
+  [ "$ONLY_FIRST" = "1" ] && { say "  (ONLY_FIRST=1 -- stopping after the top-ranked pair; set 0 for all)"; break; }
 done
 
 say ""
