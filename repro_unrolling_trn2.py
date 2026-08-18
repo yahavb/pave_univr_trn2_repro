@@ -1845,6 +1845,7 @@ def main():
             # no device rows and no explanation. torch-neuronx has moved this symbol between
             # releases, so probe rather than assume, and print the reason -- a silent fallback is
             # worse than no trace because it looks like it worked.
+            import inspect
             for _mod, _sym in (("torch_neuronx.profiling", "NeuronProfiler"),
                                ("torch_neuronx.experimental.profiler", "NeuronProfiler"),
                                ("torch_neuronx.profiler", "NeuronProfiler"),
@@ -1852,8 +1853,33 @@ def main():
                 try:
                     _m = __import__(_mod, fromlist=[_sym])
                     _cls = getattr(_m, _sym)
-                    _prof = _cls(record_shapes=True, with_stack=True)
-                    _prof_kind = "%s.%s (device rows)" % (_mod, _sym)
+                    # PASS ONLY THE KWARGS IT ACTUALLY TAKES. Handing it torch.profiler's signature
+                    # cost a whole run its device rows: torch_neuronx.profiling.NeuronProfiler IS
+                    # present on this image and raised
+                    #   TypeError: __init__() got an unexpected keyword argument 'record_shapes'
+                    # which the loop then reported as "unavailable" -- the profiler was there, the
+                    # call was wrong, and the trace came out CPU-only.
+                    _want = {"record_shapes": True, "with_stack": True}
+                    try:
+                        _params = inspect.signature(_cls).parameters
+                        _kw = {k: v for k, v in _want.items() if k in _params}
+                    except (TypeError, ValueError):
+                        _kw = {}
+                    _cand = _cls(**_kw)
+                    # It has to support the protocol used below, or the run would profile and then
+                    # silently write nothing.
+                    _missing = [n for n in ("__enter__", "__exit__", "export_chrome_trace")
+                                if not hasattr(_cand, n)]
+                    if _missing:
+                        print("  --perfetto: %s.%s constructed but lacks %s -- skipping"
+                              % (_mod, _sym, ", ".join(_missing)))
+                        continue
+                    _prof = _cand
+                    _dropped = sorted(set(_want) - set(_kw))
+                    _prof_kind = "%s.%s (device rows)%s" % (
+                        _mod, _sym,
+                        "" if not _dropped else "  [it does not accept %s, so shapes/source lines "
+                                                "may be absent]" % ", ".join(_dropped))
                     break
                 except Exception as _e:                           # noqa: BLE001
                     print("  --perfetto: %s.%s unavailable (%s: %s)"
