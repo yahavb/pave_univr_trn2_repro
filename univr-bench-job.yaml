@@ -262,6 +262,187 @@ spec:
               fi
               echo ""
 
+              # ── MODE=warpeager: OPEN THE RESAMPLE, keep the rest compiled ───────────────────
+              # THE QUESTION: are the hotspots actually the gridsample ops? Under
+              # torch.compile(fullgraph=True) that is UNANSWERABLE from any trace taken here. The
+              # tile is one graph, so torch.profiler holds "Torch-Compiled Region" and no ops, and
+              # converting the preserved NEFF+NTFF pair gives device instructions with no Python
+              # attribution -- the 7.4 GB graph.pftrace shows WHAT ran and cannot say WHICH CALL
+              # issued it.
+              #
+              # So run the resample EAGER and everything else COMPILED: --warp-region eager. The
+              # region boundary is a real graph break (torch._dynamo.disable), so the 14 resample
+              # calls per forward dispatch op by op with a `resample:C<c>:<h>x<w>` span around each,
+              # while the 54 convs stay inside their neuron graph. Two artifacts come out of it:
+              #
+              #   HOST  trace_warpeager.json.gz -- names aten::grid_sampler_2d, its shapes and its
+              #         call count, per site. pf_op_summary.py buckets every op by whether a
+              #         resample: span CONTAINS it, which is the only sound attribution: the
+              #         lowering is index/clamp/mul arithmetic whose op names are shared with the
+              #         convs, so a name-based bucket both misses its arithmetic and steals theirs.
+              #   DEVICE the eager region compiles its OWN NEFFs -- one per (C, HxW) site instead of
+              #         one fused tile -- so the per-NEFF sweep prices the resample on device
+              #         directly. matmul~0 + DMA-dominated NEFFs are the resample; the convs carry
+              #         the matmul.
+              #
+              # WHAT IT DOES NOT ANSWER. This is not the production config: fullgraph=0 plus 14
+              # graph breaks per forward is a different regime, and the shares here are of THIS
+              # run's wall, not of the fused frame's. It says which ops the resample is made of and
+              # what they cost on device when they stand alone; it does not predict the fused
+              # frame's latency. The fused number stays MODE=full.
+              #
+              # OWN NEFF CACHE, and /tmp/neff_cache is WIPED first. The fullgraph cache restored
+              # above holds whole-tile graphs this run never executes, and [4] ranks every NEFF in
+              # the directory -- mixing them would attribute a fused graph's device time to a run
+              # that never called it.
+              if [ "${MODE:-full}" = "warpeager" ]; then
+                WE_RES="${WARPEAGER_RES:-288x320}"
+                WE_WARP="${WARPEAGER_WARP:-gridsample}"
+                WE_ITERS="${WARPEAGER_ITERS:-3}"
+                WE_TILE="${WARPEAGER_TILE:-9}"
+                if [ -n "$WE_RES" ]; then
+                  WH=${WE_RES%%x*}; WW=${WE_RES##*x}
+                  GEOM="--height $WH --width $WW --tiles 1x1 --random-weights"
+                  LBL="warpeager_${WE_WARP}_${WE_RES}"
+                else
+                  GEOM="--height 1728 --width 4096 --tiles $GRID --halo $HALO $REF --only-tile $WE_TILE"
+                  LBL="warpeager_${WE_WARP}_t${WE_TILE}"
+                fi
+                RUN="exp_univr-${LBL}_${TS}"
+                RUNDIR="$PVC/runs/$RUN"
+                CACHE_TGZ="$PVC/neff_cache_${LBL}.tar.gz"
+                mkdir -p "$RUNDIR/perfetto" "$RUNDIR/pairs" || true
+                rm -rf /tmp/neff_cache; mkdir -p /tmp/neff_cache
+                if [ -f "$CACHE_TGZ" ]; then
+                  cp "$CACHE_TGZ" /tmp/we_restore.tar.gz \
+                    && tar -xzf /tmp/we_restore.tar.gz -C /tmp \
+                    && echo "cache: restored $(find /tmp/neff_cache -name '*.neff' | wc -l) NEFFs from $CACHE_TGZ"
+                else
+                  echo "cache: none at $CACHE_TGZ -- cold compile expected"
+                fi
+                echo "=== MODE=warpeager  ${WE_RES:-$GRID halo $HALO tile $WE_TILE}  warp $WE_WARP  iters $WE_ITERS ==="
+                # RES drives MODE=full's geometry and already rewrote REF to --random-weights above.
+                # This mode has its own WARPEAGER_RES, so say plainly that RES did nothing here
+                # rather than let two size knobs look like they agree.
+                [ -n "$RES" ] && echo "  NOTE RES=$RES is NOT used in this mode (WARPEAGER_RES is), but it did"
+                [ -n "$RES" ] && echo "       force --random-weights, so a cleared WARPEAGER_RES runs the real tile"
+                [ -n "$RES" ] && echo "       WITHOUT the golden. Clear RES too for a scored full-tile run."
+                echo "  run dir   : $RUNDIR"
+                echo ""
+
+                # ── [A] HOST ATTRIBUTION: torch.profiler over the timed loop, region eager.
+                # --perfetto is what installs the per-call span, so it is not optional here.
+                echo "--- [A] host trace with the resample OPEN (--warp-region eager --perfetto) ---"
+                set +e
+                python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
+                    --dtype fp32 --device neuron --cores 1 \
+                    --warp "$WE_WARP" --warp-region eager --iters "$WE_ITERS" \
+                    --perfetto "$R/perfetto/trace_${LBL}.json" \
+                    2>&1 | tee "$R/$LBL.log"
+                arc=${PIPESTATUS[0]}
+                set -e
+                echo "  rc=$arc  NEFFs now $(find /tmp/neff_cache -name '*.neff' | wc -l)"
+                if [ "$arc" != "0" ]; then
+                  { grep -aoE "got in=[0-9]+ and out=[0-9]+|MemoryError|Killed|Unsupported|FailOnRecompileLimitHit" \
+                    "$R/$LBL.log" || true; } | head -3 | sed 's/^/    /'
+                fi
+                archive_cache
+                publish "$R/perfetto/trace_${LBL}.json.gz" "$RUNDIR/perfetto/trace_${LBL}.json.gz"
+                for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                sleep 5
+
+                echo ""
+                echo "--- [B] op table: is the hotspot the resample? ---"
+                # The verdict table. It also states its own limit: with no NeuronProfiler rows this
+                # is HOST time, so a large share can be dispatch and a small one can hide device
+                # work behind the sync line. The device answer is [D].
+                python3 scripts/neuron/pf_op_summary.py "$R/perfetto/trace_${LBL}.json.gz" --top 25 \
+                    2>&1 | tee "$R/optable_${LBL}.txt" || true
+                publish "$R/optable_${LBL}.txt" "$RUNDIR/optable_${LBL}.txt"
+
+                # ── [C] DEVICE TIMELINE for the same configuration, from the RUNTIME trace. A
+                # SEPARATE run, like [3/3a] and [3/3b] are: torch.profiler and the runtime inspector
+                # both instrument the same loop and running them together mixes two overheads into
+                # one number.
+                echo ""
+                echo "--- [C] runtime system trace -> device timeline ---"
+                SYSTRACE=/tmp/systrace_we; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
+                set +e
+                NEURON_RT_INSPECT_ENABLE=1 \
+                NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
+                NEURON_RT_INSPECT_DEVICE_PROFILE=1 \
+                NEURON_RT_INSPECT_OUTPUT_DIR="$SYSTRACE" \
+                python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
+                    --dtype fp32 --device neuron --cores 1 \
+                    --warp "$WE_WARP" --warp-region eager --iters 1 \
+                    2>&1 | tee "$R/${LBL}_inspect.log" | grep -aiE "median|warp region|Killed|Error" || true
+                set -e
+                echo "  trace_info.pb count: $(find "$SYSTRACE" -name 'trace_info.pb' | wc -l)"
+                set +e
+                timeout 900 "$PROF" view -d "$SYSTRACE" --output-format perfetto \
+                    > "$R/perfetto/view_${LBL}.log" 2>&1
+                vrc=$?
+                set -e
+                PFT=$(find "$SYSTRACE" "$R" /tmp -maxdepth 3 -name '*.pftrace' -newer "$R/${LBL}_inspect.log" 2>/dev/null | head -1)
+                if [ -n "${PFT:-}" ] && [ -s "$PFT" ]; then
+                  gzip -c "$PFT" > "$R/perfetto/device_${LBL}.pftrace.gz"
+                  publish "$R/perfetto/device_${LBL}.pftrace.gz" "$RUNDIR/perfetto/device_${LBL}.pftrace.gz"
+                else
+                  echo "  no .pftrace produced (rc=$vrc); tail of the view log:"
+                  tail -6 "$R/perfetto/view_${LBL}.log" 2>/dev/null | sed 's/^/    /' || true
+                fi
+
+                # ── [D] PER-NEFF: with the region eager the resample has its own graphs, so this
+                # is where its DEVICE cost lives. The engine mix separates them from the body:
+                # matmul~0 + DMA-dominated is the resample, matmul>0 with tensor% high is the convs.
+                echo ""
+                echo "--- [D] per-NEFF engine breakdown (the resample now has its OWN NEFFs) ---"
+                POUT=/tmp/perneff_we; rm -rf "$POUT"; mkdir -p "$POUT"
+                mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)
+                echo "  NEFFs in cache: ${#NEFFS[@]}"
+                OK=0
+                for neff in "${NEFFS[@]}"; do
+                  hash=$(basename "$neff" .neff)
+                  NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 900 \
+                    "$PROF" capture --single-io -n "$neff" -s "$POUT/${hash}.ntff" >/dev/null 2>&1 || continue
+                  [ -f "$POUT/${hash}.ntff" ] || continue
+                  timeout 300 "$PROF" view -n "$neff" -s "$POUT/${hash}.ntff" \
+                    --output-format summary-json > "$POUT/${hash}.json" 2>/dev/null || true
+                  [ -s "$POUT/${hash}.json" ] && OK=$((OK+1))
+                done
+                echo "  captured+viewed OK: $OK / ${#NEFFS[@]}"
+                python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$R/perneff_${LBL}.txt" || true
+                python3 scripts/neuron/rank_neffs.py "$POUT" 2>&1 | tee "$R/ranking_${LBL}.txt" || true
+                publish "$R/perneff_${LBL}.txt" "$RUNDIR/perneff_${LBL}.txt"
+                publish "$R/ranking_${LBL}.txt" "$RUNDIR/ranking_${LBL}.txt"
+                # PAIRS, pre-joined: a resample NEFF is small, so its pair is cheap to keep and it
+                # is the one graph worth converting to a per-NEFF perfetto timeline by hand.
+                i=0
+                for hash in $(python3 scripts/neuron/top_neffs.py "$POUT" "${TOPN:-5}" 2>/dev/null || true); do
+                  i=$((i+1))
+                  src_neff=$(find /tmp/neff_cache -name "${hash}.neff" | head -1)
+                  [ -n "$src_neff" ] && [ -f "$POUT/${hash}.ntff" ] || continue
+                  MB=$(( $(wc -c < "$src_neff") / 1048576 ))
+                  d="$R/pairs/$(printf 'rank%02d' $i)_${hash:0:8}__${MB}MB"
+                  mkdir -p "$d"; cp "$src_neff" "$d/" && cp "$POUT/${hash}.ntff" "$d/"
+                  [ -f "$POUT/${hash}.json" ] && cp "$POUT/${hash}.json" "$d/summary.json"
+                  echo "  $(basename "$d"): $(ls "$d" | tr '\n' ' ')"
+                done
+                [ "$i" = "0" ] && echo "  pairs/ EMPTY -- expected if the capture sweep returned 0/N"
+
+                echo ""
+                echo "################ WARPEAGER SUMMARY ################"
+                grep -aE "RESAMPLE spans|TRACED WALL|VERDICT INPUT|MODEL THREAD" \
+                  "$R/optable_${LBL}.txt" 2>/dev/null | sed 's/^/  /' || true
+                echo "  READ IT THIS WAY: the host share above says how much of THIS run's wall the"
+                echo "  resample spans cover; ranking_${LBL}.txt says what its OWN NEFFs cost on"
+                echo "  device. Neither is the fused frame -- fullgraph=0 with 14 breaks per forward"
+                echo "  is a different regime, and MODE=full is still where a latency number comes"
+                echo "  from. What transfers is WHICH ops the resample is made of and their relative"
+                echo "  device cost."
+                exit 0
+              fi
+
               # ── MODE=warpcmp: the SAME MODEL, one tile, once per resample config ────────────
               # This is the model, not a microbenchmark: repro_unrolling_trn2.py running its real
               # op sequence -- 14 warps and 54 convs -- so it prices what no isolated op can:
@@ -755,6 +936,9 @@ spec:
             - name: BRANCH
               value: "main"
             # MODE=warpcmp: the same MODEL, one tile, once per resample config -- nki / aten / cpu.
+            # MODE=warpeager: the resample EAGER, everything else compiled, so a trace can NAME the
+            #   gridsample ops. Answers "is the hotspot the resample", which fullgraph=True makes
+            #   unanswerable (one graph -> "Torch-Compiled Region" and no ops). NOT a latency config.
             # MODE=full (default): the 3-run benchmark, serial 8-graph probe then the 8-core arm.
             # full = the 3-run benchmark: build/load, CLEAN run (the only latency), then the
             # profiled runs that produce the explorer bundle and the perfetto trace.
@@ -796,6 +980,21 @@ spec:
             # every size), which is why this works at all.
             - name: WARPCMP_RES
               value: "128x128 192x224 288x320"
+            # MODE=warpeager knobs. ONE size, not a ladder: this mode is an attribution run, not a
+            # ratio measurement, so a second size buys nothing. 288x320 keeps the 14 sites at their
+            # real C values (3/16/32/64/128) and the compile affordable. Clear WARPEAGER_RES to run
+            # the real 4x8 halo-64 tile WARPEAGER_TILE with the golden weights instead.
+            - name: WARPEAGER_RES
+              value: "288x320"
+            - name: WARPEAGER_WARP
+              value: "gridsample"
+            # 3 iterations, so the per-site table averages over 42 calls rather than 14 and one
+            # cold call cannot set the mean. The first call is excluded already: it is the
+            # compile/warmup call, before the timed loop the profiler wraps.
+            - name: WARPEAGER_ITERS
+              value: "3"
+            - name: WARPEAGER_TILE
+              value: "9"
             - name: NEURON_LOGICAL_NC_CONFIG
               value: "1"
             - name: NEURON_RT_NUM_CORES

@@ -648,7 +648,7 @@ def warp(x, f):
     return _WARP(x, f)
 
 
-def build_warp_region(base, region, device):
+def build_warp_region(base, region, device, annotate=False):
     """Compile the RESAMPLE as its OWN region, with its own backend, separate from the model.
 
     This is what makes "gridsample on CPU while everything else stays on the device" measurable:
@@ -664,8 +664,40 @@ def build_warp_region(base, region, device):
 
     region="cpu": the region is inductor-compiled and the tensors hop host-ward and back on every
     call -- 14 per tile. That transfer is part of what the arm is measuring, not an artifact.
+
+    region="eager": the region is NOT compiled at all. This is the ONLY configuration in which a
+    profiler can NAME the resample while the rest of the frame stays fused. Under
+    fullgraph=True the 14 resample calls dissolve into the tile graph and every trace taken here
+    held "Torch-Compiled Region" entries and no ops, so "is the hotspot gridsample" was
+    unanswerable from the host side; converting the NEFF+NTFF pair gives device instructions but
+    no Python attribution. With the region eager its ATen ops dispatch one at a time, so
+    aten::grid_sampler_2d appears by name with its shapes and call count, and each dispatch
+    becomes its OWN NEFF -- which is what makes the device-side share attributable too. The convs
+    around it are still compiled, so this is the fused workload with one region opened up, NOT
+    the 275-NEFF fully-eager regime that --compile 0 gives.
+
+    annotate=True (set by --perfetto) puts ONE NAMED SLICE around each call. Op names alone cannot
+    answer "is the hotspot the resample": grid_sample's lowering is index / clamp / mul arithmetic
+    whose op names are shared with the rest of the model, so a name-based bucket would both miss
+    that arithmetic and claim ops the model issued elsewhere. An explicit span is unambiguous, it
+    carries the site's C and HxW so the 6 image warps separate from the 8 Contextnet ones, and it
+    is only legal here BECAUSE this region is dynamo-disabled -- record_function inside a traced
+    region is itself a graph break.
     """
-    if region == "cpu":
+    if region == "eager":
+        if annotate:
+            try:
+                from torch.profiler import record_function
+            except Exception:                                       # noqa: BLE001
+                from torch.autograd.profiler import record_function
+            def _eager_region(x, f):
+                # x.shape is metadata: reading it costs no device sync.
+                with record_function("resample:C%d:%dx%d" % (x.shape[1], x.shape[2], x.shape[3])):
+                    return base(x, f)
+            fn = _eager_region
+        else:
+            fn = base
+    elif region == "cpu":
         inner = torch.compile(base, dynamic=False)                  # inductor
         def _cpu_region(x, f):
             dev = x.device
@@ -1463,13 +1495,19 @@ def main():
                          "aten events, with 99.6%% of its 760 ms inside one opaque .cpu() wait. "
                          "Eager is the only way a profiler can see the operations. Latency from an "
                          "eager run is NOT comparable to a compiled one.")
-    ap.add_argument("--warp-region", choices=("none", "neuron", "cpu"), default="none",
+    ap.add_argument("--warp-region", choices=("none", "neuron", "cpu", "eager"), default="none",
                     help="compile the RESAMPLE as its own region with its own backend, separate "
                          "from the model. none = inline in the model graph (default). neuron = its "
                          "own neuron graph. cpu = inductor on the HOST, tensors hopping device -> "
                          "host -> device on each of the 14 calls per tile, with the rest of the "
                          "model still on neuron -- which is how 'is gridsample better on CPU' gets "
-                         "measured without moving the whole model. Forces fullgraph=0.")
+                         "measured without moving the whole model. eager = the resample is NOT "
+                         "compiled, still on the device, while the convs around it stay compiled: "
+                         "the only way a profiler can NAME the resample (aten::grid_sampler_2d "
+                         "with its shapes and 14 calls/tile) instead of one opaque "
+                         "'Torch-Compiled Region', and it also gives the resample its OWN NEFFs so "
+                         "its DEVICE share is attributable. Pair it with --perfetto. All three "
+                         "force fullgraph=0.")
     ap.add_argument("--fullgraph", type=int, choices=(0, 1), default=1,
                     help="1 (default) = torch.compile(fullgraph=True), one fused graph per tile "
                          "shape. 0 = allow graph breaks, which is what makes --warp gridsample "
@@ -1562,9 +1600,23 @@ def main():
             ap.error("--warp-region cpu with --warp gridsample-nkl is contradictory: the NKL "
                      "kernel is an NKI device kernel and cannot run on the host. Use "
                      "--warp gridsample for the cpu region.")
-        _WARP = build_warp_region(WARPS[a.warp], a.warp_region, a.device)
-        print("  warp region   : %s (own torch.compile, backend %s)"
-              % (a.warp_region, "inductor/cpu" if a.warp_region == "cpu" else "neuron"))
+        if a.warp == "window":
+            # --warp window rebinds _WARP AFTER this block to carry its radius, which would
+            # overwrite the region wrapper and leave the run looking regioned in the log while
+            # actually running inline. Refuse rather than mislead.
+            ap.error("--warp-region is not wired for --warp window: the radius rebind below would "
+                     "silently overwrite the region wrapper.")
+        _WARP = build_warp_region(WARPS[a.warp], a.warp_region, a.device,
+                                  annotate=bool(a.perfetto))
+        print("  warp region   : %s (%s)"
+              % (a.warp_region,
+                 {"cpu": "own torch.compile, backend inductor/cpu",
+                  "neuron": "own torch.compile, backend neuron",
+                  "eager": "NOT compiled -- ATen dispatches one op at a time on %s, so the "
+                           "profiler names it" % a.device}[a.warp_region]))
+        if a.warp_region == "eager" and not a.perfetto:
+            print("    NOTE no --perfetto: the region is open but nothing is recording it. The "
+                  "point of this mode is the trace.")
     if a.warp == "window":
         _r = a.radius
         _WARP = lambda x, f: warp_window(x, f, radius=_r)   # noqa: E731

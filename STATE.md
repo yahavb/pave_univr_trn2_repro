@@ -577,7 +577,7 @@ deterministic compiler verdicts rather than flaky runs.
 | `fused-config-search-job.yaml` | geometry x warp under fullgraph. Superseded |
 | `accuracy-triage-job.yaml` | **the live job.** 4 stages: serial 8-graph compile probe, then the gated 8-core scored arm, then the Neuron Explorer system-profile bundle |
 | `univr-bench-job.yaml` | **the job to use from now on.** Adopts `/neuron-3run-benchmark`: persistent NEFF cache, 3-run methodology, consumer-split archive |
-| `scripts/neuron/` | the skill's helpers, committed so the pod's clone has them: `rank_neffs.py` (fixability + engine-mix gate), `profile_all_neffs.py`, `pick_neffs.py`, `top_neffs.py`, `pq_*.py`, `run_dma_analysis.sh` |
+| `scripts/neuron/` | the skill's helpers, committed so the pod's clone has them: `rank_neffs.py` (fixability + engine-mix gate), `profile_all_neffs.py`, `pick_neffs.py`, `top_neffs.py`, `pq_*.py`, `run_dma_analysis.sh`, `pf_op_summary.py` (chrome-trace op table, resample vs rest by SPAN CONTAINMENT) |
 | `s3-mount-test-pod.yaml` | 85-second PVC mount check on a chosen node |
 | `nki_shift_warp.py` | the dead kernel, kept for the measured op-level result |
 
@@ -629,6 +629,37 @@ univr_results_<TS>.tar.gz        everything else
   fixability by wall time -- rank-1 by wall time is usually an honest GEMM.
 * Latency needs an **output-correctness gate**: `--save-ref` writes npy + PNG + a sha256
   manifest, and a faster config is often faster because it computes less.
+
+## MODE=warpeager: how to ask "is the hotspot the gridsample ops"
+
+Under `fullgraph=True` that question has no answer in any trace: the tile is ONE graph, so
+`torch.profiler` holds `Torch-Compiled Region` and no ops, and the NEFF+NTFF conversion
+(`graph.pftrace`, 7.4 GB) shows WHAT ran on the engines with no way back to a Python call.
+MEASURED both ways on CPU at 128x128, same model, same warp:
+
+| run | resample spans | `aten::grid_sampler_2d` in the trace |
+|---|---|---|
+| `--fullgraph 1` | 0 | **absent** -- fused into one inductor kernel |
+| `--warp-region eager` | **14** | 14 calls, named, with shapes |
+
+`--warp-region eager` (new) leaves the resample UNCOMPILED and on the device while the convs stay
+in their neuron graph. The boundary is the same `torch._dynamo.disable` the `cpu`/`neuron` regions
+already use, so it forces `--fullgraph 0`. With `--perfetto` it also wraps every call in a
+`resample:C<c>:<h>x<w>` span, which is what makes attribution sound: grid_sample's lowering is
+index/clamp/mul arithmetic sharing op names with the convs, so a NAME-based bucket would both miss
+its arithmetic and steal the model's. The 14 spans came out at exactly the architectural sites --
+6 at C=3 plus 2 each at C=16/32/64/128.
+
+`MODE=warpeager` in `univr-bench-job.yaml` runs it: [A] host trace, [B] `pf_op_summary.py` op
+table, [C] runtime INSPECT trace -> device timeline, [D] per-NEFF sweep -- and the eager region
+gives the resample its OWN NEFFs, one per site, so `rank_neffs.py` prices it on device instead of
+inside a fused tile. Its cache is a SEPARATE tar and `/tmp/neff_cache` is wiped first: [D] ranks
+every NEFF in the directory, and leaving the fullgraph graphs there would attribute a fused
+graph's device time to a run that never executed it.
+
+**It is not a latency configuration.** `fullgraph=0` with 14 breaks per forward is a different
+regime and the shares are of that run's wall. What transfers is WHICH ops the resample is made of
+and their relative device cost; the frame number still comes from `MODE=full`.
 
 ## Traps that cost runs
 
