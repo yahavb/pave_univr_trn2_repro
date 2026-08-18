@@ -180,6 +180,17 @@ spec:
               echo "└─────────────────────────────────────────"
               echo ""
 
+              # PROFILER CLI, resolved ONCE and early -- it is used from [3/3c] onward, and
+              # defining it in [4] meant `set -u` would have killed the run at [3/3c].
+              # neuron-profile is DEPRECATED on this image (cc 2.27): every capture failed with a
+              # banner pointing at neuron-explorer, and that silently cost a whole microbench run
+              # its descriptor data. Prefer neuron-explorer, fall back for older images. This is the
+              # CAPTURE/VIEW subcommand -- NOT the neuron-explorer view SERVER (--ingest-only,
+              # :3001/:3002), which hangs on big DMA NEFFs and must never be used.
+              PROF=neuron-explorer
+              command -v "$PROF" >/dev/null 2>&1 || PROF=neuron-profile
+              echo "profiler CLI: $PROF"
+
               FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
               BASE="--height 1728 --width 4096 --tiles $GRID --halo $HALO --bar 3 --device neuron --dtype fp32 --fullgraph $FULLGRAPH"
@@ -527,6 +538,27 @@ spec:
                   2>&1 | tee "$R/perfetto.log" | grep -aiE "perfetto|median|FAILED" || true
               set -e
               publish "$R/perfetto/trace_rank0.json.gz" "$RUNDIR/perfetto/trace_rank0.json.gz"
+
+              # The torch.profiler route above fell back to "CPU rows only" because the
+              # NeuronProfiler import failed, so it carries no DEVICE timeline -- hence ~0 MB.
+              # The runtime system trace already holds the device timeline, and the profiler CLI
+              # converts it straight to a Perfetto trace. This is the artifact to drag into
+              # ui.perfetto.dev for device activity; the torch.profiler json is still worth keeping
+              # because it is the only one that names the PYTHON LINE behind a copy or a DMA.
+              echo "--- [3/3c] systrace -> perfetto (device timeline, via $PROF view -d) ---"
+              set +e
+              timeout 900 "$PROF" view -d "$SYSTRACE" --output-format perfetto \
+                  > "$R/perfetto/view_perfetto.log" 2>&1
+              vrc=$?
+              set -e
+              PFT=$(find "$SYSTRACE" "$R" /tmp -maxdepth 3 -name '*.pftrace' -newer "$R/perfetto" 2>/dev/null | head -1)
+              if [ -n "${PFT:-}" ] && [ -s "$PFT" ]; then
+                gzip -c "$PFT" > "$R/perfetto/system_profile.pftrace.gz"
+                publish "$R/perfetto/system_profile.pftrace.gz" "$RUNDIR/perfetto/system_profile.pftrace.gz"
+              else
+                echo "  no .pftrace produced (rc=$vrc); tail of the view log:"
+                tail -6 "$R/perfetto/view_perfetto.log" 2>/dev/null | sed 's/^/    /' || true
+              fi
               echo ""
 
               # ─────────────── [4] per-NEFF: capture -> summary-json -> rank by FIXABILITY ───────
@@ -535,14 +567,7 @@ spec:
               # :3001/:3002/:8086 UI, SQL-over-curl) -- it hangs on big DMA NEFFs on this image.
               # Only summary-json and summary-text work; --output-format json returns EMPTY.
               POUT=/tmp/perneff; rm -rf "$POUT"; mkdir -p "$POUT"
-              # neuron-profile is DEPRECATED on this image (cc 2.27): every capture failed with a
-              # banner pointing at neuron-explorer, and an entire microbench run produced no
-              # descriptor data because of it. Prefer neuron-explorer, fall back for older images.
-              # This is the CAPTURE/VIEW subcommand -- NOT the neuron-explorer view SERVER
-              # (--ingest-only, :3001/:3002), which hangs on big DMA NEFFs and must never be used.
-              PROF=neuron-explorer
-              command -v "$PROF" >/dev/null 2>&1 || PROF=neuron-profile
-              echo "  profiler CLI: $PROF"
+
               mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)
               echo "  NEFFs in cache: ${#NEFFS[@]}"
               OK=0
@@ -614,11 +639,29 @@ spec:
                 # instruction-level analysis. Pair by content hash: the cache is
                 # content-addressed, so a hash names its NEFF exactly. Reading a .ntff against the
                 # WRONG .neff yields attribution that is confidently wrong, worse than none.
+                # The runtime names its NEFFs neff_<id>_vnc_<n>.neff -- NOT content-addressed --
+                # so pairing an .ntff stem against <hash>.neff in the cache NEVER matched and the
+                # bundle came out with only the 4 small runtime NEFFs. The NEFF that matters is the
+                # content-addressed one the per-NEFF sweep captured: 44 MB, 764 ms, ~42% of the
+                # whole capture sum. Copy the preserved pairs in directly -- the Directory Upload
+                # mode takes .neff and .ntff as optional inputs, and including them is what makes
+                # ONE upload serve system-, device- AND instruction-level analysis.
+                for pd in "$R"/pairs/rank*/; do
+                  [ -d "$pd" ] || continue
+                  for f in "$pd"*.neff "$pd"*.ntff; do
+                    [ -f "$f" ] && cp "$f" "$UP/" 2>/dev/null || true
+                  done
+                done
+                # Whatever the runtime itself dumped, paired by its own naming, kept as well.
                 for nt in "$UP"/*.ntff; do
                   [ -f "$nt" ] || continue
                   h=$(basename "$nt" .ntff); h=${h%%_rank_*}
                   f=$(find /tmp/neff_cache -name "${h}.neff" | head -1)
                   [ -n "$f" ] && cp "$f" "$UP/" 2>/dev/null || true
+                done
+                echo "  bundle NEFF/NTFF inventory:"
+                for f in "$UP"/*.neff "$UP"/*.ntff "$UP"/*.pb; do
+                  [ -f "$f" ] && printf "    %-52s %s bytes\n" "$(basename "$f")" "$(wc -c < "$f")"
                 done
                 echo "  upload_bundle: $(ls "$UP" | wc -l) files, trace_info.pb $(ls -la "$UP/trace_info.pb" 2>/dev/null | awk '{print $5}' || echo MISSING) bytes"
                 tar -czf /tmp/upload_bundle.tar.gz -C "$UP" . 2>/dev/null || true
@@ -660,7 +703,11 @@ spec:
               echo "  HOW TO OPEN EACH ARTIFACT (one action each, nothing to reconcile):"
               echo "   * explorer/upload_bundle.tar.gz -> untar, then neuron-explorer"
               echo "     'Directory Upload For System Profile'. WHEN ops run + inter-NEFF gaps."
-              echo "   * perfetto/trace_rank0.json.gz  -> drag into ui.perfetto.dev, still gzipped."
+              echo "   * perfetto/system_profile.pftrace.gz -> drag into ui.perfetto.dev. THE"
+              echo "     DEVICE TIMELINE, converted from the runtime system trace."
+              echo "   * perfetto/trace_rank0.json.gz  -> also ui.perfetto.dev. Names the PYTHON"
+              echo "     LINE behind a copy or DMA, but carries no device rows unless a"
+              echo "     NeuronProfiler was importable -- the log says which."
               echo "     The ONLY artifact that names the Python line behind a copy or DMA."
               echo "   * pairs/rankNN_*/              -> 'Individual Files': the .neff and .ntff in"
               echo "     that folder are the only two files there. WHAT op inside a hot NEFF."

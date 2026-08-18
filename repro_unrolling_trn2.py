@@ -1773,15 +1773,33 @@ def main():
         # record_shapes + with_stack are what make an aten op traceable back to a source line.
         _prof = _prof_kind = None
         if a.perfetto:
-            try:
-                from torch_neuronx.profiling import NeuronProfiler
-                _prof = NeuronProfiler(record_shapes=True, with_stack=True)
-                _prof_kind = "torch_neuronx.NeuronProfiler"
-            except Exception:                                     # noqa: BLE001
+            # TRY SEVERAL IMPORT PATHS AND SAY WHY EACH FAILED. The first version caught the
+            # exception silently and fell back to CPU-only, so the run produced a ~0 MB trace with
+            # no device rows and no explanation. torch-neuronx has moved this symbol between
+            # releases, so probe rather than assume, and print the reason -- a silent fallback is
+            # worse than no trace because it looks like it worked.
+            for _mod, _sym in (("torch_neuronx.profiling", "NeuronProfiler"),
+                               ("torch_neuronx.experimental.profiler", "NeuronProfiler"),
+                               ("torch_neuronx.profiler", "NeuronProfiler"),
+                               ("torch_neuronx.experimental.profiler", "profile")):
+                try:
+                    _m = __import__(_mod, fromlist=[_sym])
+                    _cls = getattr(_m, _sym)
+                    _prof = _cls(record_shapes=True, with_stack=True)
+                    _prof_kind = "%s.%s (device rows)" % (_mod, _sym)
+                    break
+                except Exception as _e:                           # noqa: BLE001
+                    print("  --perfetto: %s.%s unavailable (%s: %s)"
+                          % (_mod, _sym, type(_e).__name__, _e))
+            if _prof is None:
                 from torch.profiler import profile, ProfilerActivity
                 _prof = profile(activities=[ProfilerActivity.CPU],
                                 record_shapes=True, with_stack=True)
-                _prof_kind = "torch.profiler (CPU rows only)"
+                _prof_kind = "torch.profiler (CPU rows ONLY -- no device timeline)"
+                print("  --perfetto: NO NeuronProfiler found. This trace will name Python lines")
+                print("    but carry NO device activity. For the device timeline use the runtime")
+                print("    system trace converted with `neuron-explorer view -d <dir>"
+                      " --output-format perfetto`.")
             print("  --perfetto: tracing the timed loop with %s" % _prof_kind)
             print("  NOTE this run's median is NOT a latency measurement: the profiler is on.")
             _prof.__enter__()
