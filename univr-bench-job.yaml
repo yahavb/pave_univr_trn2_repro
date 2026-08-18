@@ -687,7 +687,7 @@ spec:
             - name: GRID
               value: "4x8"
             - name: RES
-              value: "288x320"
+              value: ""
             - name: WARP
               value: "gridsample"
             - name: FULLGRAPH
@@ -697,7 +697,7 @@ spec:
             - name: WARPCMP_RES
               value: "128x128 192x224 288x320"
             - name: WARPEAGER_RES
-              value: "288x320"
+              value: ""
             - name: WARPEAGER_WARP
               value: "gridsample"
             - name: WARPEAGER_ITERS
