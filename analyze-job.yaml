@@ -68,8 +68,25 @@ spec:
               echo "################ REPORT ################"
               cat "$REPORT"
 
-              # One object back across the mount, verified non-empty.
-              tar -czf /tmp/timeline_$RUN.tar.gz -C "$W" timeline_report.txt $(cd "$W" && ls -d pq_* 2>/dev/null || true) 2>/dev/null || true
+              # PUBLISH THE PERFETTO FILES INDIVIDUALLY, not only inside the tar. They are the
+              # artifact you actually open, and burying a file you need to drag into a viewer inside
+              # a 600 MB archive is useless. Earlier the tar listed only the report and the table
+              # dirs, so these were written in the pod and then LOST when it exited.
+              mkdir -p "$SRC/perfetto" || true
+              for f in "$W"/*_pair.pftrace.gz "$W"/*_pair.json.gz; do
+                [ -f "$f" ] || continue
+                n=$(wc -c < "$f")
+                [ "$n" -gt 0 ] && cp "$f" "$SRC/perfetto/" \
+                  && echo "published perfetto/$(basename "$f")  $(( n / 1048576 )) MB" \
+                  || echo "publish FAILED: $(basename "$f")"
+              done
+              ls -la "$SRC/perfetto/" 2>/dev/null | sed 's/^/  /' || true
+
+              # One object back across the mount, verified non-empty. Now INCLUDES the perfetto
+              # files as well, so the archive is self-contained even though they are also loose.
+              tar -czf /tmp/timeline_$RUN.tar.gz -C "$W" timeline_report.txt \
+                  $(cd "$W" && ls -d pq_* 2>/dev/null || true) \
+                  $(cd "$W" && ls *_pair.pftrace.gz *_pair.json.gz 2>/dev/null || true) 2>/dev/null || true
               if [ -s /tmp/timeline_$RUN.tar.gz ]; then
                 cp /tmp/timeline_$RUN.tar.gz "$SRC"/ \
                   && echo "saved $SRC/timeline_$RUN.tar.gz ($(du -h /tmp/timeline_$RUN.tar.gz | cut -f1))"
