@@ -1737,7 +1737,16 @@ def main():
     # Unconditional: nn.PReLU cannot be legalised by the Neuron backend, and this script
     # always compiles. NeuronPReLU is relu(x) - w*relu(-x), bit-exact, so nothing is traded.
     _STATIC_RESIZE = a.static_resize
-    if _STATIC_RESIZE:
+    if _STATIC_RESIZE == 3:
+        # Level 3 must NOT claim the descriptors are gone: it keeps an index_select and only hands
+        # the compiler constant indices. Whether that lowers to static descriptors is the
+        # experiment, so saying otherwise here would assert the result in the log.
+        print("  --static-resize 3: fixed-factor interpolate -> PRECOMPUTED TAPS. The coordinate")
+        print("    pipeline (src, clamp, floor, +1, both weights) runs ONCE on the host in float64")
+        print("    and is cached, so the graph sees constant indices -- but the read is still an")
+        print("    index_select. Whether that becomes STATIC descriptors is what this arm measures.")
+        print("    Exactness is asserted by --self-test, not assumed.")
+    elif _STATIC_RESIZE:
         print("  --static-resize %d: fixed-factor interpolate -> %s. Scales are (4,2,1), so every"
               % (_STATIC_RESIZE, "pooling" if _STATIC_RESIZE == 1 else "pooling + deconv upsample"))
         print("    sampling position is a compile-time constant and needs NO runtime descriptors.")
