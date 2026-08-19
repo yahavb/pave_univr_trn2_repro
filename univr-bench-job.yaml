@@ -172,7 +172,11 @@ spec:
                   LBL="warpeager_${WE_WARP}_${WE_RES}"
                 else
                   GEOM="--height 1728 --width 4096 --tiles $GRID --halo $HALO $REF --only-tile $WE_TILE"
-                  LBL="warpeager_${WE_WARP}_t${WE_TILE}"
+                  # HALO BELONGS IN THE LABEL. The NEFF cache tar and the run dir are keyed on
+                  # LBL, and tile 9 is 576x640 at halo 64 but 704x768 at halo 128 -- without the
+                  # halo a second run restores the FIRST geometry's NEFFs and the per-NEFF ranking
+                  # silently mixes two tile sizes.
+                  LBL="warpeager_${WE_WARP}_t${WE_TILE}_h${HALO}"
                 fi
                 RUN="exp_univr-${LBL}_${TS}"
                 RUNDIR="$PVC/runs/$RUN"
@@ -694,7 +698,7 @@ spec:
             - name: MODE
               value: "warpeager"
             - name: HALO
-              value: "64"
+              value: "128"
             - name: GRID
               value: "4x8"
             - name: RES
