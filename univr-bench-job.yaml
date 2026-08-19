@@ -313,15 +313,25 @@ spec:
                 POUT=/tmp/perneff_we; rm -rf "$POUT"; mkdir -p "$POUT"
                 mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)
                 echo "  NEFFs in cache: ${#NEFFS[@]}"
-                OK=0
+                # HEARTBEAT. This loop is the longest stage in the job -- 63 NEFFs, each a capture
+                # plus a view with a 900 s ceiling -- and it used to print NOTHING until the last
+                # one finished, so a run mid-sweep is indistinguishable from a hung one.
+                OK=0; N=0; T0=$SECONDS
                 for neff in "${NEFFS[@]}"; do
+                  N=$((N+1))
                   hash=$(basename "$neff" .neff)
-                  NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 900 \
-                    "$PROF" capture --single-io -n "$neff" -s "$POUT/${hash}.ntff" >/dev/null 2>&1 || continue
-                  [ -f "$POUT/${hash}.ntff" ] || continue
-                  timeout 300 "$PROF" view -n "$neff" -s "$POUT/${hash}.ntff" \
-                    --output-format summary-json > "$POUT/${hash}.json" 2>/dev/null || true
-                  [ -s "$POUT/${hash}.json" ] && OK=$((OK+1))
+                  if NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 900 \
+                       "$PROF" capture --single-io -n "$neff" -s "$POUT/${hash}.ntff" >/dev/null 2>&1 \
+                     && [ -f "$POUT/${hash}.ntff" ]; then
+                    timeout 300 "$PROF" view -n "$neff" -s "$POUT/${hash}.ntff" \
+                      --output-format summary-json > "$POUT/${hash}.json" 2>/dev/null || true
+                    [ -s "$POUT/${hash}.json" ] && OK=$((OK+1))
+                  else
+                    echo "    $N/${#NEFFS[@]} ${hash:0:8} capture FAILED"
+                  fi
+                  if [ $((N % 10)) = 0 ] || [ "$N" = "${#NEFFS[@]}" ]; then
+                    echo "    $N/${#NEFFS[@]} ok=$OK  $(( (SECONDS-T0) / 60 ))m"
+                  fi
                 done
                 echo "  captured+viewed OK: $OK / ${#NEFFS[@]}"
                 # per-NEFF table and full ranking go to the files; the log gets the summaries only
