@@ -1,48 +1,4 @@
 #!/usr/bin/env python3
-"""STANDALONE reproducer: UniVR-RIFE rolling-shutter unrolling, and the trn2 gather bottleneck.
-
-One file, no imports from this repo. Inlines the model, all four resample implementations, the
-triplet composition, the descriptor accounting and the scoring criterion the project ships.
-
-WHAT IT REPRODUCES
-  1. the port's numerics -- device/gather resample against the stock F.grid_sample reference
-  2. the accuracy story against the shipped golden (bar: max_diff <= 3 of 255 levels)
-  3. the bottleneck: descriptor count, bytes per descriptor and predicted GpSimd time, per
-     resample call site, which is the thing to look at with the compiler team
-
-WHAT THE MODEL IS
-  A rolling-shutter sensor exposes one scanline at a time, so every row of a captured frame is
-  from a different instant and moving content is sheared. RIFE's IFNet_m estimates bidirectional
-  flow between two consecutive RS frames, and the UniVR wrapper feeds it a PER-ROW timestamp
-  (tau = t + gamma - gamma*row/H) so the flow is resolved to a single instant. The corrected frame
-  is then resampled from the inputs by that flow. The resample is the op this file is about.
-
-THE FOUR RESAMPLE IMPLEMENTATIONS (--warp)
-  gridsample  stock F.grid_sample(bilinear, border, align_corners=True). The reference.
-  gather      the port's form: explicit 4-tap indirect gather in pure torch. Runs anywhere.
-  nki         the shipping trn2 kernel, 2 indirect DMA descriptors per pixel. trn2 only.
-  window      the REJECTED dense reformulation: sum over a static (2R+1)^2 window with
-              triangular weights, no indirect access at all. Kept because it is the natural
-              "just make it dense" suggestion and it needs to be visibly costed, not argued about.
-
-USAGE
-  # assets (see TEST_ASSET_SHA256 below) live in
-  #   s3://digital-twin-checkpoints/digital_twin/univr_shutter_unrolling/test_assets/
-  # weights (pre_net_flow.pkl, 24.8M params) in
-  #   .../weights/UniVR_RIFE/deep_unroll_weights/<name>/
-  python repro_unrolling_trn2.py --rs0 rs70.png --rs1 rs71.png --rs2 rs72.png \
-      --gt gs71_merged_triplet.png --weights pre_net_flow.pkl --height 1728 --width 4096
-
-  # bottleneck accounting only -- no weights, no images, no device needed:
-  python repro_unrolling_trn2.py --report-only --height 1728 --width 4096
-
-  # numerics of the port's resample against the reference, CPU, no assets:
-  python repro_unrolling_trn2.py --self-test
-
-NOTE ON --random-weights: timing and descriptor counts do not depend on the weights, so a perf
-or bottleneck run is valid without them. ACCURACY IS NOT -- any PSNR from random weights is
-meaningless and this script refuses to print one.
-"""
 from __future__ import annotations
 
 import argparse
@@ -1161,8 +1117,16 @@ def run_tiled(reps, tiles, pair_f, pair_b, t_fwd, t_bwd, H, W, gamma, real_tripl
             outs.append((i, crop))
         return outs, (time.perf_counter() - t0) * 1e3
 
-    with ThreadPoolExecutor(max_workers=ncore) as pool:
-        res = list(pool.map(_one, range(ncore)))
+    if ncore == 1:
+        # INLINE ON THE CALLING THREAD when there is one core. The pool bought nothing here -- one
+        # worker, one task -- and it cost the whole host-side profile: torch.profiler does not
+        # instrument a thread spawned inside its own window, so a --only-tile run traced 671 slices,
+        # ZERO resample: spans, and 3000 ms of _thread.lock.acquire on the main thread while every
+        # aten op happened out of sight on the worker. Same numbers, one less thread hop.
+        res = [_one(0)]
+    else:
+        with ThreadPoolExecutor(max_workers=ncore) as pool:
+            res = list(pool.map(_one, range(ncore)))
     t_s = time.perf_counter()
     frame = torch.zeros(1, 3, H, W)
     cover = torch.zeros(1, 1, H, W)

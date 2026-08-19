@@ -1,13 +1,3 @@
-# Decode a preserved trace into a TIME SERIES. No Neuron device -- the profiler only PARSES.
-#
-# Why this is a separate job and not part of the benchmark: the trace for the heavy graph is
-# 1.1 GB, and converting a trace that size to queryable tables takes far longer than the workload
-# it recorded. Run inline it times out and silently skips, leaving you with aggregates and no
-# ordering. So: benchmark writes the pair, this reads it.
-#
-# Why it cannot run on a laptop: the profiler CLI ships Linux-only (verified -- the tools package
-# has no build for Darwin/arm64), so the decode has to happen where the image is. The QUERY side
-# is just duckdb and runs anywhere, which is why the report is text.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -23,8 +13,6 @@ spec:
       restartPolicy: Never
       nodeSelector:
         node-type: trn3-dev1          # for the IMAGE, not for a device
-      # DELIBERATELY no resourceClaims: parsing a trace needs no NeuronCore, so this does not
-      # queue behind or steal cores from a benchmark run.
       containers:
         - name: analyze
           image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
@@ -125,10 +113,8 @@ spec:
               cpu: 32
               memory: 128Gi
             limits:
-              cpu: 48
-              # A 1.1 GB trace expands substantially in memory during conversion; this is the
-              # single resource that decides whether the ingest finishes.
-              memory: 400Gi
+              cpu: 480
+              memory: 900Gi
           volumeMounts:
             - name: dshm
               mountPath: /dev/shm
