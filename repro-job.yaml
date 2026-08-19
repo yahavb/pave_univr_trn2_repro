@@ -12,9 +12,9 @@ spec:
       restartPolicy: Never
       nodeSelector:
         node-type: trn3-dev1
-        # Pinned: the S3 add-on backing the /var/mdl PVC only runs on this node. Elsewhere the
-        # pod sits Pending on "MountVolume.SetUp failed ... DeadlineExceeded".
-        kubernetes.io/hostname: ip-192-168-192-189.us-east-2.compute.internal
+        # NOT pinned to a host (retired 2026-08-19). The PVC mounts on any trn3-dev1 now. If a
+        # pod ever sits Pending on "MountVolume.SetUp failed ... DeadlineExceeded" again,
+        # s3-mount-test-pod.yaml checks one node in 85 s.
       resourceClaims:
         - name: neurons
           resourceClaimTemplateName: s-lnc1

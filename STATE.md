@@ -1,6 +1,6 @@
 # Session state
 
-HEAD `c9399d3`, `main`, pushed. Local `~/pave_univr_trn2_repro`.
+HEAD `7bd20d0`, `main`, pushed. Local `~/pave_univr_trn2_repro`.
 Origin repo for reference only: `~/pave-unrolling`.
 
 ## The goal
@@ -549,15 +549,15 @@ deterministic compiler verdicts rather than flaky runs.
   Worth one check before concluding the flag is purely harmful, since it may affect scheduling.
 * **The other grids under the memory ceiling.** Not worth chasing: 2x4 1.0M px, 3x4 811k,
   2x8 594k all OOM regardless of flags, and 2x8 died at 600, 1000 AND 1500Gi.
-* **`ip-192-168-192-40` S3 mount is broken** -- a cluster-owner problem, not a kubectl one.
-  The Mountpoint pod and the CSI node driver never complete their `/comm/mount.sock`
-  handshake: the pod waits exactly 120 s, times out, restarts. The driver DOES request the
-  mount and the Mountpoint pod IS created, so it is neither a missing daemon nor IAM. `.40`
-  differs from the working `.189` in nodegroup (`trn3-dev1-48xl-efa` vs `cr1-no-efa`), launch
-  template, AMI, `CAPACITY_BLOCK` capacity type, and lacks the `alpha.eksctl.io/*` labels.
-  Most likely a host filesystem or mount-propagation difference on that AMI. The
-  `s3-csi-controller` TLS error in its `--previous` log is 20 h stale and NOT the cause.
-  **Every job is pinned to `.189`** -- `s3-mount-test-pod.yaml` checks a node in 85 s.
+* ~~`ip-192-168-192-40` S3 mount is broken~~ **CLOSED 2026-08-19: no node pinning needed any
+  more.** Kept for the diagnosis in case it recurs: the Mountpoint pod and the CSI node driver
+  never completed their `/comm/mount.sock` handshake, the pod waited exactly 120 s, timed out and
+  restarted. The driver DID request the mount and the Mountpoint pod WAS created, so it was
+  neither a missing daemon nor IAM. `.40` differed from `.189` in nodegroup
+  (`trn3-dev1-48xl-efa` vs `cr1-no-efa`), launch template, AMI, `CAPACITY_BLOCK` capacity type,
+  and lacked the `alpha.eksctl.io/*` labels -- most likely a host filesystem or
+  mount-propagation difference on that AMI. The `s3-csi-controller` TLS error in its `--previous`
+  log was 20 h stale and NOT the cause.
 
 ## Files
 
@@ -661,6 +661,70 @@ graph's device time to a run that never executed it.
 regime and the shares are of that run's wall. What transfers is WHICH ops the resample is made of
 and their relative device cost; the frame number still comes from `MODE=full`.
 
+## MEASURED: `--static-resize 1` cuts 274-326 ms, and `interpolate` was the top NEFF
+
+Origin is a Slack thread: Liran read the Explorer profile and named it before we measured it --
+GpSimdE SWDGE issuing **512 B DMAs** (`src_pattern=[4][128]`, 128 fp32 = one element per
+partition) while **TensorE sits at zero**, and 512 B cannot saturate DMA, which wants >= 2 KiB.
+He localised it to IFBlock's two `F.interpolate` calls. The profile confirms it exactly: sr0's
+rank-1 NEFF `009cee17` is **301.7 ms of a 376.8 ms capture sum, swdyn 97%, tensor 14%,
+waste 101.0 ms**.
+
+Tile 9 halo 128 (704x768), `gridsample`, `--warp-region eager`, 1 core, warm cache, NO profiler,
+5 iters. `[L] CLEAN LATENCY` is the number:
+
+| arm | clean median | spread | `dev` | vs sr0 | max_diff | PSNR |
+|---|---|---|---|---|---|---|
+| sr0 `interpolate` as written | **1313.3 ms** | 1308.0-1323.0 | 1191.1 | -- | 22.45 LSB | 48.46 dB |
+| sr1 pooling (run A) | **986.9 ms** | 981.7-1022.3 | 869.2 | **-326.4, 1.33x** | 22.17 LSB | 48.77 dB |
+| sr1 pooling (run B) | **1039.2 ms** | 1036.6-1041.9 | 926.5 | **-274.1, 1.26x** | 22.17 LSB | 48.77 dB |
+
+**Two sr1 runs at the identical config differ by 52 ms (5.3%), wider than either run's internal
+spread, so the win is a RANGE: 274-326 ms, 1.26-1.33x.** Quoting 1.33x alone overstates it.
+Run B is `univr-bench-chmlv`, `exp_univr-warpeager_gridsample_t9_h128_sr1_20260819_131951`,
+complete through stage [F]. In its profile the 301.7 ms NEFF **does not exist**; nothing is
+above 176.6 ms.
+
+**Why pooling and not a kernel.** The scales are (4, 2, 1) and at those factors with
+`align_corners=False` bilinear downsample is EXACTLY average pooling, so the gather is not made
+cheaper -- it is **deleted**. `1/2` -> position `2i+0.5`, weights 1/2 -> `avg_pool2d(2)`.
+`1/4` -> position `4i+1.5` -> `avg_pool2d(x[..., 1:, 1:], k=2, s=4)`, a 2x2 mean on a 1-pixel
+offset view, **not** a 4x4 mean. Verified 2.4e-07 at 704x768. `scale == 1` is skipped by the
+existing guard. No fallback warning fired, so every downsample took the pooling path.
+
+**Accuracy is unchanged** (22.45 -> 22.17 LSB), as an exact rewrite must be. So `interpolate` is
+NOT the 22 LSB bug, and that failure is still open.
+
+**What this does NOT license.** It is `--warp-region eager` with `fullgraph=0`, not the fused
+config. **No `MODE=full` run at sr1 exists**, so the 32-tiles/8-cores arithmetic (~1.3 s off a
+frame) is unearned. That run is the next thing worth doing.
+
+**After the fix the SWDGE problem relocates rather than disappears:** sr1's top NEFFs are
+176.6 / 145.7 / 138.7 ms and still SWDGE-heavy, and those are the `gridsample` graphs. That one is
+harder -- `gather` already measures 1.006 desc/px against a printed floor of 1.0 at 40.4 ns/desc,
+and the NKL kernel needs the unmerged DGE ucode. Do not scope an interpolate kernel expecting it
+to fix the resample.
+
+**Levels 2 and 3 are implemented and UNRUN.** Level 2 = upsample as depthwise
+`conv_transpose2d`, which also moves work onto the idle TensorE. Level 3 = **precomputed taps**,
+which is Liran's design in torch form: `_resize_taps` builds `i0/i1/wl/wr` once on the host in
+float64 (float32 there would quantise the weights before use), caches on
+`(in_sz, f, dtype, device)`, and `resize_precomputed` does the separable two-pass with
+`index_select`. Exact: 2.4e-07 at 1/2 and 1/4, 4.8e-07 at x2/x4/x8, 0.0 at 1/3, 1.5e-05 at x2.5.
+
+**Level 3 is the only arm that answers the general question, and sr1 does not answer it.**
+Pooling won by deleting the gather; level 3 moves only the ADDRESS ARITHMETIC out and keeps an
+indexed read, handing the compiler constant index vectors. Whether neuronx-cc folds those into
+static descriptors or reproduces the same 512 B SWDGE pattern is unknown. Read it as: near sr1 =
+constant indices suffice and a general-scale kernel is worth building; near sr0 = the indirection
+survives them. `STATIC_RESIZE=3` is set in the manifest and queued.
+
+**It is not a verdict on Liran's NKI kernel.** His H pass has no gather at all -- rows become
+literal partition offsets combined with scalar weights (`nisa.tensor_scalar`,
+`scalar_tensor_tensor`) and only the W pass gathers, via `nc_n_gather` on the free axis, with
+channels on partitions in NHWC so there are zero transposes. torch `index_select` on NCHW cannot
+express that. A weak sr3 does not condemn the kernel.
+
 ## Traps that cost runs
 
 * **`kubectl apply` uses the on-disk YAML; the pod clones the script from git.** A pod can
@@ -702,10 +766,11 @@ and their relative device cost; the frame number still comes from `MODE=full`.
   differed from the sweep only in which op list they looped over.
 * **`NEURON_CC_FLAGS` must NOT contain `--model-type unet-inference`.** It is the single
   cause of the DMA rejection. Use `--lnc 1`.
-* **Pin every job to `ip-192-168-192-189`.** `node-type=trn3-dev1` matches more than one
-  node and the other one cannot mount the PVC; a job landing there sits Pending on
-  `MountVolume.SetUp failed ... DeadlineExceeded` for as long as you let it (74 min in one
-  case). Use `s3-mount-test-pod.yaml` to check a node in 85 s instead of hours.
+* **Node pinning is RETIRED (2026-08-19).** Jobs select on `node-type=trn3-dev1` alone and no
+  longer name a host. Historical note only: `ip-192-168-192-40` once could not mount the PVC, so
+  a job landing there sat Pending on `MountVolume.SetUp failed ... DeadlineExceeded` for as long
+  as you let it (74 min in one case). If a Pending-on-mount pod ever reappears,
+  `s3-mount-test-pod.yaml` checks a node in 85 s instead of hours.
 * **`--only-tile 1` is not the largest tile.** Tile 10 for 3x9, tile 9 for 4x8. Testing
   tile 1 produced a false "4x8 FUSES" that stood for several runs.
 * **One arm per pod.** Each arm holds its compiled graph, so peak memory is the sum across
