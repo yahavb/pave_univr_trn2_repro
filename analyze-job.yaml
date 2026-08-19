@@ -125,11 +125,11 @@ spec:
               value: "1"
             # WHICH run to analyze -- the directory name under /var/mdl/univr/runs
             - name: RUN
-              value: "exp_univr-warpeager_gridsample_t9_h128_20260819_060954"
+              value: "exp_univr-warpeager_gridsample_t9_h128_sr1_20260819_112538"
             # Cap the work: ingest cost tracks trace size and a big one can take most of an hour,
             # so an uncapped run over many pairs never finishes. 0 = no cap.
             - name: MAX_PAIRS
-              value: "5"
+              value: "6"
             # size = biggest traces first (what is usually wanted, and where the heavy graph is).
             # rank = the order the benchmark measured by TIME. Whatever is skipped is listed, so a
             # capped run cannot be mistaken for full coverage.
