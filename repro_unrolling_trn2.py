@@ -764,10 +764,78 @@ class Contextnet(nn.Module):
         outs = []
         for cv in (self.conv1, self.conv2, self.conv3, self.conv4):
             x = cv(x)
-            flow = F.interpolate(flow, scale_factor=0.5, mode="bilinear",
-                                 align_corners=False, recompute_scale_factor=False) * 0.5
+            flow = (resize_down(flow, 2) if _STATIC_RESIZE else
+                    F.interpolate(flow, scale_factor=0.5, mode="bilinear",
+                                  align_corners=False, recompute_scale_factor=False)) * 0.5
             outs.append(warp(x, flow))
         return outs
+
+
+_STATIC_RESIZE = 0          # 0 = F.interpolate as written, 1 = pooled downsample, 2 = also deconv up
+
+
+def resize_down(x, inv):
+    """Fixed-factor bilinear DOWNSAMPLE as POOLING -- a static access pattern.
+
+    WHY. F.interpolate with a compile-time scale has compile-time sampling positions, so it needs
+    no runtime addresses. It lowers anyway into indirect DMA: MEASURED on tile 9 halo 128, the
+    dominant NEFF (301.7 ms of a 376.8 ms capture sum, swdyn 97%) is GpSimd SWDGE writing 512-byte
+    descriptors -- `[128 1]` fp32 -- while TensorE sits near zero, and the source stamps land on
+    the two interpolate calls in IFBlock.forward. 512 B cannot saturate DMA (it wants >= 2 KiB), so
+    the cost is descriptor issue for data movement that a pooling op expresses directly.
+
+    EXACT, not an approximation. With align_corners=False output pixel i samples
+    (i + 0.5)/s - 0.5:
+      s = 1/2 -> position 2i + 0.5, exactly between inputs 2i and 2i+1, weights 1/2 and 1/2 per
+                 axis, so the result IS the 2x2 mean = avg_pool2d(2).
+      s = 1/4 -> position 4i + 1.5, between inputs 4i+1 and 4i+2, so it is the 2x2 mean of those
+                 -- avg_pool2d(kernel 2, stride 4) on a 1-pixel offset view, NOT a 4x4 mean.
+    Verified max|diff| 2.4e-07 (fp32 rounding) at 704x768 for both.
+
+    Anything else falls back to F.interpolate and SAYS so, because a silent approximation here
+    changes pixels with no error."""
+    if inv == 2:
+        return F.avg_pool2d(x, 2)
+    if inv == 4:
+        return F.avg_pool2d(x[..., 1:, 1:], kernel_size=2, stride=4)
+    if not resize_down.warned:
+        resize_down.warned = True
+        print("  --static-resize: 1/%s downsample has no exact pooling form; using F.interpolate"
+              % inv)
+    return F.interpolate(x, scale_factor=1.0 / inv, mode="bilinear", align_corners=False)
+
+
+resize_down.warned = False
+
+
+def resize_up(x, s):
+    """Fixed-factor bilinear UPSAMPLE as a depthwise TRANSPOSED CONV -- static, and on TensorE.
+
+    Same argument as resize_down, plus it moves the work onto the engine that is idle: the
+    triangular kernel is a constant, so this is a convolution rather than an address computation.
+
+    THE BORDER IS THE WHOLE DIFFICULTY. align_corners=False REPLICATES at the edge while
+    conv_transpose2d zero-pads, so the plain deconv matched the interior to 4.8e-07 and was wrong
+    by up to 1.49 in an s-pixel frame -- exactly the kind of silent edge corruption that looks like
+    a tiling bug later. Replicate-padding one pixel first and cropping s afterwards makes it exact
+    everywhere: verified max|diff| 4.8e-07 for s = 2, 4 and 8 at 88x96 -> 704x768.
+
+    Even s only (the model uses 2, 4, 8). Odd s falls back and says so."""
+    if s % 2 or s < 2:
+        if not resize_up.warned:
+            resize_up.warned = True
+            print("  --static-resize 2: x%s upsample is not an even factor; using F.interpolate" % s)
+        return F.interpolate(x, scale_factor=s, mode="bilinear", align_corners=False)
+    C = x.shape[1]
+    r = torch.arange(2 * s, device=x.device, dtype=x.dtype)
+    tri = (1.0 - ((r + 0.5) / s - 1.0).abs()).clamp_min(0.0)
+    k = (tri[:, None] * tri[None, :]).expand(C, 1, 2 * s, 2 * s).contiguous()
+    o = F.conv_transpose2d(F.pad(x, (1, 1, 1, 1), mode="replicate"), k,
+                           stride=s, padding=s // 2, groups=C)
+    return o[..., s:-s, s:-s]
+
+
+resize_up.warned = False
 
 
 class Unet(nn.Module):
@@ -804,15 +872,25 @@ class IFBlock(nn.Module):
 
     def forward(self, x, flow, scale):
         if scale != 1:
-            x = F.interpolate(x, scale_factor=1.0 / scale, mode="bilinear", align_corners=False)
+            x = resize_down(x, scale) if _STATIC_RESIZE else \
+                F.interpolate(x, scale_factor=1.0 / scale, mode="bilinear", align_corners=False)
         if flow is not None:
-            flow = F.interpolate(flow, scale_factor=1.0 / scale, mode="bilinear",
-                                 align_corners=False) * (1.0 / scale)
+            # AT scale == 1 THIS IS AN IDENTITY RESIZE. scale_factor=1.0 still lowers to a resize op
+            # and, on this stack, to indirect DMA -- work for a transform that returns its input.
+            # The `x` branch above is already guarded; this one never was.
+            if _STATIC_RESIZE and scale == 1:
+                pass
+            elif _STATIC_RESIZE:
+                flow = resize_down(flow, scale) * (1.0 / scale)
+            else:
+                flow = F.interpolate(flow, scale_factor=1.0 / scale, mode="bilinear",
+                                     align_corners=False) * (1.0 / scale)
             x = torch.cat((x, flow), 1)
         x = self.conv0(x)
         x = self.convblock(x) + x
         tmp = self.lastconv(x)
-        tmp = F.interpolate(tmp, scale_factor=scale * 2, mode="bilinear", align_corners=False)
+        tmp = resize_up(tmp, scale * 2) if _STATIC_RESIZE >= 2 else \
+            F.interpolate(tmp, scale_factor=scale * 2, mode="bilinear", align_corners=False)
         return tmp[:, :4] * scale * 2, tmp[:, 4:5]
 
 
@@ -1378,6 +1456,30 @@ def self_test():
             bad += 1
     print("  %s" % ("PASS -- the gather is the same op as grid_sample" if bad == 0
                     else "FAIL -- %d shape(s) disagree" % bad))
+
+    # --static-resize is only legitimate if it is EXACT. Assert it here rather than trusting the
+    # derivation: the border case already bit once (plain conv_transpose2d matched the interior to
+    # 4.8e-07 and was wrong by 1.49 in an s-pixel frame), and a wrong border is invisible in a
+    # latency number and shows up later as an accuracy regression blamed on tiling.
+    print()
+    print("SELF TEST: --static-resize equivalences (must be fp32 rounding, ~1e-7)")
+    tol = 1e-5
+    x = torch.randn(1, 5, 704, 768)
+    for inv in (2, 4):
+        ref = F.interpolate(x, scale_factor=1.0 / inv, mode="bilinear", align_corners=False)
+        got = resize_down(x, inv)
+        d = (ref - got).abs().max().item() if ref.shape == got.shape else float("inf")
+        print("  down 1/%d  %s vs %s  max|diff| %.2e  %s"
+              % (inv, tuple(ref.shape), tuple(got.shape), d, "OK" if d < tol else "FAIL"))
+        bad += d >= tol
+    small = torch.randn(1, 5, 88, 96)
+    for s in (2, 4, 8):
+        ref = F.interpolate(small, scale_factor=s, mode="bilinear", align_corners=False)
+        got = resize_up(small, s)
+        d = (ref - got).abs().max().item() if ref.shape == got.shape else float("inf")
+        print("  up   x%d    %s vs %s  max|diff| %.2e  %s"
+              % (s, tuple(ref.shape), tuple(got.shape), d, "OK" if d < tol else "FAIL"))
+        bad += d >= tol
     return 1 if bad else 0
 
 
@@ -1459,6 +1561,18 @@ def main():
                          "aten events, with 99.6%% of its 760 ms inside one opaque .cpu() wait. "
                          "Eager is the only way a profiler can see the operations. Latency from an "
                          "eager run is NOT comparable to a compiled one.")
+    ap.add_argument("--static-resize", type=int, choices=(0, 1, 2), default=0,
+                    help="replace the FIXED-FACTOR F.interpolate calls with static-pattern ops. "
+                         "0 (default) = as written. 1 = pooled downsample (avg_pool2d) plus skip "
+                         "the identity resize at scale=1. 2 = also the upsample, as a depthwise "
+                         "transposed conv. Every form is EXACT (self-test asserts ~1e-7), so this "
+                         "is a lowering experiment, not an approximation: the scales are (4,2,1), "
+                         "known at compile time, yet interpolate lowers to SWDGE indirect DMA -- "
+                         "MEASURED at tile 9 halo 128, the dominant NEFF is 301.7 ms of a 376.8 ms "
+                         "capture sum at swdyn 97%%, writing 512-byte descriptors while TensorE is "
+                         "near zero, with the source stamps on IFBlock's two interpolate calls. "
+                         "Level 2 is separate because a depthwise conv_transpose2d is its own "
+                         "lowering risk and must be measured, not assumed.")
     ap.add_argument("--warp-region", choices=("none", "neuron", "cpu", "eager"), default="none",
                     help="compile the RESAMPLE as its own region with its own backend, separate "
                          "from the model. none = inline in the model graph (default). neuron = its "
@@ -1522,7 +1636,7 @@ def main():
         ap.error("--gt <image> with --random-weights would print a meaningless PSNR. Use a "
                  "self-generated .npy reference for equivalence testing, or supply --weights.")
 
-    global _NKI_DYN, _PRELU, _PROFILE_BLOCKS, _NKI_FN, _NKI_FN_DYN
+    global _NKI_DYN, _PRELU, _PROFILE_BLOCKS, _NKI_FN, _NKI_FN_DYN, _STATIC_RESIZE
     global _SHIFTWARP_FN, _SHIFTWARP_R, _SHIFTWARP_MAXC
     global _NKL_GATHER_METHOD, _NKL_MAX_INDICES
     _NKI_DYN = (a.warp == "nki-dyn")
@@ -1548,6 +1662,12 @@ def main():
     # Must be set BEFORE UniVR() is constructed, since conv()/deconv() read it at build time.
     # Unconditional: nn.PReLU cannot be legalised by the Neuron backend, and this script
     # always compiles. NeuronPReLU is relu(x) - w*relu(-x), bit-exact, so nothing is traded.
+    _STATIC_RESIZE = a.static_resize
+    if _STATIC_RESIZE:
+        print("  --static-resize %d: fixed-factor interpolate -> %s. Scales are (4,2,1), so every"
+              % (_STATIC_RESIZE, "pooling" if _STATIC_RESIZE == 1 else "pooling + deconv upsample"))
+        print("    sampling position is a compile-time constant and needs NO runtime descriptors.")
+        print("    Exactness is asserted by --self-test, not assumed.")
     _PRELU = NeuronPReLU
     if not a.neuron_prelu:
         print("  NOTE nn.PReLU replaced by NeuronPReLU: it cannot be legalised under torch.compile")

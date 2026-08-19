@@ -162,6 +162,10 @@ spec:
                 # clearing WARPEAGER_RES to ask for the real tile silently ran 288x320 instead --
                 # a whole run at the wrong geometry that still logged as a success. ${VAR-d} honours
                 # an explicitly empty value, which is the only way to SAY "full tile".
+                # ONE ARM PER POD. The static-resize arms compile DIFFERENT graphs, so they get
+                # their own cache tar and run dir via the label -- sharing them would restore the
+                # other arm's NEFFs and the ranking would compare two different models.
+                SR="${STATIC_RESIZE:-0}"
                 WE_RES="${WARPEAGER_RES-288x320}"
                 WE_WARP="${WARPEAGER_WARP:-gridsample}"
                 WE_ITERS="${WARPEAGER_ITERS:-3}"
@@ -169,14 +173,14 @@ spec:
                 if [ -n "$WE_RES" ]; then
                   WH=${WE_RES%%x*}; WW=${WE_RES##*x}
                   GEOM="--height $WH --width $WW --tiles 1x1 --random-weights"
-                  LBL="warpeager_${WE_WARP}_${WE_RES}"
+                  LBL="warpeager_${WE_WARP}_${WE_RES}_sr${SR}"
                 else
                   GEOM="--height 1728 --width 4096 --tiles $GRID --halo $HALO $REF --only-tile $WE_TILE"
                   # HALO BELONGS IN THE LABEL. The NEFF cache tar and the run dir are keyed on
                   # LBL, and tile 9 is 576x640 at halo 64 but 704x768 at halo 128 -- without the
                   # halo a second run restores the FIRST geometry's NEFFs and the per-NEFF ranking
                   # silently mixes two tile sizes.
-                  LBL="warpeager_${WE_WARP}_t${WE_TILE}_h${HALO}"
+                  LBL="warpeager_${WE_WARP}_t${WE_TILE}_h${HALO}_sr${SR}"
                 fi
                 RUN="exp_univr-${LBL}_${TS}"
                 RUNDIR="$PVC/runs/$RUN"
@@ -207,7 +211,7 @@ spec:
                 set +e
                 python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
                     --dtype fp32 --device neuron --cores 1 \
-                    --warp "$WE_WARP" --warp-region eager --iters 0 \
+                    --warp "$WE_WARP" --warp-region eager --static-resize "$SR" --iters 0 \
                     2>&1 | tee "$R/${LBL}_warm.log" \
                   | grep -aiE "only-tile|first call|Killed|Error|MemoryError" || true
                 wrc=${PIPESTATUS[0]}
@@ -222,7 +226,7 @@ spec:
                 set +e
                 python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
                     --dtype fp32 --device neuron --cores 1 \
-                    --warp "$WE_WARP" --warp-region eager --iters "$WE_CLEAN_ITERS" \
+                    --warp "$WE_WARP" --warp-region eager --static-resize "$SR" --iters "$WE_CLEAN_ITERS" \
                     --save-ref "$R/frame_${LBL}.npy" \
                     2>&1 | tee "$R/${LBL}_clean.log"
                 lrc=${PIPESTATUS[0]}
@@ -246,7 +250,7 @@ spec:
                 set +e
                 python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
                     --dtype fp32 --device neuron --cores 1 \
-                    --warp "$WE_WARP" --warp-region eager --iters "$WE_ITERS" \
+                    --warp "$WE_WARP" --warp-region eager --static-resize "$SR" --iters "$WE_ITERS" \
                     --perfetto "$R/perfetto/trace_${LBL}.json" \
                     2>&1 | tee "$R/$LBL.log"
                 arc=${PIPESTATUS[0]}
@@ -277,7 +281,7 @@ spec:
                 NEURON_RT_INSPECT_OUTPUT_DIR="$SYSTRACE" \
                 python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
                     --dtype fp32 --device neuron --cores 1 \
-                    --warp "$WE_WARP" --warp-region eager --iters 1 \
+                    --warp "$WE_WARP" --warp-region eager --static-resize "$SR" --iters 1 \
                     2>&1 | tee "$R/${LBL}_inspect.log" | grep -aiE "median|warp region|Killed|Error" || true
                 set -e
                 echo "  trace_info.pb count: $(find "$SYSTRACE" -name 'trace_info.pb' | wc -l)"
@@ -767,6 +771,12 @@ spec:
             # only latency this mode produces; [A] and [C] both run with a profiler attached.
             - name: WARPEAGER_CLEAN_ITERS
               value: "5"
+            # 0 = F.interpolate as written (the baseline: 009cee17, 301.7 ms, swdyn 97%, 512 B
+            # descriptors). 1 = pooled downsample + drop the identity resize at scale=1.
+            # 2 = also the upsample as a depthwise transposed conv. All EXACT -- whole-model check
+            # on cpu gave max_diff 0.00 LSB / cosine 1.000000 against level 0 for both.
+            - name: STATIC_RESIZE
+              value: "1"
             - name: WARPEAGER_TILE
               value: "9"
             - name: NEURON_LOGICAL_NC_CONFIG
