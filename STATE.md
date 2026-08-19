@@ -1,6 +1,6 @@
 # Session state
 
-HEAD `7bd20d0`, `main`, pushed. Local `~/pave_univr_trn2_repro`.
+HEAD `1d5e4fa`, `main`, pushed. Local `~/pave_univr_trn2_repro`.
 Origin repo for reference only: `~/pave-unrolling`.
 
 ## The goal
@@ -120,6 +120,12 @@ of 3.** Everything the frame adds is therefore exonerated:
 What is left is the per-tile fused graph itself: a conv, `interpolate`, or `NeuronPReLU`
 lowering difference under `fullgraph=True`. The next step is a per-stage numeric diff of one
 tile against CPU, not another geometry sweep.
+
+**ANSWERED -- it was `interpolate`, specifically the UPSAMPLE.** Replacing both fixed-factor
+resizes with precomputed taps takes tile 9 from 22.17 to **0.05 LSB, PASS**. See
+"SOLVED, PROBABLY: `F.interpolate` was BOTH the top NEFF and the accuracy bug". The numbers in
+this section were all measured with `F.interpolate` in place and are baseline numbers, not
+properties of the tiling.
 
 Caveat: these are per-tile scores over each tile's own region, not whole-frame maxima, so they
 are not directly comparable to the 92.56 LSB frame number. Both fail by more than 7x.
@@ -465,7 +471,10 @@ deterministic compiler verdicts rather than flaky runs.
 
 ## Open
 
-* **Why the fused frame fails accuracy at 92.56 LSB.** The live question.
+* **Why the fused frame fails accuracy at 92.56 LSB.** **LIKELY ANSWERED: `F.interpolate`'s
+  upsample.** Tile 9 went 22.17 -> **0.05 LSB (PASS)** with precomputed taps on both resizes.
+  Unconfirmed at the FRAME level -- that needs a `MODE=full` taps run, and it is now the single
+  highest-value job in the repo. Everything below in this bullet is the pre-answer state.
   `accuracy-triage-job.yaml` runs `gather` at halo 128 -- the only remaining variable, since
   gridsample cannot compile fused and the two warps already agree to every digit. That job
   also produces the system-profile bundle.
@@ -661,69 +670,126 @@ graph's device time to a run that never executed it.
 regime and the shares are of that run's wall. What transfers is WHICH ops the resample is made of
 and their relative device cost; the frame number still comes from `MODE=full`.
 
-## MEASURED: `--static-resize 1` cuts 274-326 ms, and `interpolate` was the top NEFF
+## SOLVED, PROBABLY: `F.interpolate` was BOTH the top NEFF and the accuracy bug
 
-Origin is a Slack thread: Liran read the Explorer profile and named it before we measured it --
-GpSimdE SWDGE issuing **512 B DMAs** (`src_pattern=[4][128]`, 128 fp32 = one element per
-partition) while **TensorE sits at zero**, and 512 B cannot saturate DMA, which wants >= 2 KiB.
-He localised it to IFBlock's two `F.interpolate` calls. The profile confirms it exactly: sr0's
-rank-1 NEFF `009cee17` is **301.7 ms of a 376.8 ms capture sum, swdyn 97%, tensor 14%,
-waste 101.0 ms**.
+**Naming.** The flag is `--static-resize N`. Use the plain names, not "srN":
 
-Tile 9 halo 128 (704x768), `gridsample`, `--warp-region eager`, 1 core, warm cache, NO profiler,
-5 iters. `[L] CLEAN LATENCY` is the number:
+| flag | plain name | downsample | upsample |
+|---|---|---|---|
+| 0 | **baseline** | `F.interpolate` | `F.interpolate` |
+| 1 | **pool-down** | `avg_pool2d` | `F.interpolate` -- UNTOUCHED, and this is the whole story below |
+| 2 | **pool+deconv** | `avg_pool2d` | depthwise `conv_transpose2d` |
+| 3 | **taps** | precomputed taps | precomputed taps |
 
-| arm | clean median | spread | `dev` | vs sr0 | max_diff | PSNR |
-|---|---|---|---|---|---|---|
-| sr0 `interpolate` as written | **1313.3 ms** | 1308.0-1323.0 | 1191.1 | -- | 22.45 LSB | 48.46 dB |
-| sr1 pooling (run A) | **986.9 ms** | 981.7-1022.3 | 869.2 | **-326.4, 1.33x** | 22.17 LSB | 48.77 dB |
-| sr1 pooling (run B) | **1039.2 ms** | 1036.6-1041.9 | 926.5 | **-274.1, 1.26x** | 22.17 LSB | 48.77 dB |
+"Taps" = the 2 source pixels per axis a bilinear resize blends, plus their 2 weights. Normally the
+graph re-derives them every call (`src=(o+0.5)/f-0.5`, clamp, floor, +1, subtract) and THAT address
+arithmetic is what lowered to 512 B SWDGE. Precomputed = built once on the host, baked as
+constants, graph does only `read*w + read*w`.
 
-**Two sr1 runs at the identical config differ by 52 ms (5.3%), wider than either run's internal
-spread, so the win is a RANGE: 274-326 ms, 1.26-1.33x.** Quoting 1.33x alone overstates it.
-Run B is `univr-bench-chmlv`, `exp_univr-warpeager_gridsample_t9_h128_sr1_20260819_131951`,
-complete through stage [F]. In its profile the 301.7 ms NEFF **does not exist**; nothing is
-above 176.6 ms.
+Origin is a Slack thread: Liran read the Explorer profile and named the cause before we measured
+it -- GpSimdE SWDGE issuing **512 B DMAs** (`src_pattern=[4][128]`, 128 fp32 = one element per
+partition) while **TensorE sits at zero**, and 512 B cannot saturate DMA, which wants >= 2 KiB. He
+localised it to IFBlock's `F.interpolate` calls. Confirmed: baseline's rank-1 NEFF `009cee17` is
+**301.7 ms of a 376.8 ms capture sum, swdyn 97%, tensor 14%, waste 101.0 ms**.
 
-**Why pooling and not a kernel.** The scales are (4, 2, 1) and at those factors with
-`align_corners=False` bilinear downsample is EXACTLY average pooling, so the gather is not made
-cheaper -- it is **deleted**. `1/2` -> position `2i+0.5`, weights 1/2 -> `avg_pool2d(2)`.
-`1/4` -> position `4i+1.5` -> `avg_pool2d(x[..., 1:, 1:], k=2, s=4)`, a 2x2 mean on a 1-pixel
-offset view, **not** a 4x4 mean. Verified 2.4e-07 at 704x768. `scale == 1` is skipped by the
-existing guard. No fallback warning fired, so every downsample took the pooling path.
+Tile 9 halo 128 (704x768), `gridsample`, `--warp-region eager`, 1 core, warm cache, NO profiler.
+`[L] CLEAN LATENCY` is the number:
 
-**Accuracy is unchanged** (22.45 -> 22.17 LSB), as an exact rewrite must be. So `interpolate` is
-NOT the 22 LSB bug, and that failure is still open.
+| arm | clean median | spread | `dev` | vs baseline | max_diff | PSNR | gate |
+|---|---|---|---|---|---|---|---|
+| baseline | **1313.3 ms** | 1308.0-1323.0 | 1191.1 | -- | 22.45 LSB | 48.46 dB | FAIL |
+| pool-down A | **986.9 ms** | 981.7-1022.3 | 869.2 | 1.33x | 22.17 LSB | 48.77 dB | FAIL |
+| pool-down B | **1039.2 ms** | 1036.6-1041.9 | 926.5 | 1.26x | 22.17 LSB | 48.77 dB | FAIL |
+| **taps** | **647.3 ms** | 643.6-**67203** | 526.3 | **2.03x** | **0.05 LSB** | **102.22 dB** | **PASS** |
 
-**What this does NOT license.** It is `--warp-region eager` with `fullgraph=0`, not the fused
-config. **No `MODE=full` run at sr1 exists**, so the 32-tiles/8-cores arithmetic (~1.3 s off a
-frame) is unearned. That run is the next thing worth doing.
+**THE 22 LSB FAILURE WAS `F.interpolate`'s UPSAMPLE.** Nothing in this file had ever passed the
+3 LSB bar; every arm sat at 22-48 LSB and "why does it fail accuracy" was the live blocking
+question. Read the dispatch and it falls out -- `do_up` keeps `F.interpolate` at level 1 and only
+level 2/3 replace it:
 
-**After the fix the SWDGE problem relocates rather than disappears:** sr1's top NEFFs are
-176.6 / 145.7 / 138.7 ms and still SWDGE-heavy, and those are the `gridsample` graphs. That one is
-harder -- `gather` already measures 1.006 desc/px against a printed floor of 1.0 at 40.4 ns/desc,
-and the NKL kernel needs the unmerged DGE ucode. Do not scope an interpolate kernel expecting it
-to fix the resample.
+```
+            downsample        upsample            max_diff
+baseline    F.interpolate     F.interpolate       22.45
+pool-down   avg_pool2d        F.interpolate       22.17   <-- upsample untouched
+taps        taps              taps                 0.05
+```
 
-**Levels 2 and 3 are implemented and UNRUN.** Level 2 = upsample as depthwise
-`conv_transpose2d`, which also moves work onto the idle TensorE. Level 3 = **precomputed taps**,
-which is Liran's design in torch form: `_resize_taps` builds `i0/i1/wl/wr` once on the host in
-float64 (float32 there would quantise the weights before use), caches on
-`(in_sz, f, dtype, device)`, and `resize_precomputed` does the separable two-pass with
-`index_select`. Exact: 2.4e-07 at 1/2 and 1/4, 4.8e-07 at x2/x4/x8, 0.0 at 1/3, 1.5e-05 at x2.5.
+Swapping the DOWNsample moved accuracy by 0.28 LSB. Swapping the UPsample took it to 0.05, cosine
+**1.000000**, `pixels > 1 LSB = 0.0000%`, worst spatial bucket 0.05. So the fault was never the
+halo, the cores, the stitching, the replica copy or the resample -- all of which earlier sections
+correctly exonerated -- it was the other fixed-factor resize in the same file.
 
-**Level 3 is the only arm that answers the general question, and sr1 does not answer it.**
-Pooling won by deleting the gather; level 3 moves only the ADDRESS ARITHMETIC out and keeps an
-indexed read, handing the compiler constant index vectors. Whether neuronx-cc folds those into
-static descriptors or reproduces the same 512 B SWDGE pattern is unknown. Read it as: near sr1 =
-constant indices suffice and a general-scale kernel is worth building; near sr0 = the indirection
-survives them. `STATIC_RESIZE=3` is set in the manifest and queued.
+**taps vs pool-down is CONFOUNDED and is not a mechanism result.** taps replaces BOTH directions;
+pool-down replaces one. So the 647.3 vs 986.9 gap mixes "constant indices lower better" with
+"one more site got fixed". The honest claim is: **removing `F.interpolate` in both directions is
+worth ~2x and fixes correctness.** Separating mechanism from coverage needs **pool+deconv**, which
+is implemented and unrun. Do not tell Youval taps beat pooling -- that has not been measured.
 
-**It is not a verdict on Liran's NKI kernel.** His H pass has no gather at all -- rows become
-literal partition offsets combined with scalar weights (`nisa.tensor_scalar`,
-`scalar_tensor_tensor`) and only the W pass gathers, via `nc_n_gather` on the free axis, with
-channels on partitions in NHWC so there are zero transposes. torch `index_select` on NCHW cannot
-express that. A weak sr3 does not condemn the kernel.
+**The taps median is NOT yet quotable.** `NEFFs +3 (must be +0, else the median contains a
+compile)` and the spread proves it: `[L] max 67203.3 ms`, `[A] max 11285.3 ms` -- a 67-second
+iteration is a compile inside the timed loop. It survives the median (5 iters, one high outlier)
+and `[A]` independently gives **638.0 ms, min 637.5**, agreeing to 1.5% on tightly clustered fast
+iterations, so ~640 ms is very likely real. **Re-run for a +0 median before quoting it.** Also
+`[W]` reported `NEW graphs compiled by [W]: 0` while `[L]` compiled 3, so the prewarm does not
+cover what the timed loop needs.
+
+Secondary signals: taps produces **55 NEFFs / 13 MB** cache vs pool-down's 63 / 33 MB, and its
+host trace is **154.5 MB vs 0.6 MB** -- `index_select` emits far more host-side slices. Different
+graph shape, not just different timing.
+
+**The precompute is Liran's formula exactly** (`_resize_taps`, `repro_unrolling_trn2.py:841`):
+`out_sz=int(in_sz*f)`, `src=((o+0.5)/f-0.5).clamp(0,in_sz-1)`, `i0=floor`, `i1=min(i0+1,in_sz-1)`,
+`wr=src-i0`, `wl=1-wr`, clamp IS the `align_corners=False` replicate. Two deliberate deviations:
+torch not numpy, and **float64 then cast** rather than `astype(float32)` -- the weights are the
+entire accuracy of the op and computing them in the activation dtype quantises them before use.
+Cached on `(in_sz, f, dtype, device)`. Exact vs `F.interpolate`: 2.4e-07 at 1/2 and 1/4, 4.8e-07
+at x2/x4/x8, 0.0 at 1/3, 1.5e-05 at x2.5.
+
+**It is NOT a verdict on Liran's NKI kernel.** His H pass has no gather at all -- rows become
+literal partition offsets with scalar weights (`nisa.tensor_scalar`, `scalar_tensor_tensor`) and
+only the W pass gathers, via `nc_n_gather` on the free axis, channels on partitions in NHWC so
+zero transposes. torch `index_select` on NCHW cannot express that. Our taps arm keeps the
+indirection deliberately -- it measures whether CONSTANT indices are enough on their own, which is
+his open question, not his answer.
+
+### The traces for this run, and how to read them
+
+Run `exp_univr-warpeager_gridsample_t9_h128_sr3_20260819_142240` on `/var/mdl/univr/runs/`.
+Stages `[D]`/`[E]`/`[F]` were **still running** when this was written, so the per-NEFF ranking and
+the NEFF+NTFF pairs for the taps arm are **not yet recorded here** -- fill them in from
+`ranking_..._sr3.txt` and `perneff_..._sr3.txt`.
+
+| artifact | what it answers |
+|---|---|
+| `pairs/rankNN_<hash8>__<MB>MB/` | `.neff` + `.ntff` + `summary.json`, pre-joined -- Explorer "Individual Files" |
+| `ranking_..._sr3.txt` | per-NEFF fixability + engine mix. **START HERE** |
+| `perneff_..._sr3.txt` | per-NEFF engine table + MODEL-LEVEL engine totals |
+| `perfetto/graph_rankNN_<hash>.pftrace.gz` | what ran INSIDE that graph -> ui.perfetto.dev |
+| `perfetto/device_..._sr3.pftrace.gz` | runtime device timeline |
+| `perfetto/trace_..._sr3.json.gz` | host trace, resample spans named |
+| `explorer/upload_bundle.tar.gz` | Explorer Directory Upload (top level only) |
+
+**Never split a `.neff` from its `.ntff`** -- that pair is the atomic unit of per-NEFF analysis and
+rebuilding the join by filename stem is where wrong attribution creeps in. Use only the no-suffix
+`<hash>.ntff`; the profiler also emits `<hash>_rank_0..N.ntff` decoys on the same stem.
+
+**The comparison to make on the pairs:** baseline's `009cee17` (301.7 ms, swdyn 97%) has no
+counterpart in the taps profile. Confirm that from `ranking_..._sr3.txt` rather than assuming it,
+and check whether the remaining SWDGE-heavy entries are the `gridsample` graphs -- in pool-down
+they were 176.6 / 145.7 / 138.7 ms, and after the interpolate fix the SWDGE cost RELOCATES to the
+resample rather than disappearing. That one is harder: `gather` already measures 1.006 desc/px
+against a printed floor of 1.0 at 40.4 ns/desc, and the NKL kernel needs unmerged DGE ucode. Do
+not scope an interpolate kernel expecting it to fix the resample.
+
+### What this does NOT license
+
+All of it is `--warp-region eager` with `fullgraph=0`, not the fused config. **No `MODE=full` run
+at taps exists**, so the 32-tiles/8-cores arithmetic is unearned. Next, in order:
+
+1. **Re-run taps** for a `+0` median. Warm cache, minutes.
+2. **`MODE=full` at taps** -- the prize. If the tile-level 22.17 -> 0.05 collapse carries to the
+   frame's **92.56 LSB**, the blocking accuracy failure is solved AND the frame is faster.
+3. **pool+deconv**, to separate mechanism from coverage.
 
 ## Traps that cost runs
 
