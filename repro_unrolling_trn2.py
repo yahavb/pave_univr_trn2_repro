@@ -764,9 +764,7 @@ class Contextnet(nn.Module):
         outs = []
         for cv in (self.conv1, self.conv2, self.conv3, self.conv4):
             x = cv(x)
-            flow = (resize_down(flow, 2) if _STATIC_RESIZE else
-                    F.interpolate(flow, scale_factor=0.5, mode="bilinear",
-                                  align_corners=False, recompute_scale_factor=False)) * 0.5
+            flow = do_down(flow, 2) * 0.5
             outs.append(warp(x, flow))
         return outs
 
@@ -837,6 +835,77 @@ def resize_up(x, s):
 
 resize_up.warned = False
 
+_RESIZE_TAPS: dict = {}
+
+
+def _resize_taps(in_sz, f, dtype, device):
+    """The tap indices and blend weights for one axis, computed ONCE and cached.
+
+    This is the "move the precompute to compile time" form. With a constant scale_factor the whole
+    coordinate pipeline -- src = (o+0.5)/f - 0.5, the clamp, floor, +1, and the two weights -- is a
+    function of (in_sz, f) alone, so it belongs outside the graph. Cached per
+    (in_sz, f, dtype, device) and returned as tensors, so after the first call the graph sees four
+    CONSTANTS and does no coordinate arithmetic at all.
+
+    Computed in float64 then cast: the weights are the whole accuracy of the op, and computing them
+    in the activation dtype would quantise them before they are ever used."""
+    key = (int(in_sz), float(f), str(dtype), str(device))
+    e = _RESIZE_TAPS.get(key)
+    if e is None:
+        out_sz = int(in_sz * f)
+        o = torch.arange(out_sz, dtype=torch.float64)
+        src = ((o + 0.5) / f - 0.5).clamp(0, in_sz - 1)       # clamp IS the border replicate
+        i0 = src.floor().to(torch.long)
+        i1 = torch.minimum(i0 + 1, torch.tensor(in_sz - 1))
+        wr = src - i0
+        e = (i0.to(device), i1.to(device),
+             (1.0 - wr).to(dtype).to(device), wr.to(dtype).to(device), out_sz)
+        _RESIZE_TAPS[key] = e
+    return e
+
+
+def resize_precomputed(x, f):
+    """Separable bilinear resize from PRECOMPUTED taps -- the general form, any scale factor.
+
+    Two passes, two taps each, weights baked. Nothing here computes a coordinate: the indices are
+    constant vectors and the reads are index_select, so what reaches the compiler is an indexed read
+    with a COMPILE-TIME index tensor -- which it may be able to lower to static descriptors. That is
+    the experiment; unlike the pooling form it is not guaranteed to remove the indirection, only to
+    remove the address arithmetic and hand the compiler constants.
+
+    Use pooling (level 1/2) for the integer scales this model actually runs: there the two taps are
+    ADJACENT with weights exactly 1/2, so the pattern is a strided window and needs no indices at
+    all. This form exists for the general case -- non-integer or odd factors -- and as the A/B that
+    shows whether constant indices are enough on their own.
+
+    Exactness verified against F.interpolate: 2.4e-07 at 1/2 and 1/4, 4.8e-07 at x2/x4/x8, 0.0 at
+    1/3, and 1.5e-05 at x2.5 (fp32 accumulation order, the only case above 1e-6)."""
+    hi0, hi1, hwl, hwr, Ho = _resize_taps(x.shape[2], f, x.dtype, x.device)
+    wi0, wi1, wwl, wwr, Wo = _resize_taps(x.shape[3], f, x.dtype, x.device)
+    t = x.index_select(2, hi0) * hwl.view(1, 1, Ho, 1) + \
+        x.index_select(2, hi1) * hwr.view(1, 1, Ho, 1)
+    return t.index_select(3, wi0) * wwl.view(1, 1, 1, Wo) + \
+        t.index_select(3, wi1) * wwr.view(1, 1, 1, Wo)
+
+
+def do_down(x, inv):
+    """Dispatch the FIXED-FACTOR downsample. One place, so the arms cannot drift apart."""
+    if _STATIC_RESIZE == 3:
+        return resize_precomputed(x, 1.0 / inv)
+    if _STATIC_RESIZE:
+        return resize_down(x, inv)
+    return F.interpolate(x, scale_factor=1.0 / inv, mode="bilinear", align_corners=False)
+
+
+def do_up(x, s):
+    """Dispatch the FIXED-FACTOR upsample. Level 1 deliberately leaves this as interpolate: the
+    upsample is a separate lowering risk (depthwise conv_transpose2d) and is measured separately."""
+    if _STATIC_RESIZE == 3:
+        return resize_precomputed(x, float(s))
+    if _STATIC_RESIZE >= 2:
+        return resize_up(x, s)
+    return F.interpolate(x, scale_factor=s, mode="bilinear", align_corners=False)
+
 
 class Unet(nn.Module):
     def __init__(self):
@@ -872,25 +941,18 @@ class IFBlock(nn.Module):
 
     def forward(self, x, flow, scale):
         if scale != 1:
-            x = resize_down(x, scale) if _STATIC_RESIZE else \
-                F.interpolate(x, scale_factor=1.0 / scale, mode="bilinear", align_corners=False)
+            x = do_down(x, scale)
         if flow is not None:
             # AT scale == 1 THIS IS AN IDENTITY RESIZE. scale_factor=1.0 still lowers to a resize op
             # and, on this stack, to indirect DMA -- work for a transform that returns its input.
             # The `x` branch above is already guarded; this one never was.
-            if _STATIC_RESIZE and scale == 1:
-                pass
-            elif _STATIC_RESIZE:
-                flow = resize_down(flow, scale) * (1.0 / scale)
-            else:
-                flow = F.interpolate(flow, scale_factor=1.0 / scale, mode="bilinear",
-                                     align_corners=False) * (1.0 / scale)
+            if not (_STATIC_RESIZE and scale == 1):
+                flow = do_down(flow, scale) * (1.0 / scale)
             x = torch.cat((x, flow), 1)
         x = self.conv0(x)
         x = self.convblock(x) + x
         tmp = self.lastconv(x)
-        tmp = resize_up(tmp, scale * 2) if _STATIC_RESIZE >= 2 else \
-            F.interpolate(tmp, scale_factor=scale * 2, mode="bilinear", align_corners=False)
+        tmp = do_up(tmp, scale * 2)
         return tmp[:, :4] * scale * 2, tmp[:, 4:5]
 
 
@@ -1480,6 +1542,18 @@ def self_test():
         print("  up   x%d    %s vs %s  max|diff| %.2e  %s"
               % (s, tuple(ref.shape), tuple(got.shape), d, "OK" if d < tol else "FAIL"))
         bad += d >= tol
+    # Level 3 must hold for ARBITRARY factors, which is its whole reason to exist, so the
+    # non-integer cases are in the test and not just the ones this model runs. x2.5 lands at 1.5e-05
+    # from fp32 accumulation order, so it gets a looser bound -- stated, not hidden.
+    for t, f, ftol in ((x, 0.5, tol), (x, 0.25, tol), (small, 2.0, tol), (small, 8.0, tol),
+                       (torch.randn(1, 5, 96, 96), 1.0 / 3, tol),
+                       (torch.randn(1, 5, 64, 64), 2.5, 1e-4)):
+        ref = F.interpolate(t, scale_factor=f, mode="bilinear", align_corners=False)
+        got = resize_precomputed(t, f)
+        d = (ref - got).abs().max().item() if ref.shape == got.shape else float("inf")
+        print("  taps f=%-6.4f %s -> %s  max|diff| %.2e  %s"
+              % (f, tuple(t.shape[2:]), tuple(ref.shape[2:]), d, "OK" if d < ftol else "FAIL"))
+        bad += d >= ftol
     return 1 if bad else 0
 
 
@@ -1561,7 +1635,7 @@ def main():
                          "aten events, with 99.6%% of its 760 ms inside one opaque .cpu() wait. "
                          "Eager is the only way a profiler can see the operations. Latency from an "
                          "eager run is NOT comparable to a compiled one.")
-    ap.add_argument("--static-resize", type=int, choices=(0, 1, 2), default=0,
+    ap.add_argument("--static-resize", type=int, choices=(0, 1, 2, 3), default=0,
                     help="replace the FIXED-FACTOR F.interpolate calls with static-pattern ops. "
                          "0 (default) = as written. 1 = pooled downsample (avg_pool2d) plus skip "
                          "the identity resize at scale=1. 2 = also the upsample, as a depthwise "
@@ -1572,7 +1646,7 @@ def main():
                          "capture sum at swdyn 97%%, writing 512-byte descriptors while TensorE is "
                          "near zero, with the source stamps on IFBlock's two interpolate calls. "
                          "Level 2 is separate because a depthwise conv_transpose2d is its own "
-                         "lowering risk and must be measured, not assumed.")
+                         "lowering risk and must be measured, not assumed. 3 = PRECOMPUTED TAPS: the general form, any scale factor -- index_select with CONSTANT index vectors and baked weights, so the coordinate arithmetic leaves the graph but the read stays indexed. That is the A/B for whether constant indices alone are enough; 1/2 need no indices at all.")
     ap.add_argument("--warp-region", choices=("none", "neuron", "cpu", "eager"), default="none",
                     help="compile the RESAMPLE as its own region with its own backend, separate "
                          "from the model. none = inline in the model graph (default). neuron = its "
