@@ -1,14 +1,35 @@
+# FULL PRODUCTION FRAME at the taps arm (--static-resize 3). Separate Job NAME from
+# univr-bench so it can be queued or run alongside without a delete.
+#
+# WHY THIS CONFIG AND NOT THE README's. The README baseline is `--tiles 2x4 --halo 128
+# --cores 8 --warp nki` = 3673.3 ms, and it CANNOT be reproduced: 2x4 is 1,009,664 padded
+# px and OOMs the compiler at 1500Gi, and the eager path the README used no longer exists
+# in the script. 4x8 halo 128 is the production fused geometry -- it is the only grid under
+# the host-memory ceiling and all 8 (shape x pass) slots compile. Same frame, same 4096x1728,
+# same golden weights, same 3-LSB bar, same CUDA reference npy.
+#
+# THE PROBE IS THE GO/NO-GO, and it is why this is safe to launch blind. [1/3] compiles the
+# 8 slots SERIALLY, largest first (9 17 8 16 1 25 0 24), archives the cache after each, and
+# gates the 8-core scored arm on ALL of them succeeding. The taps path has NEVER been traced
+# under fullgraph=True -- _resize_taps builds float64 tensors on the first call, which under
+# fullgraph=True happens DURING tracing, and dynamo cannot break there. If that fails it
+# fails on tile 9 in the first probe and stops, costing one compile instead of a day.
+#
+# COST. Eight fused halo-128 graphs took 11.7 h for `gather` at level 0. Taps changes the
+# graph -- 55 NEFFs / 13 MB vs 63 / 33 MB in the eager regime -- so it could be far cheaper
+# or dearer. Budget hours. The cache is keyed 4x8_h128_sr3 and re-archived after EVERY
+# successful compile, so a pod death costs one tile, not the set.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: univr-bench
+  name: univr-full-taps
   namespace: default
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: univr-bench
+        app: univr-full-taps
     spec:
       restartPolicy: Never
       nodeSelector:
@@ -749,15 +770,19 @@ spec:
             - name: BRANCH
               value: "main"
             - name: MODE
-              value: "warpeager"
+              value: "full"
             - name: HALO
               value: "128"
             - name: GRID
               value: "4x8"
             - name: RES
               value: ""
+            # gather, NOT gridsample. gridsample CANNOT compile fused -- OOM-killed at 169 min
+            # and again at 94 min at 1500Gi on this exact geometry, because its lowering issues
+            # 3-205x more DMA descriptors so the fused graph is far larger. gather is what the
+            # model ships with and it is already at the 1 descriptor/px floor.
             - name: WARP
-              value: "gridsample"
+              value: "gather"
             - name: FULLGRAPH
               value: "1"
             - name: WARPCMP_TILE
