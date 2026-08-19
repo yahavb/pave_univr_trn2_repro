@@ -202,6 +202,46 @@ spec:
                 echo "  run dir   : $RUNDIR"
                 echo ""
 
+                WE_CLEAN_ITERS="${WARPEAGER_CLEAN_ITERS:-5}"
+                echo "--- [W] WARM: compile only, NOT timed ---"
+                set +e
+                python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
+                    --dtype fp32 --device neuron --cores 1 \
+                    --warp "$WE_WARP" --warp-region eager --iters 0 \
+                    2>&1 | tee "$R/${LBL}_warm.log" \
+                  | grep -aiE "only-tile|first call|Killed|Error|MemoryError" || true
+                wrc=${PIPESTATUS[0]}
+                set -e
+                echo "  rc=$wrc  NEFFs now $(find /tmp/neff_cache -name '"'"'*.neff'"'"' | wc -l)"
+                archive_cache
+                for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                sleep 5
+
+                echo "--- [L] CLEAN LATENCY: warm cache, NO profiler -- THE number ---"
+                B0=$(find /tmp/neff_cache -name '"'"'*.neff'"'"' | wc -l)
+                set +e
+                python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
+                    --dtype fp32 --device neuron --cores 1 \
+                    --warp "$WE_WARP" --warp-region eager --iters "$WE_CLEAN_ITERS" \
+                    --save-ref "$R/frame_${LBL}.npy" \
+                    2>&1 | tee "$R/${LBL}_clean.log"
+                lrc=${PIPESTATUS[0]}
+                set -e
+                A0=$(find /tmp/neff_cache -name '"'"'*.neff'"'"' | wc -l)
+                T_CLEAN=$(grep -aoE "steady state: median [0-9.]+ ms" "$R/${LBL}_clean.log" | head -1 | awk '"'"'{print $4}'"'"' || true)
+                T_FIRST=$(grep -aoE "first call [0-9.]+ ms" "$R/${LBL}_clean.log" | head -1 | awk '"'"'{print $3}'"'"' || true)
+                LSB=$(grep -aoE "max_diff +[0-9.]+ LSB" "$R/${LBL}_clean.log" | tail -1 | awk '"'"'{print $2}'"'"' || true)
+                PSNR=$(grep -aoE "PSNR +[0-9.]+ dB" "$R/${LBL}_clean.log" | tail -1 | awk '"'"'{print $2}'"'"' || true)
+                echo "  rc=$lrc  CLEAN median=${T_CLEAN:--} ms over $WE_CLEAN_ITERS iters"
+                echo "  max_diff=${LSB:--} LSB  PSNR=${PSNR:--} dB  first call=${T_FIRST:--} ms"
+                echo "  NEFFs +$((A0-B0)) -- MUST be +0, any increase means [W] missed a graph and this"
+                echo "  median includes a compile and is NOT a latency"
+                publish "$R/frame_${LBL}.png" "$RUNDIR/frame_${LBL}.png"
+                publish "$R/frame_${LBL}.json" "$RUNDIR/frame_${LBL}.json"
+                archive_cache
+                for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                sleep 5
+
                 echo "--- [A] host trace with the resample OPEN (--warp-region eager --perfetto) ---"
                 set +e
                 python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
@@ -371,6 +411,12 @@ spec:
 
                 echo ""
                 echo "################ WARPEAGER SUMMARY ################"
+                T_A=$(grep -aoE "steady state: median [0-9.]+ ms" "$R/$LBL.log" 2>/dev/null | head -1 | awk '"'"'{print $4}'"'"' || true)
+                printf "  %-38s %s\n" "CLEAN median (THE latency, no profiler)" "${T_CLEAN:--} ms"
+                printf "  %-38s %s\n" "[A] median (torch.profiler ON)" "${T_A:--} ms"
+                printf "  %-38s %s\n" "max_diff / bar 3" "${LSB:--} LSB"
+                printf "  %-38s %s\n" "PSNR" "${PSNR:--} dB"
+                printf "  %-38s %s\n" "first call (compile+warmup, [L])" "${T_FIRST:--} ms"
                 grep -aE "RESAMPLE spans|TRACED WALL|VERDICT INPUT|MODEL THREAD" \
                   "$R/optable_${LBL}.txt" 2>/dev/null | sed 's/^/  /' || true
                 echo ""
@@ -717,6 +763,10 @@ spec:
               value: "gridsample"
             - name: WARPEAGER_ITERS
               value: "3"
+            # Iterations for the CLEAN pass in [L] -- no profiler, warm cache. This median is the
+            # only latency this mode produces; [A] and [C] both run with a profiler attached.
+            - name: WARPEAGER_CLEAN_ITERS
+              value: "5"
             - name: WARPEAGER_TILE
               value: "9"
             - name: NEURON_LOGICAL_NC_CONFIG
