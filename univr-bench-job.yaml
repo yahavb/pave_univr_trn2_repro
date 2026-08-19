@@ -141,21 +141,31 @@ spec:
               echo "  run dir   : $RUNDIR"
               echo ""
 
+              # nkilib is ONLY restored when an arm actually asks for gridsample-nkl. It was
+              # restoring and probing on every run, which put "nkilib: IMPORT OK" in the log of
+              # runs that never touch the kernel -- a standing invitation to read a gridsample
+              # number as an nkl number. The warpcmp arm still skips with its own message if the
+              # tar is missing, so the capability survives without the noise.
               NKILIB_TGZ="${NKILIB_TGZ:-$PVC/nkilib.tar.gz}"
-              if [ -f "$NKILIB_TGZ" ]; then
-                cp "$NKILIB_TGZ" /tmp/nkilib.tar.gz && mkdir -p /tmp/nkilib \
-                  && tar -xzf /tmp/nkilib.tar.gz -C /tmp/nkilib \
-                  && export PYTHONPATH="/tmp/nkilib:${PYTHONPATH:-}" \
-                  && echo "nkilib: restored from $NKILIB_TGZ"
-              else
-                echo "nkilib: no tar at $NKILIB_TGZ"
-              fi
-              if python3 -c "import nkilib.experimental.indirect.grid_sample" 2>/dev/null; then
-                echo "nkilib: IMPORT OK -- gridsample-nkl available"
-              else
-                echo "nkilib: IMPORT FAILS -- gridsample-nkl arms will be SKIPPED"
-              fi
-              echo ""
+              case "${WARP:-}:${WARPEAGER_WARP:-}:${WARPCMP_ARMS:-}" in
+                *gridsample-nkl*)
+                  if [ -f "$NKILIB_TGZ" ]; then
+                    cp "$NKILIB_TGZ" /tmp/nkilib.tar.gz && mkdir -p /tmp/nkilib \
+                      && tar -xzf /tmp/nkilib.tar.gz -C /tmp/nkilib \
+                      && export PYTHONPATH="/tmp/nkilib:${PYTHONPATH:-}" \
+                      && echo "nkilib: restored from $NKILIB_TGZ"
+                  else
+                    echo "nkilib: no tar at $NKILIB_TGZ"
+                  fi
+                  if python3 -c "import nkilib.experimental.indirect.grid_sample" 2>/dev/null; then
+                    echo "nkilib: IMPORT OK -- gridsample-nkl available"
+                  else
+                    echo "nkilib: IMPORT FAILS -- gridsample-nkl arms will be SKIPPED"
+                  fi
+                  echo ""
+                  ;;
+                *) echo "nkilib: NOT restored -- no arm requests gridsample-nkl"; echo "" ;;
+              esac
 
               if [ "${MODE:-full}" = "warpeager" ]; then
                 # NO COLON in the default: ${VAR:-d} substitutes d when VAR is unset OR EMPTY, so
