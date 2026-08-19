@@ -771,8 +771,19 @@ spec:
             # descriptors). 1 = pooled downsample + drop the identity resize at scale=1.
             # 2 = also the upsample as a depthwise transposed conv. All EXACT -- whole-model check
             # on cpu gave max_diff 0.00 LSB / cosine 1.000000 against level 0 for both.
+            # 3 = PRECOMPUTED TAPS, and it is the ONLY arm that answers the question the thread
+            # actually asked. MEASURED so far, tile 9 halo 128, clean median: sr0 1313.3 ms,
+            # sr1 986.9 and 1039.2 ms across two runs (so the pooling win is 274-326 ms, and
+            # 52 ms of that is run-to-run). Pooling wins by DELETING the gather -- at 1/2 and 1/4
+            # the two taps are adjacent with weights exactly 1/2 -- so it says nothing about the
+            # general form. Level 3 moves only the ADDRESS ARITHMETIC out of the graph (i0/i1/wl/wr
+            # built once on the host in float64, cached) and keeps an indexed read via
+            # index_select. Whether neuronx-cc folds a CONSTANT index tensor into static
+            # descriptors, or reproduces the same 512 B SWDGE pattern, is unknown and is the whole
+            # experiment. Read it as: near sr1 = constant indices suffice; near sr0 = the
+            # indirection survives them and only removing the gather helps.
             - name: STATIC_RESIZE
-              value: "1"
+              value: "3"
             - name: WARPEAGER_TILE
               value: "9"
             - name: NEURON_LOGICAL_NC_CONFIG
