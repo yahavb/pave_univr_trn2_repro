@@ -125,7 +125,7 @@ spec:
               value: "1"
             # WHICH run to analyze -- the directory name under /var/mdl/univr/runs
             - name: RUN
-              value: "exp_univr-warpeager_gridsample_288x320_20260818_122633"
+              value: "exp_univr-warpeager_gridsample_t9_h128_20260819_060954"
             # Cap the work: ingest cost tracks trace size and a big one can take most of an hour,
             # so an uncapped run over many pairs never finishes. 0 = no cap.
             - name: MAX_PAIRS
