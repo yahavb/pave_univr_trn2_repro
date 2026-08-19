@@ -32,17 +32,10 @@ spec:
               cd REPRO
 
               GIT_SHA=$(git rev-parse HEAD); GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-              echo "┌── PROVENANCE ──"
-              echo "│ branch : $GIT_BRANCH (requested: $BRANCH)"
-              echo "│ commit : $GIT_SHA"
-              echo "│ subject: $(git log -1 --pretty=%s)"
-              echo "│ cc     : $(neuronx-cc --version 2>&1 | head -1 || true)"
-              echo "│ ccflags: ${NEURON_CC_FLAGS:-<unset>}"
-              echo "└────────────────"
+              echo "commit ${GIT_SHA:0:8} ($GIT_BRANCH) | cc $(neuronx-cc --version 2>&1 | head -1 | awk '{print $NF}') | ccflags ${NEURON_CC_FLAGS:-<unset>}"
 
               PROBE='import torch,repro_unrolling_trn2; print("cache_size_limit="+str(torch._dynamo.config.cache_size_limit), "accumulated="+str(torch._dynamo.config.accumulated_cache_size_limit))'
-              echo "PROVENANCE FEATURE: $(python3 -c "$PROBE" 2>&1 | tail -1)"
-              echo ""
+              echo "dynamo: $(python3 -c "$PROBE" 2>&1 | tail -1)"
 
               GRID="${GRID:-4x8}"; HALO="${HALO:-128}"; WARP="${WARP:-gather}"
               CORES="${CORES:-8}"; ITERS="${ITERS:-5}"
@@ -62,11 +55,7 @@ spec:
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
               mkdir -p /tmp/neff_cache
 
-              echo "════════════ NEURON 3-RUN BENCHMARK -- UniVR 4K unrolling ════════════"
-              echo "  config    : $GRID halo $HALO warp $WARP  ${CORES} cores  ${ITERS} iters  fp32"
-              echo "  reference : $REFERENCE"
-              echo "══════════════════════════════════════════════════════════════════════"
-              echo ""
+              echo "config: $GRID h$HALO warp $WARP ${CORES}c ${ITERS}it fp32"
 
               mkdir -p "$RUNDIR/explorer" "$RUNDIR/perfetto" || true
               publish() {
@@ -98,29 +87,27 @@ spec:
                 tar -czf "/tmp/univr_results_${TS}.tar.gz" -C /tmp results 2>/dev/null || true
                 publish "/tmp/univr_results_${TS}.tar.gz" "$RUNDIR/univr_results_${TS}.tar.gz"
                 echo "  layout: $RUNDIR"
-                ls -la "$RUNDIR" 2>/dev/null | sed 's/^/    /' || true
+                ls -1 "$RUNDIR" 2>/dev/null | sed 's/^/    /' || true
               }
               trap finalize EXIT
 
               # THIS BANNER READS THE GENERIC KEY, and MODE=warpeager/warpcmp override CACHE_TGZ
               # afterwards -- so for those modes it always claimed "(none)" and "LOADED: 0" while the
               # mode's own restore was pulling 49 NEFFs a few lines later. Say which key it is.
-              echo "┌───────── NEFF CACHE (generic key; a MODE may override it below) ─────────"
+              # generic key; MODE=warpeager/warpcmp override CACHE_TGZ below
               if [ -f "$CACHE_TGZ" ]; then
                 cp "$CACHE_TGZ" /tmp/restore.tar.gz && tar -xzf /tmp/restore.tar.gz -C /tmp \
                   || echo "│ WARNING: restore failed"
-                echo "│ SOURCE : $CACHE_TGZ ($(du -h "$CACHE_TGZ" | cut -f1))"
+                echo "cache[generic]: $(basename "$CACHE_TGZ") $(du -h "$CACHE_TGZ" | cut -f1)"
               else
                 # No fabricated estimate. MEASURED at 704x768 tile 9 with the eager region:
                 # 597.9 s for the interpolate arm, 266.8 s and 245.0 s for the pooled arm. The
                 # "~75 min per shape" this used to print came from FUSED fullgraph=1 compiles and
                 # was wrong by an order of magnitude for every run that read it.
-                echo "│ SOURCE : (none) for this key -- see the MODE's own restore line below"
+                echo "cache[generic]: none"
               fi
               CACHE_BEFORE=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
-              echo "│ LOADED : $CACHE_BEFORE prebuilt NEFFs"
-              echo "└─────────────────────────────────────────"
-              echo ""
+              echo "cache[generic]: $CACHE_BEFORE NEFFs"
 
               PROF=neuron-explorer
               command -v "$PROF" >/dev/null 2>&1 || PROF=neuron-profile
@@ -211,21 +198,15 @@ spec:
                 else
                   echo "cache: none at $CACHE_TGZ -- cold compile expected"
                 fi
-                echo "=== MODE=warpeager  ${WE_RES:-$GRID halo $HALO tile $WE_TILE}  warp $WE_WARP  iters $WE_ITERS ==="
-                if [ -n "$WE_RES" ]; then
-                  echo "  geometry  : REDUCED ${WE_RES} 1x1, random weights (WARPEAGER_RES is set)"
-                else
-                  echo "  geometry  : REAL TILE $GRID halo $HALO --only-tile $WE_TILE, golden weights"
-                fi
-                [ -n "$RES" ] && echo "  NOTE RES=$RES is NOT used in this mode (WARPEAGER_RES is), but it did"
-                [ -n "$RES" ] && echo "       force --random-weights, so a cleared WARPEAGER_RES runs the real tile"
-                [ -n "$RES" ] && echo "       WITHOUT the golden. Clear RES too for a scored full-tile run."
-                echo "  run dir   : $RUNDIR"
-                echo ""
+                echo "MODE=warpeager ${WE_RES:-$GRID h$HALO tile$WE_TILE} warp=$WE_WARP sr=$SR iters=$WE_ITERS"
+                [ -n "$WE_RES" ] && echo "geometry: REDUCED $WE_RES 1x1 random-weights" \
+                                  || echo "geometry: REAL TILE $GRID h$HALO only-tile $WE_TILE golden"
+                [ -n "$RES" ] && echo "NOTE RES=$RES unused here (forced --random-weights; clear it for a scored run)"
+                echo "run dir: $RUNDIR"
 
                 WE_CLEAN_ITERS="${WARPEAGER_CLEAN_ITERS:-5}"
                 find /tmp/neff_cache -name '*.neff' -printf '%f\n' 2>/dev/null | sort > /tmp/neff_before.txt
-                echo "--- [W] WARM: compile only, NOT timed ---"
+                echo "[W] compile (not timed)"
                 set +e
                 python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
                     --dtype fp32 --device neuron --cores 1 \
@@ -248,14 +229,15 @@ spec:
                 for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
                 sleep 5
 
-                echo "--- [L] CLEAN LATENCY: warm cache, NO profiler -- THE number ---"
+                echo "[L] clean latency (no profiler)"
                 B0=$(find /tmp/neff_cache -name '*.neff' | wc -l)
                 set +e
                 python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
                     --dtype fp32 --device neuron --cores 1 \
                     --warp "$WE_WARP" --warp-region eager --static-resize "$SR" --iters "$WE_CLEAN_ITERS" \
                     --save-ref "$R/frame_${LBL}.npy" \
-                    2>&1 | tee "$R/${LBL}_clean.log"
+                    2>&1 | tee "$R/${LBL}_clean.log" \
+                  | grep -aE "steady state|max_diff|PSNR|only-tile|Killed|Error|Traceback" || true
                 lrc=${PIPESTATUS[0]}
                 set -e
                 A0=$(find /tmp/neff_cache -name '*.neff' | wc -l)
@@ -265,15 +247,14 @@ spec:
                 PSNR=$(grep -aoE "PSNR +[0-9.]+ dB" "$R/${LBL}_clean.log" | tail -1 | awk '{print $2}' || true)
                 echo "  rc=$lrc  CLEAN median=${T_CLEAN:--} ms over $WE_CLEAN_ITERS iters"
                 echo "  max_diff=${LSB:--} LSB  PSNR=${PSNR:--} dB  first call=${T_FIRST:--} ms"
-                echo "  NEFFs +$((A0-B0)) -- MUST be +0, any increase means [W] missed a graph and this"
-                echo "  median includes a compile and is NOT a latency"
+                echo "  NEFFs +$((A0-B0)) (must be +0, else the median contains a compile)"
                 publish "$R/frame_${LBL}.png" "$RUNDIR/frame_${LBL}.png"
                 publish "$R/frame_${LBL}.json" "$RUNDIR/frame_${LBL}.json"
                 archive_cache
                 for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
                 sleep 5
 
-                echo "--- [A] host trace with the resample OPEN (--warp-region eager --perfetto) ---"
+                echo "[A] host trace (torch.profiler)"
                 set +e
                 python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
                     --dtype fp32 --device neuron --cores 1 \
@@ -293,13 +274,14 @@ spec:
                 sleep 5
 
                 echo ""
-                echo "--- [B] op table: is the hotspot the resample? ---"
-                python3 scripts/neuron/pf_op_summary.py "$R/perfetto/trace_${LBL}.json.gz" --top 25 \
-                    2>&1 | tee "$R/optable_${LBL}.txt" || true
+                echo "[B] op table"
+                python3 scripts/neuron/pf_op_summary.py "$R/perfetto/trace_${LBL}.json.gz" --top 10 \
+                    > "$R/optable_${LBL}.txt" 2>&1 || true
+                sed -n '/MODEL THREAD/,$p' "$R/optable_${LBL}.txt" || true
                 publish "$R/optable_${LBL}.txt" "$RUNDIR/optable_${LBL}.txt"
 
                 echo ""
-                echo "--- [C] runtime system trace -> device timeline ---"
+                echo "[C] runtime systrace -> device pftrace"
                 SYSTRACE=/tmp/systrace_we; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
                 set +e
                 NEURON_RT_INSPECT_ENABLE=1 \
@@ -327,7 +309,7 @@ spec:
                 fi
 
                 echo ""
-                echo "--- [D] per-NEFF engine breakdown (the resample now has its OWN NEFFs) ---"
+                echo "[D] per-NEFF engine breakdown"
                 POUT=/tmp/perneff_we; rm -rf "$POUT"; mkdir -p "$POUT"
                 mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)
                 echo "  NEFFs in cache: ${#NEFFS[@]}"
@@ -342,8 +324,12 @@ spec:
                   [ -s "$POUT/${hash}.json" ] && OK=$((OK+1))
                 done
                 echo "  captured+viewed OK: $OK / ${#NEFFS[@]}"
-                python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$R/perneff_${LBL}.txt" || true
-                python3 scripts/neuron/rank_neffs.py "$POUT" 2>&1 | tee "$R/ranking_${LBL}.txt" || true
+                # per-NEFF table and full ranking go to the files; the log gets the summaries only
+                python3 scripts/neuron/profile_all_neffs.py "$POUT" > "$R/perneff_${LBL}.txt" 2>&1 || true
+                sed -n '/MODEL-LEVEL/,$p' "$R/perneff_${LBL}.txt" || true
+                python3 scripts/neuron/rank_neffs.py "$POUT" > "$R/ranking_${LBL}.txt" 2>&1 || true
+                head -16 "$R/ranking_${LBL}.txt" || true
+                sed -n '/TOP FIXABLE/,$p' "$R/ranking_${LBL}.txt" | head -8 || true
                 publish "$R/perneff_${LBL}.txt" "$RUNDIR/perneff_${LBL}.txt"
                 publish "$R/ranking_${LBL}.txt" "$RUNDIR/ranking_${LBL}.txt"
                 i=0
@@ -360,7 +346,7 @@ spec:
                 [ "$i" = "0" ] && echo "  pairs/ EMPTY -- expected if the capture sweep returned 0/N"
 
                 echo ""
-                echo "--- [E] per-NEFF -> graph.pftrace (what ran INSIDE each graph) ---"
+                echo "[E] pair -> graph pftrace"
                 j=0; NPFT=0
                 for pd in "$R"/pairs/rank*/; do
                   [ -d "$pd" ] || continue
@@ -392,7 +378,7 @@ spec:
                 [ "$j" = "0" ] && echo "  nothing to convert: [D] preserved no pairs"
 
                 echo ""
-                echo "--- [F] Neuron Explorer bundle (Directory Upload) ---"
+                echo "[F] explorer bundle"
                 BEST=$(find "$SYSTRACE" -name 'trace_info.pb' -printf '%s %h\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}' || true)
                 if [ -n "${BEST:-}" ]; then
                   UP=/tmp/upload_bundle_we; rm -rf "$UP"; mkdir -p "$UP"
@@ -422,20 +408,14 @@ spec:
                   cp -r scripts "$UP/source/" 2>/dev/null || true
                   ( cd "$UP/source" && find . -type f ! -name SHA256SUMS -exec sha256sum {} + \
                       > SHA256SUMS 2>/dev/null ) || true
-                  echo "  source/: $(find "$UP/source" -type f | wc -l) files (NOT part of the upload format --"
-                  echo "    Directory Upload reads only the TOP level, so the source sits in a subdir)"
+                  echo "  source/: $(find "$UP/source" -type f | wc -l) files (subdir; not read by Directory Upload)"
                   tar -czf /tmp/source_we.tar.gz -C "$UP" source 2>/dev/null || true
                   publish /tmp/source_we.tar.gz "$RUNDIR/source.tar.gz"
-                  echo "  TOP-LEVEL inventory (what the upload tool reads):"
-                  for f in "$UP"/*.neff "$UP"/*.ntff "$UP"/*.pb; do
-                    [ -f "$f" ] && printf "    %-52s %s bytes\n" "$(basename "$f")" "$(wc -c < "$f")"
-                  done
-                  echo "  files $(ls "$UP" | wc -l)   trace_info.pb $(wc -c < "$UP/trace_info.pb" 2>/dev/null || echo MISSING) bytes"
+                  echo "  top level: $(ls "$UP"/*.neff 2>/dev/null | wc -l) neff, $(ls "$UP"/*.ntff 2>/dev/null | wc -l) ntff, $(ls "$UP"/*.pb 2>/dev/null | wc -l) pb, trace_info.pb $(wc -c < "$UP/trace_info.pb" 2>/dev/null || echo MISSING) B"
                   tar -czf /tmp/upload_bundle_we.tar.gz -C "$UP" . 2>/dev/null || true
                   publish /tmp/upload_bundle_we.tar.gz "$RUNDIR/explorer/upload_bundle.tar.gz"
                 else
-                  echo "  MISSING trace_info.pb -- a Directory Upload would be REJECTED."
-                  echo "  It comes from the RUNTIME env vars in [C], not from capture; check ${LBL}_inspect.log."
+                  echo "  MISSING trace_info.pb -- Directory Upload would be REJECTED (see ${LBL}_inspect.log)"
                 fi
                 tar -czf /tmp/systrace_bundle_we.tar.gz -C "$SYSTRACE" . 2>/dev/null || true
                 publish /tmp/systrace_bundle_we.tar.gz "$RUNDIR/explorer/systrace_bundle.tar.gz"
@@ -450,24 +430,8 @@ spec:
                 printf "  %-38s %s\n" "first call (compile+warmup, [L])" "${T_FIRST:--} ms"
                 grep -aE "RESAMPLE spans|TRACED WALL|VERDICT INPUT|MODEL THREAD" \
                   "$R/optable_${LBL}.txt" 2>/dev/null | sed 's/^/  /' || true
-                echo ""
-                echo "  ARTIFACTS in $RUNDIR"
-                printf "    %-44s %s\n" "perfetto/graph_rankNN_<hash>.pftrace.gz" "$NPFT file(s): INSIDE each graph -> ui.perfetto.dev"
-                printf "    %-44s %s\n" "perfetto/device_${LBL}.pftrace.gz" "runtime device timeline -> ui.perfetto.dev"
-                printf "    %-44s %s\n" "perfetto/trace_${LBL}.json.gz" "host trace, resample named -> ui.perfetto.dev"
-                printf "    %-44s %s\n" "explorer/upload_bundle.tar.gz" "Neuron Explorer Directory Upload (+ source/ subdir)"
-                printf "    %-44s %s\n" "explorer/systrace_bundle.tar.gz" "raw all-rank runtime trace"
-                printf "    %-44s %s\n" "source.tar.gz" "the .py that ran + job YAML + SHA256SUMS"
-                printf "    %-44s %s\n" "pairs/rankNN_<hash>__<MB>MB/" "Explorer 'Individual Files': .neff + .ntff"
-                printf "    %-44s %s\n" "ranking_${LBL}.txt" "per-NEFF fixability + engine mix"
-                printf "    %-44s %s\n" "optable_${LBL}.txt" "host op table, resample vs rest"
-                echo ""
-                echo "  READ IT THIS WAY: the host share above says how much of THIS run's wall the"
-                echo "  resample spans cover; ranking_${LBL}.txt says what its OWN NEFFs cost on"
-                echo "  device. Neither is the fused frame -- fullgraph=0 with 14 breaks per forward"
-                echo "  is a different regime, and MODE=full is still where a latency number comes"
-                echo "  from. What transfers is WHICH ops the resample is made of and their relative"
-                echo "  device cost."
+                echo "  artifacts: $RUNDIR"
+                echo "  NOTE fullgraph=0 + eager region: not the fused config; MODE=full for a frame number"
                 exit 0
               fi
 
@@ -478,17 +442,12 @@ spec:
                 WRES_LIST="${WARPCMP_RES-128x128 192x224 288x320}"
                 WARPCMP_ARMS="${WARPCMP_ARMS:-aten:gridsample:neuron cpu:gridsample:cpu}"
                 echo "=== MODE=warpcmp  ${WRES:-$GRID halo $HALO tile $WT}  iters $WI ==="
-                echo "    THE MODEL STAYS ON NEURON in all three arms. Only the RESAMPLE REGION"
-                echo "    differs: its own torch.compile, its own backend. So the resample is the"
-                echo "    only variable, and the region boundary is a graph break in every arm."
-                echo ""
+                echo "  model on neuron in every arm; only the resample region differs"
                 for WRES in $WRES_LIST; do
                 for CFG in $WARPCMP_ARMS; do
                   LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; RG=${Z##*:}
                   if [ "$WP" = "gridsample-nkl" ] && ! python3 -c "import nkilib.experimental.indirect.grid_sample" 2>/dev/null; then
-                    echo "SKIP $LB: nkilib not importable (CR-288764575 is unmerged; upload a tar"
-                    echo "  CONTAINING nkilib/experimental/indirect/grid_sample.py to $NKILIB_TGZ --"
-                    echo "  a tar from a branch without the CR imports fine and still lacks it)"
+                    echo "SKIP $LB: nkilib not importable (CR-288764575 unmerged; tar must CONTAIN grid_sample.py)"
                     continue
                   fi
                   if [ -n "$WRES" ]; then
