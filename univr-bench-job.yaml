@@ -102,13 +102,20 @@ spec:
               }
               trap finalize EXIT
 
-              echo "┌────────────── NEFF CACHE ──────────────"
+              # THIS BANNER READS THE GENERIC KEY, and MODE=warpeager/warpcmp override CACHE_TGZ
+              # afterwards -- so for those modes it always claimed "(none)" and "LOADED: 0" while the
+              # mode's own restore was pulling 49 NEFFs a few lines later. Say which key it is.
+              echo "┌───────── NEFF CACHE (generic key; a MODE may override it below) ─────────"
               if [ -f "$CACHE_TGZ" ]; then
                 cp "$CACHE_TGZ" /tmp/restore.tar.gz && tar -xzf /tmp/restore.tar.gz -C /tmp \
                   || echo "│ WARNING: restore failed"
                 echo "│ SOURCE : $CACHE_TGZ ($(du -h "$CACHE_TGZ" | cut -f1))"
               else
-                echo "│ SOURCE : (none) -- cold compile expected, ~75 min per 704x768 shape"
+                # No fabricated estimate. MEASURED at 704x768 tile 9 with the eager region:
+                # 597.9 s for the interpolate arm, 266.8 s and 245.0 s for the pooled arm. The
+                # "~75 min per shape" this used to print came from FUSED fullgraph=1 compiles and
+                # was wrong by an order of magnitude for every run that read it.
+                echo "│ SOURCE : (none) for this key -- see the MODE's own restore line below"
               fi
               CACHE_BEFORE=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
               echo "│ LOADED : $CACHE_BEFORE prebuilt NEFFs"
@@ -217,6 +224,7 @@ spec:
                 echo ""
 
                 WE_CLEAN_ITERS="${WARPEAGER_CLEAN_ITERS:-5}"
+                find /tmp/neff_cache -name '*.neff' -printf '%f\n' 2>/dev/null | sort > /tmp/neff_before.txt
                 echo "--- [W] WARM: compile only, NOT timed ---"
                 set +e
                 python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
@@ -227,6 +235,15 @@ spec:
                 wrc=${PIPESTATUS[0]}
                 set -e
                 echo "  rc=$wrc  NEFFs now $(find /tmp/neff_cache -name '*.neff' | wc -l)"
+                # WHICH graphs are new, not just how many. A warm-looking restore that still compiles
+                # 14 graphs is either a real code change or a cache miss, and "+14" alone cannot tell
+                # you which -- so list the hashes that were not in the restored set.
+                find /tmp/neff_cache -name '*.neff' -printf '%f\n' 2>/dev/null | sort > /tmp/neff_after.txt
+                if [ -s /tmp/neff_before.txt ]; then
+                  NEW=$(comm -13 /tmp/neff_before.txt /tmp/neff_after.txt | wc -l)
+                  echo "  NEW graphs compiled by [W]: $NEW"
+                  comm -13 /tmp/neff_before.txt /tmp/neff_after.txt | head -20 | sed 's/^/    + /'
+                fi
                 archive_cache
                 for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
                 sleep 5
