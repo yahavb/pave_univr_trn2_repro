@@ -14,101 +14,806 @@ spec:
       nodeSelector:
         node-type: trn3-dev1
       resourceClaims:
-      - name: neurons
-        resourceClaimTemplateName: s-lnc1
+        - name: neurons
+          resourceClaimTemplateName: s-lnc1
       containers:
-      - name: bench
-        image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
-        imagePullPolicy: IfNotPresent
-        command:
-        - /bin/bash
-        - -ec
-        - "set -euo pipefail\n\nBRANCH=\"${BRANCH:-main}\"\ncd /tmp\ngit clone -b \"$BRANCH\" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO\ncd REPRO\n\nGIT_SHA=$(git rev-parse HEAD); GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)\necho \"commit ${GIT_SHA:0:8} ($GIT_BRANCH) | cc $(neuronx-cc --version 2>&1 | head -1 | awk '{print $NF}') | ccflags ${NEURON_CC_FLAGS:-<unset>}\"\n\nPROBE='import torch,repro_unrolling_trn2; print(\"cache_size_limit=\"+str(torch._dynamo.config.cache_size_limit), \"accumulated=\"+str(torch._dynamo.config.accumulated_cache_size_limit))'\necho \"dynamo: $(python3 -c \"$PROBE\" 2>&1 | tail -1)\"\n\nGRID=\"${GRID:-4x8}\"; HALO=\"${HALO:-128}\"; WARP=\"${WARP:-gather}\"\nCORES=\"${CORES:-8}\"; ITERS=\"${ITERS:-5}\"\nFULLGRAPH=\"${FULLGRAPH:-1}\"\nPREWARM_TILES=\"${PREWARM_TILES:-9 17 8 16 1 25 0 24}\"\nTOPN=\"${TOPN:-5}\"\nREFERENCE=\"README trn2 eager 3673.3 ms / 0.64 LSB; g6e L40S 351.1 ms (161 ms ONNX+TRT)\"\n\nSR=\"${STATIC_RESIZE:-0}\"\nCFG=\"${GRID}_h${HALO}_sr${SR}_fg${FULLGRAPH}\"\nTS=$(date -u +%Y%m%d_%H%M%S)\nRUN=\"exp_univr-${CFG}-${WARP}_${TS}\"\nPVC=/var/mdl/univr\nRUNDIR=\"$PVC/runs/$RUN\"\nCACHE_TGZ=\"$PVC/neff_cache_${CFG}.tar.gz\"\nLEGACY_TGZ=\"$PVC/neff_cache_${GRID}_h${HALO}_sr${SR}.tar.gz\"\nif [ ! -f \"$CACHE_TGZ\" ] && [ \"$FULLGRAPH\" = \"1\" ] && [ -f \"$LEGACY_TGZ\" ]; then\n  echo \"cache: adopting legacy fullgraph=1 key $(basename \"$LEGACY_TGZ\")\"\n  CACHE_TGZ=\"$LEGACY_TGZ\"\n  ADOPTED_LEGACY=1\nfi\n\nR=/tmp/results; rm -rf \"$R\"; mkdir -p \"$R/explorer\" \"$R/perfetto\" \"$R/pairs\"\nexport TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache\nmkdir -p /tmp/neff_cache\n\necho \"config: $GRID h$HALO warp $WARP ${CORES}c ${ITERS}it fp32 static-resize $SR fullgraph $FULLGRAPH\"\n\nmkdir -p \"$RUNDIR/explorer\" \"$RUNDIR/perfetto\" || true\npublish() {\n  local src=\"$1\" dst=\"$2\"\n  [ -f \"$src\" ] || { echo \"  publish SKIP (absent): $(basename \"$src\")\"; return 0; }\n  local n; n=$(wc -c < \"$src\")\n  [ \"$n\" -gt 0 ] || { echo \"  publish REFUSED (0 bytes): $(basename \"$src\")\"; return 0; }\n  cp \"$src\" \"$dst\" || { echo \"  publish FAILED: $(basename \"$src\")\"; return 0; }\n  local m; m=$(wc -c < \"$dst\" 2>/dev/null || echo 0)\n  if [ \"$m\" = \"$n\" ]; then\n    echo \"  published $(basename \"$dst\")  $(( n / 1048576 )) MB  OK\"\n  else\n    echo \"  publish SIZE MISMATCH $(basename \"$dst\"): $n -> $m\"\n  fi\n}\n\narchive_cache() {\n  local n; n=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)\n  [ \"$n\" -gt 0 ] || return 0\n  tar -czf /tmp/neff_cache.tar.gz -C /tmp neff_cache 2>/dev/null || return 0\n  publish /tmp/neff_cache.tar.gz \"$CACHE_TGZ\"\n  echo \"  cache archived: $n NEFFs -> $CACHE_TGZ\"\n}\n\nfinalize() {\n  echo \"\"\n  echo \"=== FINALIZE (trap EXIT -- runs even on failure) ===\"\n  archive_cache\n  tar -czf \"/tmp/univr_results_${TS}.tar.gz\" -C /tmp results 2>/dev/null || true\n  publish \"/tmp/univr_results_${TS}.tar.gz\" \"$RUNDIR/univr_results_${TS}.tar.gz\"\n  echo \"  layout: $RUNDIR\"\n  ls -1 \"$RUNDIR\" 2>/dev/null | sed 's/^/    /' || true\n}\ntrap finalize EXIT\n\nif [ -f \"$CACHE_TGZ\" ]; then\n  cp \"$CACHE_TGZ\" /tmp/restore.tar.gz && tar -xzf /tmp/restore.tar.gz -C /tmp \\\n    || echo \"\u2502 WARNING: restore failed\"\n  echo \"cache[generic]: $(basename \"$CACHE_TGZ\") $(du -h \"$CACHE_TGZ\" | cut -f1)\"\nelse\n  echo \"cache[generic]: none\"\nfi\nCACHE_BEFORE=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)\necho \"cache[generic]: $CACHE_BEFORE NEFFs\"\nif [ \"${ADOPTED_LEGACY:-0}\" = \"1\" ]; then\n  CACHE_TGZ=\"$PVC/neff_cache_${CFG}.tar.gz\"\n  echo \"cache: further archives go to $(basename \"$CACHE_TGZ\")\"\nfi\n\nPROF=neuron-explorer\ncommand -v \"$PROF\" >/dev/null 2>&1 || PROF=neuron-profile\necho \"profiler CLI: $PROF\"\n\nFRAMES=\"--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png\"\nREF=\"--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth\"\nBASE=\"--height 1728 --width 4096 --tiles $GRID --halo $HALO --bar 3 --device neuron --dtype fp32 --fullgraph $FULLGRAPH --static-resize $SR\"\n\nRES=\"${RES:-}\"\nSKIP_PROBE=0\nif [ -n \"$RES\" ]; then\n  RH=${RES%%x*}; RW=${RES##*x}\n  REF=\"--random-weights\"\n  BASE=\"--height $RH --width $RW --tiles 1x1 --bar 3 --device neuron --dtype fp32 --fullgraph $FULLGRAPH --static-resize $SR\"\n  CORES=1\n  SKIP_PROBE=1\n  CFG=\"${RES}_sr${SR}\"\n  RUN=\"exp_univr-${RES}-${WARP}-fg${FULLGRAPH}-sr${SR}_${TS}\"\n  RUNDIR=\"$PVC/runs/$RUN\"\n  CACHE_TGZ=\"$PVC/neff_cache_${RES}_fg${FULLGRAPH}_sr${SR}.tar.gz\"\n  mkdir -p \"$RUNDIR/explorer\" \"$RUNDIR/perfetto\" || true\n  echo \"\u2500\u2500 REDUCED: ${RH}x${RW} = $((RH*RW)) px, 1x1, 1 core, random weights\"\nfi\necho \"  run dir   : $RUNDIR\"\necho \"\"\n\nNKILIB_TGZ=\"${NKILIB_TGZ:-$PVC/nkilib.tar.gz}\"\ncase \"${WARP:-}:${WARPEAGER_WARP:-}:${WARPCMP_ARMS:-}\" in\n  *gridsample-nkl*)\n    if [ -f \"$NKILIB_TGZ\" ]; then\n      cp \"$NKILIB_TGZ\" /tmp/nkilib.tar.gz && mkdir -p /tmp/nkilib \\\n        && tar -xzf /tmp/nkilib.tar.gz -C /tmp/nkilib \\\n        && export PYTHONPATH=\"/tmp/nkilib:${PYTHONPATH:-}\" \\\n        && echo \"nkilib: restored from $NKILIB_TGZ\"\n    else\n      echo \"nkilib: no tar at $NKILIB_TGZ\"\n    fi\n    if python3 -c \"import nkilib.experimental.indirect.grid_sample\" 2>/dev/null; then\n      echo \"nkilib: IMPORT OK -- gridsample-nkl available\"\n    else\n      echo \"nkilib: IMPORT FAILS -- gridsample-nkl arms will be SKIPPED\"\n    fi\n    echo \"\"\n    ;;\n  *) echo \"nkilib: NOT restored -- no arm requests gridsample-nkl\"; echo \"\" ;;\nesac\n\nif [ \"${MODE:-full}\" = \"warpeager\" ]; then\n  WE_RES=\"${WARPEAGER_RES-288x320}\"\n  WE_WARP=\"${WARPEAGER_WARP:-gridsample}\"\n  WE_ITERS=\"${WARPEAGER_ITERS:-3}\"\n  WE_TILE=\"${WARPEAGER_TILE:-9}\"\n  if [ -n \"$WE_RES\" ]; then\n    WH=${WE_RES%%x*}; WW=${WE_RES##*x}\n    GEOM=\"--height $WH --width $WW --tiles 1x1 --random-weights\"\n    LBL=\"warpeager_${WE_WARP}_${WE_RES}_sr${SR}\"\n  else\n    GEOM=\"--height 1728 --width 4096 --tiles $GRID --halo $HALO $REF --only-tile $WE_TILE\"\n    LBL=\"warpeager_${WE_WARP}_t${WE_TILE}_h${HALO}_sr${SR}\"\n  fi\n  RUN=\"exp_univr-${LBL}_${TS}\"\n  RUNDIR=\"$PVC/runs/$RUN\"\n  CACHE_TGZ=\"$PVC/neff_cache_${LBL}.tar.gz\"\n  mkdir -p \"$RUNDIR/perfetto\" \"$RUNDIR/pairs\" \"$RUNDIR/explorer\" || true\n  rm -rf /tmp/neff_cache; mkdir -p /tmp/neff_cache\n  if [ -f \"$CACHE_TGZ\" ]; then\n    cp \"$CACHE_TGZ\" /tmp/we_restore.tar.gz \\\n      && tar -xzf /tmp/we_restore.tar.gz -C /tmp \\\n      && echo \"cache: restored $(find /tmp/neff_cache -name '*.neff' | wc -l) NEFFs from $CACHE_TGZ\"\n  else\n    echo \"cache: none at $CACHE_TGZ -- cold compile expected\"\n  fi\n  echo \"MODE=warpeager ${WE_RES:-$GRID h$HALO tile$WE_TILE} warp=$WE_WARP sr=$SR iters=$WE_ITERS\"\n  [ -n \"$WE_RES\" ] && echo \"geometry: REDUCED $WE_RES 1x1 random-weights\" \\\n                    || echo \"geometry: REAL TILE $GRID h$HALO only-tile $WE_TILE golden\"\n  [ -n \"$RES\" ] && echo \"NOTE RES=$RES unused here (forced --random-weights; clear it for a scored run)\"\n  echo \"run dir: $RUNDIR\"\n\n  WE_CLEAN_ITERS=\"${WARPEAGER_CLEAN_ITERS:-5}\"\n  find /tmp/neff_cache -name '*.neff' -printf '%f\\n' 2>/dev/null | sort > /tmp/neff_before.txt\n  echo \"[W] compile (not timed)\"\n  set +e\n  python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \\\n      --dtype fp32 --device neuron --cores 1 \\\n      --warp \"$WE_WARP\" --warp-region eager --static-resize \"$SR\" --iters 0 \\\n      2>&1 | tee \"$R/${LBL}_warm.log\" \\\n    | grep -aiE \"only-tile|first call|Killed|Error|MemoryError\" || true\n  wrc=${PIPESTATUS[0]}\n  set -e\n  echo \"  rc=$wrc  NEFFs now $(find /tmp/neff_cache -name '*.neff' | wc -l)\"\n  find /tmp/neff_cache -name '*.neff' -printf '%f\\n' 2>/dev/null | sort > /tmp/neff_after.txt\n  if [ -s /tmp/neff_before.txt ]; then\n    NEW=$(comm -13 /tmp/neff_before.txt /tmp/neff_after.txt | wc -l)\n    echo \"  NEW graphs compiled by [W]: $NEW\"\n    comm -13 /tmp/neff_before.txt /tmp/neff_after.txt | head -20 | sed 's/^/    + /'\n  fi\n  archive_cache\n  for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done\n  sleep 5\n\n  echo \"[L] clean latency (no profiler)\"\n  B0=$(find /tmp/neff_cache -name '*.neff' | wc -l)\n  set +e\n  python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \\\n      --dtype fp32 --device neuron --cores 1 \\\n      --warp \"$WE_WARP\" --warp-region eager --static-resize \"$SR\" --iters \"$WE_CLEAN_ITERS\" \\\n      --save-ref \"$R/frame_${LBL}.npy\" \\\n      2>&1 | tee \"$R/${LBL}_clean.log\" \\\n    | grep -aE \"steady state|max_diff|PSNR|only-tile|Killed|Error|Traceback\" || true\n  lrc=${PIPESTATUS[0]}\n  set -e\n  A0=$(find /tmp/neff_cache -name '*.neff' | wc -l)\n  T_CLEAN=$(grep -aoE \"steady state: median [0-9.]+ ms\" \"$R/${LBL}_clean.log\" | head -1 | awk '{print $4}' || true)\n  T_FIRST=$(grep -aoE \"first call [0-9.]+ ms\" \"$R/${LBL}_clean.log\" | head -1 | awk '{print $3}' || true)\n  LSB=$(grep -aoE \"max_diff +[0-9.]+ LSB\" \"$R/${LBL}_clean.log\" | tail -1 | awk '{print $2}' || true)\n  PSNR=$(grep -aoE \"PSNR +[0-9.]+ dB\" \"$R/${LBL}_clean.log\" | tail -1 | awk '{print $2}' || true)\n  echo \"  rc=$lrc  CLEAN median=${T_CLEAN:--} ms over $WE_CLEAN_ITERS iters\"\n  echo \"  max_diff=${LSB:--} LSB  PSNR=${PSNR:--} dB  first call=${T_FIRST:--} ms\"\n  echo \"  NEFFs +$((A0-B0)) (must be +0, else the median contains a compile)\"\n  publish \"$R/frame_${LBL}.png\" \"$RUNDIR/frame_${LBL}.png\"\n  publish \"$R/frame_${LBL}.json\" \"$RUNDIR/frame_${LBL}.json\"\n  archive_cache\n  for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done\n  sleep 5\n\n  echo \"[A] host trace (torch.profiler)\"\n  set +e\n  python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \\\n      --dtype fp32 --device neuron --cores 1 \\\n      --warp \"$WE_WARP\" --warp-region eager --static-resize \"$SR\" --iters \"$WE_ITERS\" \\\n      --perfetto \"$R/perfetto/trace_${LBL}.json\" \\\n      2>&1 | tee \"$R/$LBL.log\"\n  arc=${PIPESTATUS[0]}\n  set -e\n  echo \"  rc=$arc  NEFFs now $(find /tmp/neff_cache -name '*.neff' | wc -l)\"\n  if [ \"$arc\" != \"0\" ]; then\n    { grep -aoE \"got in=[0-9]+ and out=[0-9]+|MemoryError|Killed|Unsupported|FailOnRecompileLimitHit\" \\\n      \"$R/$LBL.log\" || true; } | head -3 | sed 's/^/    /'\n  fi\n  archive_cache\n  publish \"$R/perfetto/trace_${LBL}.json.gz\" \"$RUNDIR/perfetto/trace_${LBL}.json.gz\"\n  for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done\n  sleep 5\n\n  echo \"\"\n  echo \"[B] op table\"\n  python3 scripts/neuron/pf_op_summary.py \"$R/perfetto/trace_${LBL}.json.gz\" --top 10 \\\n      > \"$R/optable_${LBL}.txt\" 2>&1 || true\n  sed -n '/MODEL THREAD/,$p' \"$R/optable_${LBL}.txt\" || true\n  publish \"$R/optable_${LBL}.txt\" \"$RUNDIR/optable_${LBL}.txt\"\n\n  echo \"\"\n  echo \"[C] runtime systrace -> device pftrace\"\n  SYSTRACE=/tmp/systrace_we; rm -rf \"$SYSTRACE\"; mkdir -p \"$SYSTRACE\"\n  set +e\n  NEURON_RT_INSPECT_ENABLE=1 \\\n  NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \\\n  NEURON_RT_INSPECT_DEVICE_PROFILE=1 \\\n  NEURON_RT_INSPECT_OUTPUT_DIR=\"$SYSTRACE\" \\\n  python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \\\n      --dtype fp32 --device neuron --cores 1 \\\n      --warp \"$WE_WARP\" --warp-region eager --static-resize \"$SR\" --iters 1 \\\n      2>&1 | tee \"$R/${LBL}_inspect.log\" | grep -aiE \"median|warp region|Killed|Error\" || true\n  set -e\n  echo \"  trace_info.pb count: $(find \"$SYSTRACE\" -name 'trace_info.pb' | wc -l)\"\n  set +e\n  timeout 900 \"$PROF\" view -d \"$SYSTRACE\" --output-format perfetto \\\n      > \"$R/perfetto/view_${LBL}.log\" 2>&1\n  vrc=$?\n  set -e\n  PFT=$(find \"$SYSTRACE\" \"$R\" /tmp -maxdepth 3 -name '*.pftrace' -newer \"$R/${LBL}_inspect.log\" 2>/dev/null | head -1)\n  if [ -n \"${PFT:-}\" ] && [ -s \"$PFT\" ]; then\n    gzip -c \"$PFT\" > \"$R/perfetto/device_${LBL}.pftrace.gz\"\n    publish \"$R/perfetto/device_${LBL}.pftrace.gz\" \"$RUNDIR/perfetto/device_${LBL}.pftrace.gz\"\n  else\n    echo \"  no .pftrace produced (rc=$vrc); tail of the view log:\"\n    tail -6 \"$R/perfetto/view_${LBL}.log\" 2>/dev/null | sed 's/^/    /' || true\n  fi\n\n  echo \"\"\n  echo \"[D] per-NEFF engine breakdown\"\n  POUT=/tmp/perneff_we; rm -rf \"$POUT\"; mkdir -p \"$POUT\"\n  mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)\n  echo \"  NEFFs in cache: ${#NEFFS[@]}\"\n  OK=0; N=0; T0=$SECONDS\n  for neff in \"${NEFFS[@]}\"; do\n    N=$((N+1))\n    hash=$(basename \"$neff\" .neff)\n    if NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 900 \\\n         \"$PROF\" capture --single-io -n \"$neff\" -s \"$POUT/${hash}.ntff\" >/dev/null 2>&1 \\\n       && [ -f \"$POUT/${hash}.ntff\" ]; then\n      timeout 300 \"$PROF\" view -n \"$neff\" -s \"$POUT/${hash}.ntff\" \\\n        --output-format summary-json > \"$POUT/${hash}.json\" 2>/dev/null || true\n      [ -s \"$POUT/${hash}.json\" ] && OK=$((OK+1))\n    else\n      echo \"    $N/${#NEFFS[@]} ${hash:0:8} capture FAILED\"\n    fi\n    if [ $((N % 10)) = 0 ] || [ \"$N\" = \"${#NEFFS[@]}\" ]; then\n      echo \"    $N/${#NEFFS[@]} ok=$OK  $(( (SECONDS-T0) / 60 ))m\"\n    fi\n  done\n  echo \"  captured+viewed OK: $OK / ${#NEFFS[@]}\"\n  python3 scripts/neuron/profile_all_neffs.py \"$POUT\" > \"$R/perneff_${LBL}.txt\" 2>&1 || true\n  sed -n '/MODEL-LEVEL/,$p' \"$R/perneff_${LBL}.txt\" || true\n  python3 scripts/neuron/rank_neffs.py \"$POUT\" > \"$R/ranking_${LBL}.txt\" 2>&1 || true\n  head -16 \"$R/ranking_${LBL}.txt\" || true\n  sed -n '/TOP FIXABLE/,$p' \"$R/ranking_${LBL}.txt\" | head -8 || true\n  publish \"$R/perneff_${LBL}.txt\" \"$RUNDIR/perneff_${LBL}.txt\"\n  publish \"$R/ranking_${LBL}.txt\" \"$RUNDIR/ranking_${LBL}.txt\"\n  i=0\n  for hash in $(python3 scripts/neuron/top_neffs.py \"$POUT\" \"${TOPN:-5}\" 2>/dev/null || true); do\n    i=$((i+1))\n    src_neff=$(find /tmp/neff_cache -name \"${hash}.neff\" | head -1)\n    [ -n \"$src_neff\" ] && [ -f \"$POUT/${hash}.ntff\" ] || continue\n    MB=$(( $(wc -c < \"$src_neff\") / 1048576 ))\n    d=\"$R/pairs/$(printf 'rank%02d' $i)_${hash:0:8}__${MB}MB\"\n    mkdir -p \"$d\"; cp \"$src_neff\" \"$d/\" && cp \"$POUT/${hash}.ntff\" \"$d/\"\n    [ -f \"$POUT/${hash}.json\" ] && cp \"$POUT/${hash}.json\" \"$d/summary.json\"\n    echo \"  $(basename \"$d\"): $(ls \"$d\" | tr '\\n' ' ')\"\n  done\n  [ \"$i\" = \"0\" ] && echo \"  pairs/ EMPTY -- expected if the capture sweep returned 0/N\"\n\n  echo \"\"\n  echo \"[E] pair -> graph pftrace\"\n  j=0; NPFT=0\n  for pd in \"$R\"/pairs/rank*/; do\n    [ -d \"$pd\" ] || continue\n    nf=$(find \"$pd\" -maxdepth 1 -name '*.neff' | head -1)\n    nt=$(find \"$pd\" -maxdepth 1 -name '*.ntff' | head -1)\n    [ -n \"$nf\" ] && [ -n \"$nt\" ] || continue\n    h=$(basename \"$nf\" .neff); j=$((j+1))\n    G=\"$R/perfetto/graph_$(printf 'rank%02d' $j)_${h:0:8}.pftrace\"\n    set +e\n    timeout 1800 \"$PROF\" view -n \"$nf\" -s \"$nt\" --output-format perfetto \\\n        --output-file \"$G\" > \"$R/perfetto/pft_${h}.log\" 2>&1\n    prc=$?\n    set -e\n    if [ ! -s \"$G\" ]; then\n      alt=$(find \"$pd\" \"$R/perfetto\" \"$(dirname \"$nf\")\" -maxdepth 1 -name '*.pftrace' 2>/dev/null | head -1)\n      if [ -n \"${alt:-}\" ] && [ -s \"$alt\" ] && [ \"$alt\" != \"$G\" ]; then mv \"$alt\" \"$G\"; fi\n    fi\n    if [ -s \"$G\" ]; then\n      gzip -f \"$G\"\n      echo \"  $(basename \"$G\").gz  $(du -h \"${G}.gz\" | cut -f1)  -- ui.perfetto.dev\"\n      publish \"${G}.gz\" \"$RUNDIR/perfetto/$(basename \"${G}.gz\")\"\n      NPFT=$((NPFT+1))\n    else\n      echo \"  NO pftrace for ${h:0:8} (rc=$prc); tail of the view log:\"\n      tail -4 \"$R/perfetto/pft_${h}.log\" 2>/dev/null | sed 's/^/    /' || true\n    fi\n    publish \"$R/perfetto/pft_${h}.log\" \"$RUNDIR/perfetto/pft_${h}.log\"\n  done\n  [ \"$j\" = \"0\" ] && echo \"  nothing to convert: [D] preserved no pairs\"\n\n  echo \"\"\n  echo \"[F] explorer bundle\"\n  BEST=$(find \"$SYSTRACE\" -name 'trace_info.pb' -printf '%s %h\\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}' || true)\n  if [ -n \"${BEST:-}\" ]; then\n    UP=/tmp/upload_bundle_we; rm -rf \"$UP\"; mkdir -p \"$UP\"\n    cp \"$BEST\"/* \"$UP/\" 2>/dev/null || true\n    for pd in \"$R\"/pairs/rank*/; do\n      [ -d \"$pd\" ] || continue\n      for f in \"$pd\"*.neff \"$pd\"*.ntff; do\n        [ -f \"$f\" ] && cp \"$f\" \"$UP/\" 2>/dev/null || true\n      done\n    done\n    for nt in \"$UP\"/*.ntff; do\n      [ -f \"$nt\" ] || continue\n      h=$(basename \"$nt\" .ntff); h=${h%%_rank_*}\n      f=$(find /tmp/neff_cache -name \"${h}.neff\" | head -1)\n      [ -n \"$f\" ] && cp \"$f\" \"$UP/\" 2>/dev/null || true\n    done\n    mkdir -p \"$UP/source\"\n    { echo \"run       : $RUN\"; echo \"provenance: $GIT_BRANCH@$GIT_SHA\";\n      echo \"config    : ${WE_RES:-tile $WE_TILE} warp $WE_WARP --warp-region eager (fullgraph 0)\";\n      echo \"cc        : $(neuronx-cc --version 2>&1 | head -1)\";\n      echo \"ccflags   : ${NEURON_CC_FLAGS:-<unset>}\";\n      echo \"cmd [A]   : python repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 --dtype fp32 --device neuron --cores 1 --warp $WE_WARP --warp-region eager --iters $WE_ITERS --perfetto ...\";\n      echo \"cmd [C]   : NEURON_RT_INSPECT_ENABLE=1 SYSTEM_PROFILE=1 DEVICE_PROFILE=1 (same args, --iters 1, no --perfetto)\";\n    } > \"$UP/source/PROVENANCE.txt\"\n    cp repro_unrolling_trn2.py nki_shift_warp.py microbench.py profile_roofline.py \\\n       univr-bench-job.yaml \"$UP/source/\" 2>/dev/null || true\n    cp -r scripts \"$UP/source/\" 2>/dev/null || true\n    ( cd \"$UP/source\" && find . -type f ! -name SHA256SUMS -exec sha256sum {} + \\\n        > SHA256SUMS 2>/dev/null ) || true\n    echo \"  source/: $(find \"$UP/source\" -type f | wc -l) files (subdir; not read by Directory Upload)\"\n    tar -czf /tmp/source_we.tar.gz -C \"$UP\" source 2>/dev/null || true\n    publish /tmp/source_we.tar.gz \"$RUNDIR/source.tar.gz\"\n    echo \"  top level: $(ls \"$UP\"/*.neff 2>/dev/null | wc -l) neff, $(ls \"$UP\"/*.ntff 2>/dev/null | wc -l) ntff, $(ls \"$UP\"/*.pb 2>/dev/null | wc -l) pb, trace_info.pb $(wc -c < \"$UP/trace_info.pb\" 2>/dev/null || echo MISSING) B\"\n    tar -czf /tmp/upload_bundle_we.tar.gz -C \"$UP\" . 2>/dev/null || true\n    publish /tmp/upload_bundle_we.tar.gz \"$RUNDIR/explorer/upload_bundle.tar.gz\"\n  else\n    echo \"  MISSING trace_info.pb -- Directory Upload would be REJECTED (see ${LBL}_inspect.log)\"\n  fi\n  tar -czf /tmp/systrace_bundle_we.tar.gz -C \"$SYSTRACE\" . 2>/dev/null || true\n  publish /tmp/systrace_bundle_we.tar.gz \"$RUNDIR/explorer/systrace_bundle.tar.gz\"\n\n  echo \"\"\n  echo \"################ WARPEAGER SUMMARY ################\"\n  T_A=$(grep -aoE \"steady state: median [0-9.]+ ms\" \"$R/$LBL.log\" 2>/dev/null | head -1 | awk '{print $4}' || true)\n  printf \"  %-38s %s\\n\" \"CLEAN median (THE latency, no profiler)\" \"${T_CLEAN:--} ms\"\n  printf \"  %-38s %s\\n\" \"[A] median (torch.profiler ON)\" \"${T_A:--} ms\"\n  printf \"  %-38s %s\\n\" \"max_diff / bar 3\" \"${LSB:--} LSB\"\n  printf \"  %-38s %s\\n\" \"PSNR\" \"${PSNR:--} dB\"\n  printf \"  %-38s %s\\n\" \"first call (compile+warmup, [L])\" \"${T_FIRST:--} ms\"\n  grep -aE \"RESAMPLE spans|TRACED WALL|VERDICT INPUT|MODEL THREAD\" \\\n    \"$R/optable_${LBL}.txt\" 2>/dev/null | sed 's/^/  /' || true\n  echo \"  artifacts: $RUNDIR\"\n  echo \"  NOTE fullgraph=0 + eager region: not the fused config; MODE=full for a frame number\"\n  exit 0\nfi\n\nif [ \"${MODE:-full}\" = \"warpcmp\" ]; then\n  WT=\"${WARPCMP_TILE:-9}\"; WI=\"${WARPCMP_ITERS:-3}\"\n  WRES_LIST=\"${WARPCMP_RES-128x128 192x224 288x320}\"\n  WARPCMP_ARMS=\"${WARPCMP_ARMS:-aten:gridsample:neuron cpu:gridsample:cpu}\"\n  echo \"=== MODE=warpcmp  ${WRES:-$GRID halo $HALO tile $WT}  iters $WI ===\"\n  echo \"  model on neuron in every arm; only the resample region differs\"\n  for WRES in $WRES_LIST; do\n  for CFG in $WARPCMP_ARMS; do\n    LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; RG=${Z##*:}\n    if [ \"$WP\" = \"gridsample-nkl\" ] && ! python3 -c \"import nkilib.experimental.indirect.grid_sample\" 2>/dev/null; then\n      echo \"SKIP $LB: nkilib not importable (CR-288764575 unmerged; tar must CONTAIN grid_sample.py)\"\n      continue\n    fi\n    if [ -n \"$WRES\" ]; then\n      WH=${WRES%%x*}; WW=${WRES##*x}\n      GEOM=\"--height $WH --width $WW --tiles 1x1 --random-weights\"\n      LBL=\"warpcmp_${LB}_${WRES}\"\n    else\n      GEOM=\"--height 1728 --width 4096 --tiles $GRID --halo $HALO $REF --only-tile $WT\"\n      LBL=\"warpcmp_${LB}_t${WT}\"\n    fi\n    echo \"################ $LBL\"\n    B=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)\n    set +e\n    python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \\\n        --dtype fp32 --device neuron --cores 1 \\\n        --warp \"$WP\" --warp-region \"$RG\" --iters \"$WI\" \\\n        2>&1 | tee \"$R/$LBL.log\"\n    rc=${PIPESTATUS[0]}\n    set -e\n    A=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)\n    echo \"$rc\" > \"$R/rc_$LBL.txt\"\n    echo \"  rc=$rc  NEFFs +$((A-B))\"\n    if [ \"$rc\" != \"0\" ]; then\n      { grep -aoE \"got in=[0-9]+ and out=[0-9]+|MemoryError|Killed|Unsupported|kernel_assert\" \\\n        \"$R/$LBL.log\" || true; } | head -3 | sed 's/^/    /'\n    fi\n    archive_cache\n    for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done\n    sleep 5\n  done\n  done\n  echo \"\"\n  echo \"################ GRIDSAMPLE IN THE MODEL -- ${WRES:-$GRID halo $HALO tile $WT} fullgraph $WFG\"\n  printf \"  %-10s %-8s %-14s %5s %12s %12s %10s\\n\" size cfg warp_region rc median_ms vs_aten first_ms\n  for WRES in $WRES_LIST; do\n  A_MS=$(grep -aoE \"steady state: median [0-9.]+ ms\" \"$R/warpcmp_aten_${WRES}.log\" 2>/dev/null | head -1 | awk '{print $4}' || true)\n  for CFG in $WARPCMP_ARMS; do\n    LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; RG=${Z##*:}\n    f=\"$R/warpcmp_${LB}_${WRES}.log\"; [ -f \"$f\" ] || continue\n    rc=$(cat \"$R/rc_warpcmp_${LB}_${WRES}.txt\" 2>/dev/null || echo '?')\n    MS=$(grep -aoE \"steady state: median [0-9.]+ ms\" \"$f\" | head -1 | awk '{print $4}' || true)\n    FI=$(grep -aoE \"first call [0-9.]+ ms\" \"$f\" | head -1 | awk '{print $3}' || true)\n    L=$(grep -aoE \"max_diff +[0-9.]+ LSB\" \"$f\" | tail -1 | awk '{print $2}' || true)\n    RGL=\"$RG\"; if [ \"$RG\" = \"cpu\" ]; then RGL=\"cpu/inductor\"; fi\n    VS=\"-\"\n    if [ -n \"${MS:-}\" ] && [ -n \"${A_MS:-}\" ]; then\n      VS=$(awk -v m=\"$MS\" -v a=\"$A_MS\" 'BEGIN{if(a>0) printf \"%.3fx\", m/a; else print \"-\"}')\n    fi\n    printf \"  %-10s %-8s %-14s %5s %12s %12s %10s\\n\" \\\n      \"$WRES\" \"$LB\" \"$RGL\" \"$rc\" \"${MS:--}\" \"$VS\" \"${FI:--}\"\n  done\n  done\n  exit 0\nfi\n\necho \"=== [1/3] BUILD/LOAD -- serial compile probe, ONE graph at a time (not timed) ===\"\nif [ \"$SKIP_PROBE\" = \"1\" ]; then\n  echo \"  SKIPPED: reduced geometry has a single shape; the clean run compiles it\"\n  PW_ALL=1\nelse\necho \"tiles (largest shape first): $PREWARM_TILES\"\nPW_ALL=1\nfor T in $PREWARM_TILES; do\n  TAG=\"pw_${CFG}_t${T}\"\n  B=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)\n  S=$(date -u +%s)\n  echo \"  host mem before tile $T: $(free -g 2>/dev/null | awk '/^Mem:/{print \"total \"$2\"G used \"$3\"G free \"$4\"G avail \"$7\"G\"}')\"\n  set +e\n  NEURON_LAUNCH_BLOCKING=1 \\\n  python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \\\n      --cores 1 --only-tile \"$T\" --warp \"$WARP\" --iters 0 \\\n      2>&1 | tee \"$R/${TAG}.log\"\n  rc=${PIPESTATUS[0]}\n  set -e\n  MIN=$(( ($(date -u +%s) - S) / 60 ))\n  A2=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)\n  SH=$(grep -aoE \"padded [0-9]+x[0-9]+\" \"$R/${TAG}.log\" | head -1 | awk '{print $2}' || true)\n  printf \"%s %s %s %s\\n\" \"$T\" \"${SH:--}\" \"$rc\" \"$MIN\" >> \"$R/probe_table.txt\"\n  if [ \"$rc\" = \"0\" ]; then\n    echo \"  tile $T  ${SH:--}  FUSES  ${MIN} min  NEFFs +$((A2-B))  cache=$A2\"\n    archive_cache\n  else\n    PW_ALL=0\n    echo \"  tile $T  ${SH:--}  FAILED rc=$rc  ${MIN} min  cache=$A2\"\n    { grep -aoE \"got in=[0-9]+ and out=[0-9]+|Instructions generated by compiler [0-9]+ exceeds the typical limit of [0-9]+|MemoryError|Killed\" \\\n      \"$R/${TAG}.log\" || true; } | head -2 | sed 's/^/      /'\n    echo \"  ==> a required graph is missing; abandoning the remaining probe tiles\"\n    break\n  fi\n  for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done\n  sleep 5\ndone\necho \"  ==> ALL 8 GRAPHS COMPILE = $PW_ALL  (cache holds $(find /tmp/neff_cache -name '*.neff' | wc -l) NEFFs)\"\n\nif [ \"$PW_ALL\" = \"1\" ] && [ \"$CORES\" = \"1\" ]; then\n  echo \"\"\n  echo \"=== [1b] SKIPPED: CORES=1, so [2/3] IS the serial full-frame pass ===\"\nelif [ \"$PW_ALL\" = \"1\" ]; then\n  echo \"\"\n  echo \"=== [1b] SERIAL FULL-FRAME WARM-UP (--cores 1, all tiles, not timed) ===\"\n  WB=$(find /tmp/neff_cache -name '*.neff' | wc -l)\n  S=$(date -u +%s)\n  set +e\n  NEURON_LAUNCH_BLOCKING=1 \\\n  python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \\\n      --cores 1 --warp \"$WARP\" --iters 0 \\\n      2>&1 | tee \"$R/warm_full.log\" \\\n    | grep -aiE \"replica|forward complete|Killed|Error|MemoryError\" || true\n  wrc=${PIPESTATUS[0]}\n  set -e\n  WA=$(find /tmp/neff_cache -name '*.neff' | wc -l)\n  echo \"  rc=$wrc  $(( ($(date -u +%s) - S) / 60 )) min  NEFFs $WB -> $WA (+$((WA-WB)))\"\n  if [ \"$wrc\" != \"0\" ]; then\n    PW_ALL=0\n    echo \"  ==> the full frame does NOT run on one core; the 8-core arm cannot work either\"\n    { grep -aoE \"RuntimeError: [^\\\"]{0,120}|MemoryError|Killed\" \"$R/warm_full.log\" || true; } \\\n      | head -2 | sed 's/^/      /'\n  else\n    echo \"  ==> full frame RUNS serially; cache is now complete for --cores $CORES\"\n    archive_cache\n  fi\nfi\nfi\necho \"\"\n\nT_CLEAN=\"\"; LSB=\"\"; PSNR=\"\"; GATE=\"\"\nif [ \"$PW_ALL\" != \"1\" ]; then\n  echo \"  \"\nelse\n\necho \"=== [2/3] CLEAN RUN (NO profiler) -- median of $ITERS = THE REAL LATENCY ===\"\nset +e\npython -u repro_unrolling_trn2.py $FRAMES $REF $BASE \\\n    --cores \"$CORES\" --warp \"$WARP\" --iters \"$ITERS\" \\\n    --save-ref \"$R/frame_${CFG}_${WARP}.npy\" \\\n    2>&1 | tee \"$R/clean.log\"\ncrc=${PIPESTATUS[0]}\nset -e\nT_CLEAN=$(grep -aoE \"steady state: median [0-9.]+ ms\" \"$R/clean.log\" | head -1 | awk '{print $4}' || true)\nLSB=$(grep -aoE \"max_diff +[0-9.]+ LSB\" \"$R/clean.log\" | tail -1 | awk '{print $2}' || true)\nPSNR=$(grep -aoE \"PSNR +[0-9.]+ dB\" \"$R/clean.log\" | tail -1 | awk '{print $2}' || true)\nGATE=$(grep -aoE \"(PASS|FAIL) vs the shipped bar\" \"$R/clean.log\" | tail -1 | awk '{print $1}' || true)\nNEW=$(find /tmp/neff_cache -name '*.neff' | wc -l)\necho \"  rc=$crc  median=${T_CLEAN:--} ms  max_diff=${LSB:--} LSB  PSNR=${PSNR:--} dB  gate=${GATE:--}\"\necho \"  NEFFs now $NEW (was $CACHE_BEFORE at entry, expected +0 after the probe --\"\necho \"  any increase means the probe missed a slot and compiles ran CONCURRENTLY here)\"\narchive_cache\npublish \"$R/frame_${CFG}_${WARP}.png\" \"$RUNDIR/frame_${CFG}_${WARP}.png\"\npublish \"$R/frame_${CFG}_${WARP}.json\" \"$RUNDIR/frame_${CFG}_${WARP}.json\"\n\necho \"=== [3/3a] PROFILED RUN -- runtime system trace (trace_info.pb) ===\"\nSYSTRACE=/tmp/systrace; rm -rf \"$SYSTRACE\"; mkdir -p \"$SYSTRACE\"\nset +e\nNEURON_RT_INSPECT_ENABLE=1 \\\nNEURON_RT_INSPECT_SYSTEM_PROFILE=1 \\\nNEURON_RT_INSPECT_DEVICE_PROFILE=1 \\\nNEURON_RT_INSPECT_OUTPUT_DIR=\"$SYSTRACE\" \\\npython -u repro_unrolling_trn2.py $FRAMES $REF $BASE \\\n    --cores \"$CORES\" --warp \"$WARP\" --iters 1 \\\n    2>&1 | tee \"$R/profiled.log\"\nset -e\nT_PROF=$(grep -aoE \"steady state: median [0-9.]+ ms\" \"$R/profiled.log\" | head -1 | awk '{print $4}' || true)\necho \"  trace_info.pb count: $(find \"$SYSTRACE\" -name 'trace_info.pb' | wc -l)\"\necho \"  rank subdirs       : $(find \"$SYSTRACE\" -maxdepth 1 -type d -name 'i-*' | wc -l)\"\necho \"\"\n\necho \"=== [3/3b] PROFILED RUN -- torch.profiler (host view only) ===\"\nset +e\npython -u repro_unrolling_trn2.py $FRAMES $REF $BASE \\\n    --cores \"$CORES\" --warp \"$WARP\" --iters 1 \\\n    --perfetto \"$R/perfetto/trace_rank0.json\" \\\n    2>&1 | tee \"$R/perfetto.log\" | grep -aiE \"perfetto|median|FAILED\" || true\nset -e\npublish \"$R/perfetto/trace_rank0.json.gz\" \"$RUNDIR/perfetto/trace_rank0.json.gz\"\n\necho \"--- [3/3c] systrace -> perfetto (device timeline, via $PROF view -d) ---\"\nset +e\ntimeout 900 \"$PROF\" view -d \"$SYSTRACE\" --output-format perfetto \\\n    > \"$R/perfetto/view_perfetto.log\" 2>&1\nvrc=$?\nset -e\nPFT=$(find \"$SYSTRACE\" \"$R\" /tmp -maxdepth 3 -name '*.pftrace' -newer \"$R/perfetto\" 2>/dev/null | head -1)\nif [ -n \"${PFT:-}\" ] && [ -s \"$PFT\" ]; then\n  gzip -c \"$PFT\" > \"$R/perfetto/system_profile.pftrace.gz\"\n  publish \"$R/perfetto/system_profile.pftrace.gz\" \"$RUNDIR/perfetto/system_profile.pftrace.gz\"\nelse\n  echo \"  no .pftrace produced (rc=$vrc); tail of the view log:\"\n  tail -6 \"$R/perfetto/view_perfetto.log\" 2>/dev/null | sed 's/^/    /' || true\nfi\necho \"\"\n\necho \"=== [4] per-NEFF engine breakdown + fixability ranking ===\"\nPOUT=/tmp/perneff; rm -rf \"$POUT\"; mkdir -p \"$POUT\"\n\nmapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)\necho \"  NEFFs in cache: ${#NEFFS[@]}\"\nOK=0\nfor neff in \"${NEFFS[@]}\"; do\n  hash=$(basename \"$neff\" .neff)\n  NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 900 \\\n    \"$PROF\" capture --single-io -n \"$neff\" -s \"$POUT/${hash}.ntff\" >/dev/null 2>&1 || continue\n  [ -f \"$POUT/${hash}.ntff\" ] || continue\n  timeout 300 \"$PROF\" view -n \"$neff\" -s \"$POUT/${hash}.ntff\" \\\n    --output-format summary-json > \"$POUT/${hash}.json\" 2>/dev/null || true\n  [ -s \"$POUT/${hash}.json\" ] && OK=$((OK+1))\ndone\necho \"  captured+viewed OK: $OK / ${#NEFFS[@]}\"\npython3 scripts/neuron/profile_all_neffs.py \"$POUT\" 2>&1 | tee \"$R/perneff_breakdown.txt\" || true\npython3 scripts/neuron/rank_neffs.py \"$POUT\" 2>&1 | tee \"$R/neff_ranking.txt\" || true\npublish \"$R/neff_ranking.txt\" \"$RUNDIR/neff_ranking.txt\"\n\necho \"\"\necho \"=== [4b] dominant-NEFF metric dump (summary-text) ===\"\nBIGHASH=$(python3 scripts/neuron/pick_neffs.py \"$POUT\" /tmp/neff_cache 2>/dev/null | head -1 || true)\nif [ -n \"${BIGHASH:-}\" ] && [ -f \"$POUT/${BIGHASH}.ntff\" ]; then\n  BIGNEFF=$(find /tmp/neff_cache -name \"${BIGHASH}.neff\" | head -1)\n  timeout 300 \"$PROF\" view -n \"$BIGNEFF\" -s \"$POUT/${BIGHASH}.ntff\" \\\n    --output-format summary-text 2>/dev/null | tee \"$R/hotspots_${BIGHASH}.txt\" || true\nelse\n  echo \"  no dominant NEFF (capture sweep returned nothing) -- skip\"\nfi\n\necho \"\"\necho \"=== [5] preserve top-$TOPN heavy NEFF+NTFF pairs, PRE-JOINED ===\"\ni=0\nfor hash in $(python3 scripts/neuron/top_neffs.py \"$POUT\" \"$TOPN\" 2>/dev/null || true); do\n  i=$((i+1))\n  src_neff=$(find /tmp/neff_cache -name \"${hash}.neff\" | head -1)\n  [ -n \"$src_neff\" ] && [ -f \"$POUT/${hash}.ntff\" ] || continue\n  MB=$(( $(wc -c < \"$src_neff\") / 1048576 ))\n  d=\"$R/pairs/$(printf 'rank%02d' $i)_${hash:0:8}__${MB}MB\"\n  mkdir -p \"$d\"\n  cp \"$src_neff\" \"$d/\" && cp \"$POUT/${hash}.ntff\" \"$d/\"\n  [ -f \"$POUT/${hash}.json\" ] && cp \"$POUT/${hash}.json\" \"$d/summary.json\"\n  echo \"  $(basename \"$d\"): $(ls \"$d\" | tr '\\n' ' ')\"\ndone\n[ \"$i\" = \"0\" ] && echo \"  pairs/ EMPTY -- expected if the capture sweep returned 0/N\"\n\necho \"\"\necho \"=== [6] explorer bundles ===\"\nBEST=$(find \"$SYSTRACE\" -name 'trace_info.pb' -printf '%s %h\\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}' || true)\nif [ -n \"${BEST:-}\" ]; then\n  UP=/tmp/upload_bundle; rm -rf \"$UP\"; mkdir -p \"$UP\"\n  cp \"$BEST\"/* \"$UP/\" 2>/dev/null || true\n  for pd in \"$R\"/pairs/rank*/; do\n    [ -d \"$pd\" ] || continue\n    for f in \"$pd\"*.neff \"$pd\"*.ntff; do\n      [ -f \"$f\" ] && cp \"$f\" \"$UP/\" 2>/dev/null || true\n    done\n  done\n  for nt in \"$UP\"/*.ntff; do\n    [ -f \"$nt\" ] || continue\n    h=$(basename \"$nt\" .ntff); h=${h%%_rank_*}\n    f=$(find /tmp/neff_cache -name \"${h}.neff\" | head -1)\n    [ -n \"$f\" ] && cp \"$f\" \"$UP/\" 2>/dev/null || true\n  done\n  echo \"  bundle NEFF/NTFF inventory:\"\n  for f in \"$UP\"/*.neff \"$UP\"/*.ntff \"$UP\"/*.pb; do\n    [ -f \"$f\" ] && printf \"    %-52s %s bytes\\n\" \"$(basename \"$f\")\" \"$(wc -c < \"$f\")\"\n  done\n  echo \"  upload_bundle: $(ls \"$UP\" | wc -l) files, trace_info.pb $(ls -la \"$UP/trace_info.pb\" 2>/dev/null | awk '{print $5}' || echo MISSING) bytes\"\n  tar -czf /tmp/upload_bundle.tar.gz -C \"$UP\" . 2>/dev/null || true\n  publish /tmp/upload_bundle.tar.gz \"$RUNDIR/explorer/upload_bundle.tar.gz\"\nelse\n  echo \"  MISSING trace_info.pb -- the Directory Upload will be REJECTED.\"\n  echo \"  Check profiled.log: a failed run has no trace to write; a successful one\"\n  echo \"  means NEURON_RT_INSPECT_ENABLE did not take effect.\"\nfi\ntar -czf /tmp/systrace_bundle.tar.gz -C \"$SYSTRACE\" . 2>/dev/null || true\npublish /tmp/systrace_bundle.tar.gz \"$RUNDIR/explorer/systrace_bundle.tar.gz\"\n\nfi\n\necho \"\"\necho \"################ UNIVR BENCH -- $RUN\"\necho \"  provenance   : $GIT_BRANCH@${GIT_SHA:0:8}   cc $(neuronx-cc --version 2>&1 | head -1 | awk '{print $NF}')\"\necho \"  config       : $GRID halo $HALO warp $WARP ${CORES} cores fp32 fullgraph\"\necho \"\"\nprintf \"  %-34s %s\\n\" \"CLEAN median (THE latency)\" \"${T_CLEAN:--} ms\"\nprintf \"  %-34s %s\\n\" \"profiled median (overhead)\" \"${T_PROF:--} ms\"\nprintf \"  %-34s %s\\n\" \"max_diff / bar 3\" \"${LSB:--} LSB  ${GATE:--}\"\nprintf \"  %-34s %s\\n\" \"PSNR\" \"${PSNR:--} dB\"\nprintf \"  %-34s %s\\n\" \"reference\" \"$REFERENCE\"\necho \"\"\necho \"  probe (serial, one graph at a time):\"\nprintf \"    %-6s %-10s %9s %5s %6s\\n\" tile padded px rc min\nif [ -f \"$R/probe_table.txt\" ]; then\n  while read -r t sh rc mn; do\n    px=$(echo \"$sh\" | awk -Fx 'NF==2{print $1*$2}')\n    printf \"    %-6s %-10s %9s %5s %6s\\n\" \"$t\" \"$sh\" \"${px:--}\" \"$rc\" \"$mn\"\n  done < \"$R/probe_table.txt\"\nelse\n  echo \"    (no probe rows)\"\nfi\n"
-        resources:
-          claims:
-          - name: neurons
-          requests:
-            cpu: 48
-            memory: 248Gi
-          limits:
-            cpu: 150
-            memory: 1800Gi
-        volumeMounts:
-        - name: dshm
-          mountPath: /dev/shm
-        - name: 621547421844-ap-southeast-4-pvc
-          mountPath: /var/mdl
-        env:
-        - name: PYTHONUNBUFFERED
-          value: '1'
-        - name: BRANCH
-          value: main
-        - name: MODE
-          value: full
-        - name: HALO
-          value: '128'
-        - name: GRID
-          value: 2x4
-        - name: PREWARM_TILES
-          value: 1 5 0 4
-        - name: RES
-          value: ''
-        - name: WARP
-          value: gather
-        - name: CORES
-          value: '1'
-        - name: ITERS
-          value: '1'
-        - name: FULLGRAPH
-          value: '1'
-        - name: WARPCMP_TILE
-          value: '9'
-        - name: WARPCMP_RES
-          value: 128x128 192x224 288x320
-        - name: WARPEAGER_RES
-          value: ''
-        - name: WARPEAGER_WARP
-          value: gridsample
-        - name: WARPEAGER_ITERS
-          value: '3'
-        - name: WARPEAGER_CLEAN_ITERS
-          value: '5'
-        - name: STATIC_RESIZE
-          value: '3'
-        - name: WARPEAGER_TILE
-          value: '9'
-        - name: NEURON_LOGICAL_NC_CONFIG
-          value: '1'
-        - name: NEURON_RT_NUM_CORES
-          value: '8'
-        - name: NEURON_RT_VISIBLE_CORES
-          value: 0-7
-        - name: NEURON_CC_FLAGS
-          value: --lnc 1
-        - name: XLA_IR_DEBUG
-          value: '1'
-        - name: XLA_HLO_DEBUG
-          value: '1'
-        - name: NEURON_FRAMEWORK_DEBUG
-          value: '1'
-        - name: TORCH_NEURONX_NEFF_CACHE_DIR
-          value: /tmp/neff_cache
-        - name: OMP_NUM_THREADS
-          value: '8'
-        - name: NEURON_RT_LOG_LEVEL
-          value: ERROR
-        - name: NEURON_CC_LOG_LEVEL
-          value: ERROR
-        - name: GITHUB_TOKEN
-          valueFrom:
-            secretKeyRef:
-              name: github-token
-              key: GITHUB_TOKEN
+        - name: bench
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+
+              BRANCH="${BRANCH:-main}"
+              cd /tmp
+              git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
+              cd REPRO
+
+              GIT_SHA=$(git rev-parse HEAD); GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+              echo "commit ${GIT_SHA:0:8} ($GIT_BRANCH) | cc $(neuronx-cc --version 2>&1 | head -1 | awk '{print $NF}') | ccflags ${NEURON_CC_FLAGS:-<unset>}"
+
+              PROBE='import torch,repro_unrolling_trn2; print("cache_size_limit="+str(torch._dynamo.config.cache_size_limit), "accumulated="+str(torch._dynamo.config.accumulated_cache_size_limit))'
+              echo "dynamo: $(python3 -c "$PROBE" 2>&1 | tail -1)"
+
+              GRID="${GRID:-4x8}"; HALO="${HALO:-128}"; WARP="${WARP:-gather}"
+              CORES="${CORES:-8}"; ITERS="${ITERS:-5}"
+              FULLGRAPH="${FULLGRAPH:-1}"
+              PREWARM_TILES="${PREWARM_TILES:-9 17 8 16 1 25 0 24}"
+              TOPN="${TOPN:-5}"
+              REFERENCE="README trn2 eager 3673.3 ms / 0.64 LSB; g6e L40S 351.1 ms (161 ms ONNX+TRT)"
+
+              SR="${STATIC_RESIZE:-0}"
+              CFG="${GRID}_h${HALO}_sr${SR}_fg${FULLGRAPH}"
+              TS=$(date -u +%Y%m%d_%H%M%S)
+              RUN="exp_univr-${CFG}-${WARP}_${TS}"
+              PVC=/var/mdl/univr
+              RUNDIR="$PVC/runs/$RUN"
+              CACHE_TGZ="$PVC/neff_cache_${CFG}.tar.gz"
+              LEGACY_TGZ="$PVC/neff_cache_${GRID}_h${HALO}_sr${SR}.tar.gz"
+              if [ ! -f "$CACHE_TGZ" ] && [ "$FULLGRAPH" = "1" ] && [ -f "$LEGACY_TGZ" ]; then
+                echo "cache: adopting legacy fullgraph=1 key $(basename "$LEGACY_TGZ")"
+                CACHE_TGZ="$LEGACY_TGZ"
+                ADOPTED_LEGACY=1
+              fi
+
+              R=/tmp/results; rm -rf "$R"; mkdir -p "$R/explorer" "$R/perfetto" "$R/pairs"
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
+              mkdir -p /tmp/neff_cache
+
+              echo "config: $GRID h$HALO warp $WARP ${CORES}c ${ITERS}it fp32 static-resize $SR fullgraph $FULLGRAPH"
+
+              mkdir -p "$RUNDIR/explorer" "$RUNDIR/perfetto" || true
+              publish() {
+                local src="$1" dst="$2"
+                [ -f "$src" ] || { echo "  publish SKIP (absent): $(basename "$src")"; return 0; }
+                local n; n=$(wc -c < "$src")
+                [ "$n" -gt 0 ] || { echo "  publish REFUSED (0 bytes): $(basename "$src")"; return 0; }
+                cp "$src" "$dst" || { echo "  publish FAILED: $(basename "$src")"; return 0; }
+                local m; m=$(wc -c < "$dst" 2>/dev/null || echo 0)
+                if [ "$m" = "$n" ]; then
+                  echo "  published $(basename "$dst")  $(( n / 1048576 )) MB  OK"
+                else
+                  echo "  publish SIZE MISMATCH $(basename "$dst"): $n -> $m"
+                fi
+              }
+
+              archive_cache() {
+                local n; n=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
+                [ "$n" -gt 0 ] || return 0
+                tar -czf /tmp/neff_cache.tar.gz -C /tmp neff_cache 2>/dev/null || return 0
+                publish /tmp/neff_cache.tar.gz "$CACHE_TGZ"
+                echo "  cache archived: $n NEFFs -> $CACHE_TGZ"
+              }
+
+              finalize() {
+                echo ""
+                echo "=== FINALIZE (trap EXIT -- runs even on failure) ==="
+                archive_cache
+                tar -czf "/tmp/univr_results_${TS}.tar.gz" -C /tmp results 2>/dev/null || true
+                publish "/tmp/univr_results_${TS}.tar.gz" "$RUNDIR/univr_results_${TS}.tar.gz"
+                echo "  layout: $RUNDIR"
+                ls -1 "$RUNDIR" 2>/dev/null | sed 's/^/    /' || true
+              }
+              trap finalize EXIT
+
+              if [ -f "$CACHE_TGZ" ]; then
+                cp "$CACHE_TGZ" /tmp/restore.tar.gz && tar -xzf /tmp/restore.tar.gz -C /tmp \
+                  || echo "│ WARNING: restore failed"
+                echo "cache[generic]: $(basename "$CACHE_TGZ") $(du -h "$CACHE_TGZ" | cut -f1)"
+              else
+                echo "cache[generic]: none"
+              fi
+              CACHE_BEFORE=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
+              echo "cache[generic]: $CACHE_BEFORE NEFFs"
+              if [ "${ADOPTED_LEGACY:-0}" = "1" ]; then
+                CACHE_TGZ="$PVC/neff_cache_${CFG}.tar.gz"
+                echo "cache: further archives go to $(basename "$CACHE_TGZ")"
+              fi
+
+              PROF=neuron-explorer
+              command -v "$PROF" >/dev/null 2>&1 || PROF=neuron-profile
+              echo "profiler CLI: $PROF"
+
+              FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
+              REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
+              BASE="--height 1728 --width 4096 --tiles $GRID --halo $HALO --bar 3 --device neuron --dtype fp32 --fullgraph $FULLGRAPH --static-resize $SR"
+
+              RES="${RES:-}"
+              SKIP_PROBE=0
+              if [ -n "$RES" ]; then
+                RH=${RES%%x*}; RW=${RES##*x}
+                REF="--random-weights"
+                BASE="--height $RH --width $RW --tiles 1x1 --bar 3 --device neuron --dtype fp32 --fullgraph $FULLGRAPH --static-resize $SR"
+                CORES=1
+                SKIP_PROBE=1
+                CFG="${RES}_sr${SR}"
+                RUN="exp_univr-${RES}-${WARP}-fg${FULLGRAPH}-sr${SR}_${TS}"
+                RUNDIR="$PVC/runs/$RUN"
+                CACHE_TGZ="$PVC/neff_cache_${RES}_fg${FULLGRAPH}_sr${SR}.tar.gz"
+                mkdir -p "$RUNDIR/explorer" "$RUNDIR/perfetto" || true
+                echo "── REDUCED: ${RH}x${RW} = $((RH*RW)) px, 1x1, 1 core, random weights"
+              fi
+              echo "  run dir   : $RUNDIR"
+              echo ""
+
+              NKILIB_TGZ="${NKILIB_TGZ:-$PVC/nkilib.tar.gz}"
+              case "${WARP:-}:${WARPEAGER_WARP:-}:${WARPCMP_ARMS:-}" in
+                *gridsample-nkl*)
+                  if [ -f "$NKILIB_TGZ" ]; then
+                    cp "$NKILIB_TGZ" /tmp/nkilib.tar.gz && mkdir -p /tmp/nkilib \
+                      && tar -xzf /tmp/nkilib.tar.gz -C /tmp/nkilib \
+                      && export PYTHONPATH="/tmp/nkilib:${PYTHONPATH:-}" \
+                      && echo "nkilib: restored from $NKILIB_TGZ"
+                  else
+                    echo "nkilib: no tar at $NKILIB_TGZ"
+                  fi
+                  if python3 -c "import nkilib.experimental.indirect.grid_sample" 2>/dev/null; then
+                    echo "nkilib: IMPORT OK -- gridsample-nkl available"
+                  else
+                    echo "nkilib: IMPORT FAILS -- gridsample-nkl arms will be SKIPPED"
+                  fi
+                  echo ""
+                  ;;
+                *) echo "nkilib: NOT restored -- no arm requests gridsample-nkl"; echo "" ;;
+              esac
+
+              if [ "${MODE:-full}" = "warpeager" ]; then
+                WE_RES="${WARPEAGER_RES-288x320}"
+                WE_WARP="${WARPEAGER_WARP:-gridsample}"
+                WE_ITERS="${WARPEAGER_ITERS:-3}"
+                WE_TILE="${WARPEAGER_TILE:-9}"
+                if [ -n "$WE_RES" ]; then
+                  WH=${WE_RES%%x*}; WW=${WE_RES##*x}
+                  GEOM="--height $WH --width $WW --tiles 1x1 --random-weights"
+                  LBL="warpeager_${WE_WARP}_${WE_RES}_sr${SR}"
+                else
+                  GEOM="--height 1728 --width 4096 --tiles $GRID --halo $HALO $REF --only-tile $WE_TILE"
+                  LBL="warpeager_${WE_WARP}_t${WE_TILE}_h${HALO}_sr${SR}"
+                fi
+                RUN="exp_univr-${LBL}_${TS}"
+                RUNDIR="$PVC/runs/$RUN"
+                CACHE_TGZ="$PVC/neff_cache_${LBL}.tar.gz"
+                mkdir -p "$RUNDIR/perfetto" "$RUNDIR/pairs" "$RUNDIR/explorer" || true
+                rm -rf /tmp/neff_cache; mkdir -p /tmp/neff_cache
+                if [ -f "$CACHE_TGZ" ]; then
+                  cp "$CACHE_TGZ" /tmp/we_restore.tar.gz \
+                    && tar -xzf /tmp/we_restore.tar.gz -C /tmp \
+                    && echo "cache: restored $(find /tmp/neff_cache -name '*.neff' | wc -l) NEFFs from $CACHE_TGZ"
+                else
+                  echo "cache: none at $CACHE_TGZ -- cold compile expected"
+                fi
+                echo "MODE=warpeager ${WE_RES:-$GRID h$HALO tile$WE_TILE} warp=$WE_WARP sr=$SR iters=$WE_ITERS"
+                [ -n "$WE_RES" ] && echo "geometry: REDUCED $WE_RES 1x1 random-weights" \
+                                  || echo "geometry: REAL TILE $GRID h$HALO only-tile $WE_TILE golden"
+                [ -n "$RES" ] && echo "NOTE RES=$RES unused here (forced --random-weights; clear it for a scored run)"
+                echo "run dir: $RUNDIR"
+
+                WE_CLEAN_ITERS="${WARPEAGER_CLEAN_ITERS:-5}"
+                find /tmp/neff_cache -name '*.neff' -printf '%f\n' 2>/dev/null | sort > /tmp/neff_before.txt
+                echo "[W] compile (not timed)"
+                set +e
+                python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
+                    --dtype fp32 --device neuron --cores 1 \
+                    --warp "$WE_WARP" --warp-region eager --static-resize "$SR" --iters 0 \
+                    2>&1 | tee "$R/${LBL}_warm.log" \
+                  | grep -aiE "only-tile|first call|Killed|Error|MemoryError" || true
+                wrc=${PIPESTATUS[0]}
+                set -e
+                echo "  rc=$wrc  NEFFs now $(find /tmp/neff_cache -name '*.neff' | wc -l)"
+                find /tmp/neff_cache -name '*.neff' -printf '%f\n' 2>/dev/null | sort > /tmp/neff_after.txt
+                if [ -s /tmp/neff_before.txt ]; then
+                  NEW=$(comm -13 /tmp/neff_before.txt /tmp/neff_after.txt | wc -l)
+                  echo "  NEW graphs compiled by [W]: $NEW"
+                  comm -13 /tmp/neff_before.txt /tmp/neff_after.txt | head -20 | sed 's/^/    + /'
+                fi
+                archive_cache
+                for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                sleep 5
+
+                echo "[L] clean latency (no profiler)"
+                B0=$(find /tmp/neff_cache -name '*.neff' | wc -l)
+                set +e
+                python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
+                    --dtype fp32 --device neuron --cores 1 \
+                    --warp "$WE_WARP" --warp-region eager --static-resize "$SR" --iters "$WE_CLEAN_ITERS" \
+                    --save-ref "$R/frame_${LBL}.npy" \
+                    2>&1 | tee "$R/${LBL}_clean.log" \
+                  | grep -aE "steady state|max_diff|PSNR|only-tile|Killed|Error|Traceback" || true
+                lrc=${PIPESTATUS[0]}
+                set -e
+                A0=$(find /tmp/neff_cache -name '*.neff' | wc -l)
+                T_CLEAN=$(grep -aoE "steady state: median [0-9.]+ ms" "$R/${LBL}_clean.log" | head -1 | awk '{print $4}' || true)
+                T_FIRST=$(grep -aoE "first call [0-9.]+ ms" "$R/${LBL}_clean.log" | head -1 | awk '{print $3}' || true)
+                LSB=$(grep -aoE "max_diff +[0-9.]+ LSB" "$R/${LBL}_clean.log" | tail -1 | awk '{print $2}' || true)
+                PSNR=$(grep -aoE "PSNR +[0-9.]+ dB" "$R/${LBL}_clean.log" | tail -1 | awk '{print $2}' || true)
+                echo "  rc=$lrc  CLEAN median=${T_CLEAN:--} ms over $WE_CLEAN_ITERS iters"
+                echo "  max_diff=${LSB:--} LSB  PSNR=${PSNR:--} dB  first call=${T_FIRST:--} ms"
+                echo "  NEFFs +$((A0-B0)) (must be +0, else the median contains a compile)"
+                publish "$R/frame_${LBL}.png" "$RUNDIR/frame_${LBL}.png"
+                publish "$R/frame_${LBL}.json" "$RUNDIR/frame_${LBL}.json"
+                archive_cache
+                for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                sleep 5
+
+                echo "[A] host trace (torch.profiler)"
+                set +e
+                python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
+                    --dtype fp32 --device neuron --cores 1 \
+                    --warp "$WE_WARP" --warp-region eager --static-resize "$SR" --iters "$WE_ITERS" \
+                    --perfetto "$R/perfetto/trace_${LBL}.json" \
+                    2>&1 | tee "$R/$LBL.log"
+                arc=${PIPESTATUS[0]}
+                set -e
+                echo "  rc=$arc  NEFFs now $(find /tmp/neff_cache -name '*.neff' | wc -l)"
+                if [ "$arc" != "0" ]; then
+                  { grep -aoE "got in=[0-9]+ and out=[0-9]+|MemoryError|Killed|Unsupported|FailOnRecompileLimitHit" \
+                    "$R/$LBL.log" || true; } | head -3 | sed 's/^/    /'
+                fi
+                archive_cache
+                publish "$R/perfetto/trace_${LBL}.json.gz" "$RUNDIR/perfetto/trace_${LBL}.json.gz"
+                for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                sleep 5
+
+                echo ""
+                echo "[B] op table"
+                python3 scripts/neuron/pf_op_summary.py "$R/perfetto/trace_${LBL}.json.gz" --top 10 \
+                    > "$R/optable_${LBL}.txt" 2>&1 || true
+                sed -n '/MODEL THREAD/,$p' "$R/optable_${LBL}.txt" || true
+                publish "$R/optable_${LBL}.txt" "$RUNDIR/optable_${LBL}.txt"
+
+                echo ""
+                echo "[C] runtime systrace -> device pftrace"
+                SYSTRACE=/tmp/systrace_we; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
+                set +e
+                NEURON_RT_INSPECT_ENABLE=1 \
+                NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
+                NEURON_RT_INSPECT_DEVICE_PROFILE=1 \
+                NEURON_RT_INSPECT_OUTPUT_DIR="$SYSTRACE" \
+                python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
+                    --dtype fp32 --device neuron --cores 1 \
+                    --warp "$WE_WARP" --warp-region eager --static-resize "$SR" --iters 1 \
+                    2>&1 | tee "$R/${LBL}_inspect.log" | grep -aiE "median|warp region|Killed|Error" || true
+                set -e
+                echo "  trace_info.pb count: $(find "$SYSTRACE" -name 'trace_info.pb' | wc -l)"
+                set +e
+                timeout 900 "$PROF" view -d "$SYSTRACE" --output-format perfetto \
+                    > "$R/perfetto/view_${LBL}.log" 2>&1
+                vrc=$?
+                set -e
+                PFT=$(find "$SYSTRACE" "$R" /tmp -maxdepth 3 -name '*.pftrace' -newer "$R/${LBL}_inspect.log" 2>/dev/null | head -1)
+                if [ -n "${PFT:-}" ] && [ -s "$PFT" ]; then
+                  gzip -c "$PFT" > "$R/perfetto/device_${LBL}.pftrace.gz"
+                  publish "$R/perfetto/device_${LBL}.pftrace.gz" "$RUNDIR/perfetto/device_${LBL}.pftrace.gz"
+                else
+                  echo "  no .pftrace produced (rc=$vrc); tail of the view log:"
+                  tail -6 "$R/perfetto/view_${LBL}.log" 2>/dev/null | sed 's/^/    /' || true
+                fi
+
+                echo ""
+                echo "[D] per-NEFF engine breakdown"
+                POUT=/tmp/perneff_we; rm -rf "$POUT"; mkdir -p "$POUT"
+                mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)
+                echo "  NEFFs in cache: ${#NEFFS[@]}"
+                OK=0; N=0; T0=$SECONDS
+                for neff in "${NEFFS[@]}"; do
+                  N=$((N+1))
+                  hash=$(basename "$neff" .neff)
+                  if NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 900 \
+                       "$PROF" capture --single-io -n "$neff" -s "$POUT/${hash}.ntff" >/dev/null 2>&1 \
+                     && [ -f "$POUT/${hash}.ntff" ]; then
+                    timeout 300 "$PROF" view -n "$neff" -s "$POUT/${hash}.ntff" \
+                      --output-format summary-json > "$POUT/${hash}.json" 2>/dev/null || true
+                    [ -s "$POUT/${hash}.json" ] && OK=$((OK+1))
+                  else
+                    echo "    $N/${#NEFFS[@]} ${hash:0:8} capture FAILED"
+                  fi
+                  if [ $((N % 10)) = 0 ] || [ "$N" = "${#NEFFS[@]}" ]; then
+                    echo "    $N/${#NEFFS[@]} ok=$OK  $(( (SECONDS-T0) / 60 ))m"
+                  fi
+                done
+                echo "  captured+viewed OK: $OK / ${#NEFFS[@]}"
+                python3 scripts/neuron/profile_all_neffs.py "$POUT" > "$R/perneff_${LBL}.txt" 2>&1 || true
+                sed -n '/MODEL-LEVEL/,$p' "$R/perneff_${LBL}.txt" || true
+                python3 scripts/neuron/rank_neffs.py "$POUT" > "$R/ranking_${LBL}.txt" 2>&1 || true
+                head -16 "$R/ranking_${LBL}.txt" || true
+                sed -n '/TOP FIXABLE/,$p' "$R/ranking_${LBL}.txt" | head -8 || true
+                publish "$R/perneff_${LBL}.txt" "$RUNDIR/perneff_${LBL}.txt"
+                publish "$R/ranking_${LBL}.txt" "$RUNDIR/ranking_${LBL}.txt"
+                i=0
+                for hash in $(python3 scripts/neuron/top_neffs.py "$POUT" "${TOPN:-5}" 2>/dev/null || true); do
+                  i=$((i+1))
+                  src_neff=$(find /tmp/neff_cache -name "${hash}.neff" | head -1)
+                  [ -n "$src_neff" ] && [ -f "$POUT/${hash}.ntff" ] || continue
+                  MB=$(( $(wc -c < "$src_neff") / 1048576 ))
+                  d="$R/pairs/$(printf 'rank%02d' $i)_${hash:0:8}__${MB}MB"
+                  mkdir -p "$d"; cp "$src_neff" "$d/" && cp "$POUT/${hash}.ntff" "$d/"
+                  [ -f "$POUT/${hash}.json" ] && cp "$POUT/${hash}.json" "$d/summary.json"
+                  echo "  $(basename "$d"): $(ls "$d" | tr '\n' ' ')"
+                done
+                [ "$i" = "0" ] && echo "  pairs/ EMPTY -- expected if the capture sweep returned 0/N"
+
+                echo ""
+                echo "[E] pair -> graph pftrace"
+                j=0; NPFT=0
+                for pd in "$R"/pairs/rank*/; do
+                  [ -d "$pd" ] || continue
+                  nf=$(find "$pd" -maxdepth 1 -name '*.neff' | head -1)
+                  nt=$(find "$pd" -maxdepth 1 -name '*.ntff' | head -1)
+                  [ -n "$nf" ] && [ -n "$nt" ] || continue
+                  h=$(basename "$nf" .neff); j=$((j+1))
+                  G="$R/perfetto/graph_$(printf 'rank%02d' $j)_${h:0:8}.pftrace"
+                  set +e
+                  timeout 1800 "$PROF" view -n "$nf" -s "$nt" --output-format perfetto \
+                      --output-file "$G" > "$R/perfetto/pft_${h}.log" 2>&1
+                  prc=$?
+                  set -e
+                  if [ ! -s "$G" ]; then
+                    alt=$(find "$pd" "$R/perfetto" "$(dirname "$nf")" -maxdepth 1 -name '*.pftrace' 2>/dev/null | head -1)
+                    if [ -n "${alt:-}" ] && [ -s "$alt" ] && [ "$alt" != "$G" ]; then mv "$alt" "$G"; fi
+                  fi
+                  if [ -s "$G" ]; then
+                    gzip -f "$G"
+                    echo "  $(basename "$G").gz  $(du -h "${G}.gz" | cut -f1)  -- ui.perfetto.dev"
+                    publish "${G}.gz" "$RUNDIR/perfetto/$(basename "${G}.gz")"
+                    NPFT=$((NPFT+1))
+                  else
+                    echo "  NO pftrace for ${h:0:8} (rc=$prc); tail of the view log:"
+                    tail -4 "$R/perfetto/pft_${h}.log" 2>/dev/null | sed 's/^/    /' || true
+                  fi
+                  publish "$R/perfetto/pft_${h}.log" "$RUNDIR/perfetto/pft_${h}.log"
+                done
+                [ "$j" = "0" ] && echo "  nothing to convert: [D] preserved no pairs"
+
+                echo ""
+                echo "[F] explorer bundle"
+                BEST=$(find "$SYSTRACE" -name 'trace_info.pb' -printf '%s %h\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}' || true)
+                if [ -n "${BEST:-}" ]; then
+                  UP=/tmp/upload_bundle_we; rm -rf "$UP"; mkdir -p "$UP"
+                  cp "$BEST"/* "$UP/" 2>/dev/null || true
+                  for pd in "$R"/pairs/rank*/; do
+                    [ -d "$pd" ] || continue
+                    for f in "$pd"*.neff "$pd"*.ntff; do
+                      [ -f "$f" ] && cp "$f" "$UP/" 2>/dev/null || true
+                    done
+                  done
+                  for nt in "$UP"/*.ntff; do
+                    [ -f "$nt" ] || continue
+                    h=$(basename "$nt" .ntff); h=${h%%_rank_*}
+                    f=$(find /tmp/neff_cache -name "${h}.neff" | head -1)
+                    [ -n "$f" ] && cp "$f" "$UP/" 2>/dev/null || true
+                  done
+                  mkdir -p "$UP/source"
+                  { echo "run       : $RUN"; echo "provenance: $GIT_BRANCH@$GIT_SHA";
+                    echo "config    : ${WE_RES:-tile $WE_TILE} warp $WE_WARP --warp-region eager (fullgraph 0)";
+                    echo "cc        : $(neuronx-cc --version 2>&1 | head -1)";
+                    echo "ccflags   : ${NEURON_CC_FLAGS:-<unset>}";
+                    echo "cmd [A]   : python repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 --dtype fp32 --device neuron --cores 1 --warp $WE_WARP --warp-region eager --iters $WE_ITERS --perfetto ...";
+                    echo "cmd [C]   : NEURON_RT_INSPECT_ENABLE=1 SYSTEM_PROFILE=1 DEVICE_PROFILE=1 (same args, --iters 1, no --perfetto)";
+                  } > "$UP/source/PROVENANCE.txt"
+                  cp repro_unrolling_trn2.py nki_shift_warp.py microbench.py profile_roofline.py \
+                     univr-bench-job.yaml "$UP/source/" 2>/dev/null || true
+                  cp -r scripts "$UP/source/" 2>/dev/null || true
+                  ( cd "$UP/source" && find . -type f ! -name SHA256SUMS -exec sha256sum {} + \
+                      > SHA256SUMS 2>/dev/null ) || true
+                  echo "  source/: $(find "$UP/source" -type f | wc -l) files (subdir; not read by Directory Upload)"
+                  tar -czf /tmp/source_we.tar.gz -C "$UP" source 2>/dev/null || true
+                  publish /tmp/source_we.tar.gz "$RUNDIR/source.tar.gz"
+                  echo "  top level: $(ls "$UP"/*.neff 2>/dev/null | wc -l) neff, $(ls "$UP"/*.ntff 2>/dev/null | wc -l) ntff, $(ls "$UP"/*.pb 2>/dev/null | wc -l) pb, trace_info.pb $(wc -c < "$UP/trace_info.pb" 2>/dev/null || echo MISSING) B"
+                  tar -czf /tmp/upload_bundle_we.tar.gz -C "$UP" . 2>/dev/null || true
+                  publish /tmp/upload_bundle_we.tar.gz "$RUNDIR/explorer/upload_bundle.tar.gz"
+                else
+                  echo "  MISSING trace_info.pb -- Directory Upload would be REJECTED (see ${LBL}_inspect.log)"
+                fi
+                tar -czf /tmp/systrace_bundle_we.tar.gz -C "$SYSTRACE" . 2>/dev/null || true
+                publish /tmp/systrace_bundle_we.tar.gz "$RUNDIR/explorer/systrace_bundle.tar.gz"
+
+                echo ""
+                echo "################ WARPEAGER SUMMARY ################"
+                T_A=$(grep -aoE "steady state: median [0-9.]+ ms" "$R/$LBL.log" 2>/dev/null | head -1 | awk '{print $4}' || true)
+                printf "  %-38s %s\n" "CLEAN median (THE latency, no profiler)" "${T_CLEAN:--} ms"
+                printf "  %-38s %s\n" "[A] median (torch.profiler ON)" "${T_A:--} ms"
+                printf "  %-38s %s\n" "max_diff / bar 3" "${LSB:--} LSB"
+                printf "  %-38s %s\n" "PSNR" "${PSNR:--} dB"
+                printf "  %-38s %s\n" "first call (compile+warmup, [L])" "${T_FIRST:--} ms"
+                grep -aE "RESAMPLE spans|TRACED WALL|VERDICT INPUT|MODEL THREAD" \
+                  "$R/optable_${LBL}.txt" 2>/dev/null | sed 's/^/  /' || true
+                echo "  artifacts: $RUNDIR"
+                echo "  NOTE fullgraph=0 + eager region: not the fused config; MODE=full for a frame number"
+                exit 0
+              fi
+
+              if [ "${MODE:-full}" = "warpcmp" ]; then
+                WT="${WARPCMP_TILE:-9}"; WI="${WARPCMP_ITERS:-3}"
+                WRES_LIST="${WARPCMP_RES-128x128 192x224 288x320}"
+                WARPCMP_ARMS="${WARPCMP_ARMS:-aten:gridsample:neuron cpu:gridsample:cpu}"
+                echo "=== MODE=warpcmp  ${WRES:-$GRID halo $HALO tile $WT}  iters $WI ==="
+                echo "  model on neuron in every arm; only the resample region differs"
+                for WRES in $WRES_LIST; do
+                for CFG in $WARPCMP_ARMS; do
+                  LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; RG=${Z##*:}
+                  if [ "$WP" = "gridsample-nkl" ] && ! python3 -c "import nkilib.experimental.indirect.grid_sample" 2>/dev/null; then
+                    echo "SKIP $LB: nkilib not importable (CR-288764575 unmerged; tar must CONTAIN grid_sample.py)"
+                    continue
+                  fi
+                  if [ -n "$WRES" ]; then
+                    WH=${WRES%%x*}; WW=${WRES##*x}
+                    GEOM="--height $WH --width $WW --tiles 1x1 --random-weights"
+                    LBL="warpcmp_${LB}_${WRES}"
+                  else
+                    GEOM="--height 1728 --width 4096 --tiles $GRID --halo $HALO $REF --only-tile $WT"
+                    LBL="warpcmp_${LB}_t${WT}"
+                  fi
+                  echo "################ $LBL"
+                  B=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
+                  set +e
+                  python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
+                      --dtype fp32 --device neuron --cores 1 \
+                      --warp "$WP" --warp-region "$RG" --iters "$WI" \
+                      2>&1 | tee "$R/$LBL.log"
+                  rc=${PIPESTATUS[0]}
+                  set -e
+                  A=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
+                  echo "$rc" > "$R/rc_$LBL.txt"
+                  echo "  rc=$rc  NEFFs +$((A-B))"
+                  if [ "$rc" != "0" ]; then
+                    { grep -aoE "got in=[0-9]+ and out=[0-9]+|MemoryError|Killed|Unsupported|kernel_assert" \
+                      "$R/$LBL.log" || true; } | head -3 | sed 's/^/    /'
+                  fi
+                  archive_cache
+                  for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                  sleep 5
+                done
+                done
+                echo ""
+                echo "################ GRIDSAMPLE IN THE MODEL -- ${WRES:-$GRID halo $HALO tile $WT} fullgraph $WFG"
+                printf "  %-10s %-8s %-14s %5s %12s %12s %10s\n" size cfg warp_region rc median_ms vs_aten first_ms
+                for WRES in $WRES_LIST; do
+                A_MS=$(grep -aoE "steady state: median [0-9.]+ ms" "$R/warpcmp_aten_${WRES}.log" 2>/dev/null | head -1 | awk '{print $4}' || true)
+                for CFG in $WARPCMP_ARMS; do
+                  LB=${CFG%%:*}; Z=${CFG#*:}; WP=${Z%%:*}; RG=${Z##*:}
+                  f="$R/warpcmp_${LB}_${WRES}.log"; [ -f "$f" ] || continue
+                  rc=$(cat "$R/rc_warpcmp_${LB}_${WRES}.txt" 2>/dev/null || echo '?')
+                  MS=$(grep -aoE "steady state: median [0-9.]+ ms" "$f" | head -1 | awk '{print $4}' || true)
+                  FI=$(grep -aoE "first call [0-9.]+ ms" "$f" | head -1 | awk '{print $3}' || true)
+                  L=$(grep -aoE "max_diff +[0-9.]+ LSB" "$f" | tail -1 | awk '{print $2}' || true)
+                  RGL="$RG"; if [ "$RG" = "cpu" ]; then RGL="cpu/inductor"; fi
+                  VS="-"
+                  if [ -n "${MS:-}" ] && [ -n "${A_MS:-}" ]; then
+                    VS=$(awk -v m="$MS" -v a="$A_MS" 'BEGIN{if(a>0) printf "%.3fx", m/a; else print "-"}')
+                  fi
+                  printf "  %-10s %-8s %-14s %5s %12s %12s %10s\n" \
+                    "$WRES" "$LB" "$RGL" "$rc" "${MS:--}" "$VS" "${FI:--}"
+                done
+                done
+                exit 0
+              fi
+
+              echo "=== [1/3] BUILD/LOAD -- serial compile probe, ONE graph at a time (not timed) ==="
+              if [ "$SKIP_PROBE" = "1" ]; then
+                echo "  SKIPPED: reduced geometry has a single shape; the clean run compiles it"
+                PW_ALL=1
+              else
+              echo "tiles (largest shape first): $PREWARM_TILES"
+              PW_ALL=1
+              for T in $PREWARM_TILES; do
+                TAG="pw_${CFG}_t${T}"
+                B=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
+                S=$(date -u +%s)
+                echo "  host mem before tile $T: $(free -g 2>/dev/null | awk '/^Mem:/{print "total "$2"G used "$3"G free "$4"G avail "$7"G"}')"
+                set +e
+                NEURON_LAUNCH_BLOCKING=1 \
+                python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \
+                    --cores 1 --only-tile "$T" --warp "$WARP" --iters 0 \
+                    2>&1 | tee "$R/${TAG}.log"
+                rc=${PIPESTATUS[0]}
+                set -e
+                MIN=$(( ($(date -u +%s) - S) / 60 ))
+                A2=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
+                SH=$(grep -aoE "padded [0-9]+x[0-9]+" "$R/${TAG}.log" | head -1 | awk '{print $2}' || true)
+                printf "%s %s %s %s\n" "$T" "${SH:--}" "$rc" "$MIN" >> "$R/probe_table.txt"
+                if [ "$rc" = "0" ]; then
+                  echo "  tile $T  ${SH:--}  FUSES  ${MIN} min  NEFFs +$((A2-B))  cache=$A2"
+                  archive_cache
+                else
+                  PW_ALL=0
+                  echo "  tile $T  ${SH:--}  FAILED rc=$rc  ${MIN} min  cache=$A2"
+                  { grep -aoE "got in=[0-9]+ and out=[0-9]+|Instructions generated by compiler [0-9]+ exceeds the typical limit of [0-9]+|MemoryError|Killed" \
+                    "$R/${TAG}.log" || true; } | head -2 | sed 's/^/      /'
+                  echo "  ==> a required graph is missing; abandoning the remaining probe tiles"
+                  break
+                fi
+                for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                sleep 5
+              done
+              echo "  ==> ALL 8 GRAPHS COMPILE = $PW_ALL  (cache holds $(find /tmp/neff_cache -name '*.neff' | wc -l) NEFFs)"
+
+              if [ "$PW_ALL" = "1" ] && [ "$CORES" = "1" ]; then
+                echo ""
+                echo "=== [1b] SKIPPED: CORES=1, so [2/3] IS the serial full-frame pass ==="
+              elif [ "$PW_ALL" = "1" ]; then
+                echo ""
+                echo "=== [1b] SERIAL FULL-FRAME WARM-UP (--cores 1, all tiles, not timed) ==="
+                WB=$(find /tmp/neff_cache -name '*.neff' | wc -l)
+                S=$(date -u +%s)
+                set +e
+                NEURON_LAUNCH_BLOCKING=1 \
+                python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \
+                    --cores 1 --warp "$WARP" --iters 0 \
+                    2>&1 | tee "$R/warm_full.log" \
+                  | grep -aiE "replica|forward complete|Killed|Error|MemoryError" || true
+                wrc=${PIPESTATUS[0]}
+                set -e
+                WA=$(find /tmp/neff_cache -name '*.neff' | wc -l)
+                echo "  rc=$wrc  $(( ($(date -u +%s) - S) / 60 )) min  NEFFs $WB -> $WA (+$((WA-WB)))"
+                if [ "$wrc" != "0" ]; then
+                  PW_ALL=0
+                  echo "  ==> the full frame does NOT run on one core; the 8-core arm cannot work either"
+                  { grep -aoE "RuntimeError: [^\"]{0,120}|MemoryError|Killed" "$R/warm_full.log" || true; } \
+                    | head -2 | sed 's/^/      /'
+                else
+                  echo "  ==> full frame RUNS serially; cache is now complete for --cores $CORES"
+                  archive_cache
+                fi
+              fi
+              fi
+              echo ""
+
+              T_CLEAN=""; LSB=""; PSNR=""; GATE=""
+              if [ "$PW_ALL" != "1" ]; then
+                echo "  "
+              else
+
+              echo "=== [2/3] CLEAN RUN (NO profiler) -- median of $ITERS = THE REAL LATENCY ==="
+              set +e
+              python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \
+                  --cores "$CORES" --warp "$WARP" --iters "$ITERS" \
+                  --save-ref "$R/frame_${CFG}_${WARP}.npy" \
+                  2>&1 | tee "$R/clean.log"
+              crc=${PIPESTATUS[0]}
+              set -e
+              T_CLEAN=$(grep -aoE "steady state: median [0-9.]+ ms" "$R/clean.log" | head -1 | awk '{print $4}' || true)
+              LSB=$(grep -aoE "max_diff +[0-9.]+ LSB" "$R/clean.log" | tail -1 | awk '{print $2}' || true)
+              PSNR=$(grep -aoE "PSNR +[0-9.]+ dB" "$R/clean.log" | tail -1 | awk '{print $2}' || true)
+              GATE=$(grep -aoE "(PASS|FAIL) vs the shipped bar" "$R/clean.log" | tail -1 | awk '{print $1}' || true)
+              NEW=$(find /tmp/neff_cache -name '*.neff' | wc -l)
+              echo "  rc=$crc  median=${T_CLEAN:--} ms  max_diff=${LSB:--} LSB  PSNR=${PSNR:--} dB  gate=${GATE:--}"
+              echo "  NEFFs now $NEW (was $CACHE_BEFORE at entry, expected +0 after the probe --"
+              echo "  any increase means the probe missed a slot and compiles ran CONCURRENTLY here)"
+              archive_cache
+              publish "$R/frame_${CFG}_${WARP}.png" "$RUNDIR/frame_${CFG}_${WARP}.png"
+              publish "$R/frame_${CFG}_${WARP}.json" "$RUNDIR/frame_${CFG}_${WARP}.json"
+
+              echo "=== [3/3a] PROFILED RUN -- runtime system trace (trace_info.pb) ==="
+              SYSTRACE=/tmp/systrace; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
+              set +e
+              NEURON_RT_INSPECT_ENABLE=1 \
+              NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
+              NEURON_RT_INSPECT_DEVICE_PROFILE=1 \
+              NEURON_RT_INSPECT_OUTPUT_DIR="$SYSTRACE" \
+              python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \
+                  --cores "$CORES" --warp "$WARP" --iters 1 \
+                  2>&1 | tee "$R/profiled.log"
+              set -e
+              T_PROF=$(grep -aoE "steady state: median [0-9.]+ ms" "$R/profiled.log" | head -1 | awk '{print $4}' || true)
+              echo "  trace_info.pb count: $(find "$SYSTRACE" -name 'trace_info.pb' | wc -l)"
+              echo "  rank subdirs       : $(find "$SYSTRACE" -maxdepth 1 -type d -name 'i-*' | wc -l)"
+              echo ""
+
+              echo "=== [3/3b] PROFILED RUN -- torch.profiler (host view only) ==="
+              set +e
+              python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \
+                  --cores "$CORES" --warp "$WARP" --iters 1 \
+                  --perfetto "$R/perfetto/trace_rank0.json" \
+                  2>&1 | tee "$R/perfetto.log" | grep -aiE "perfetto|median|FAILED" || true
+              set -e
+              publish "$R/perfetto/trace_rank0.json.gz" "$RUNDIR/perfetto/trace_rank0.json.gz"
+
+              echo "--- [3/3c] systrace -> perfetto (device timeline, via $PROF view -d) ---"
+              set +e
+              timeout 900 "$PROF" view -d "$SYSTRACE" --output-format perfetto \
+                  > "$R/perfetto/view_perfetto.log" 2>&1
+              vrc=$?
+              set -e
+              PFT=$(find "$SYSTRACE" "$R" /tmp -maxdepth 3 -name '*.pftrace' -newer "$R/perfetto" 2>/dev/null | head -1)
+              if [ -n "${PFT:-}" ] && [ -s "$PFT" ]; then
+                gzip -c "$PFT" > "$R/perfetto/system_profile.pftrace.gz"
+                publish "$R/perfetto/system_profile.pftrace.gz" "$RUNDIR/perfetto/system_profile.pftrace.gz"
+              else
+                echo "  no .pftrace produced (rc=$vrc); tail of the view log:"
+                tail -6 "$R/perfetto/view_perfetto.log" 2>/dev/null | sed 's/^/    /' || true
+              fi
+              echo ""
+
+              echo "=== [4] per-NEFF engine breakdown + fixability ranking ==="
+              POUT=/tmp/perneff; rm -rf "$POUT"; mkdir -p "$POUT"
+
+              mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)
+              echo "  NEFFs in cache: ${#NEFFS[@]}"
+              OK=0
+              for neff in "${NEFFS[@]}"; do
+                hash=$(basename "$neff" .neff)
+                NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 900 \
+                  "$PROF" capture --single-io -n "$neff" -s "$POUT/${hash}.ntff" >/dev/null 2>&1 || continue
+                [ -f "$POUT/${hash}.ntff" ] || continue
+                timeout 300 "$PROF" view -n "$neff" -s "$POUT/${hash}.ntff" \
+                  --output-format summary-json > "$POUT/${hash}.json" 2>/dev/null || true
+                [ -s "$POUT/${hash}.json" ] && OK=$((OK+1))
+              done
+              echo "  captured+viewed OK: $OK / ${#NEFFS[@]}"
+              python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$R/perneff_breakdown.txt" || true
+              python3 scripts/neuron/rank_neffs.py "$POUT" 2>&1 | tee "$R/neff_ranking.txt" || true
+              publish "$R/neff_ranking.txt" "$RUNDIR/neff_ranking.txt"
+
+              echo ""
+              echo "=== [4b] dominant-NEFF metric dump (summary-text) ==="
+              BIGHASH=$(python3 scripts/neuron/pick_neffs.py "$POUT" /tmp/neff_cache 2>/dev/null | head -1 || true)
+              if [ -n "${BIGHASH:-}" ] && [ -f "$POUT/${BIGHASH}.ntff" ]; then
+                BIGNEFF=$(find /tmp/neff_cache -name "${BIGHASH}.neff" | head -1)
+                timeout 300 "$PROF" view -n "$BIGNEFF" -s "$POUT/${BIGHASH}.ntff" \
+                  --output-format summary-text 2>/dev/null | tee "$R/hotspots_${BIGHASH}.txt" || true
+              else
+                echo "  no dominant NEFF (capture sweep returned nothing) -- skip"
+              fi
+
+              echo ""
+              echo "=== [5] preserve top-$TOPN heavy NEFF+NTFF pairs, PRE-JOINED ==="
+              i=0
+              for hash in $(python3 scripts/neuron/top_neffs.py "$POUT" "$TOPN" 2>/dev/null || true); do
+                i=$((i+1))
+                src_neff=$(find /tmp/neff_cache -name "${hash}.neff" | head -1)
+                [ -n "$src_neff" ] && [ -f "$POUT/${hash}.ntff" ] || continue
+                MB=$(( $(wc -c < "$src_neff") / 1048576 ))
+                d="$R/pairs/$(printf 'rank%02d' $i)_${hash:0:8}__${MB}MB"
+                mkdir -p "$d"
+                cp "$src_neff" "$d/" && cp "$POUT/${hash}.ntff" "$d/"
+                [ -f "$POUT/${hash}.json" ] && cp "$POUT/${hash}.json" "$d/summary.json"
+                echo "  $(basename "$d"): $(ls "$d" | tr '\n' ' ')"
+              done
+              [ "$i" = "0" ] && echo "  pairs/ EMPTY -- expected if the capture sweep returned 0/N"
+
+              echo ""
+              echo "=== [6] explorer bundles ==="
+              BEST=$(find "$SYSTRACE" -name 'trace_info.pb' -printf '%s %h\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}' || true)
+              if [ -n "${BEST:-}" ]; then
+                UP=/tmp/upload_bundle; rm -rf "$UP"; mkdir -p "$UP"
+                cp "$BEST"/* "$UP/" 2>/dev/null || true
+                for pd in "$R"/pairs/rank*/; do
+                  [ -d "$pd" ] || continue
+                  for f in "$pd"*.neff "$pd"*.ntff; do
+                    [ -f "$f" ] && cp "$f" "$UP/" 2>/dev/null || true
+                  done
+                done
+                for nt in "$UP"/*.ntff; do
+                  [ -f "$nt" ] || continue
+                  h=$(basename "$nt" .ntff); h=${h%%_rank_*}
+                  f=$(find /tmp/neff_cache -name "${h}.neff" | head -1)
+                  [ -n "$f" ] && cp "$f" "$UP/" 2>/dev/null || true
+                done
+                echo "  bundle NEFF/NTFF inventory:"
+                for f in "$UP"/*.neff "$UP"/*.ntff "$UP"/*.pb; do
+                  [ -f "$f" ] && printf "    %-52s %s bytes\n" "$(basename "$f")" "$(wc -c < "$f")"
+                done
+                echo "  upload_bundle: $(ls "$UP" | wc -l) files, trace_info.pb $(ls -la "$UP/trace_info.pb" 2>/dev/null | awk '{print $5}' || echo MISSING) bytes"
+                tar -czf /tmp/upload_bundle.tar.gz -C "$UP" . 2>/dev/null || true
+                publish /tmp/upload_bundle.tar.gz "$RUNDIR/explorer/upload_bundle.tar.gz"
+              else
+                echo "  MISSING trace_info.pb -- the Directory Upload will be REJECTED."
+                echo "  Check profiled.log: a failed run has no trace to write; a successful one"
+                echo "  means NEURON_RT_INSPECT_ENABLE did not take effect."
+              fi
+              tar -czf /tmp/systrace_bundle.tar.gz -C "$SYSTRACE" . 2>/dev/null || true
+              publish /tmp/systrace_bundle.tar.gz "$RUNDIR/explorer/systrace_bundle.tar.gz"
+
+              fi
+
+              echo ""
+              echo "################ UNIVR BENCH -- $RUN"
+              echo "  provenance   : $GIT_BRANCH@${GIT_SHA:0:8}   cc $(neuronx-cc --version 2>&1 | head -1 | awk '{print $NF}')"
+              echo "  config       : $GRID halo $HALO warp $WARP ${CORES} cores fp32 fullgraph"
+              echo ""
+              printf "  %-34s %s\n" "CLEAN median (THE latency)" "${T_CLEAN:--} ms"
+              printf "  %-34s %s\n" "profiled median (overhead)" "${T_PROF:--} ms"
+              printf "  %-34s %s\n" "max_diff / bar 3" "${LSB:--} LSB  ${GATE:--}"
+              printf "  %-34s %s\n" "PSNR" "${PSNR:--} dB"
+              printf "  %-34s %s\n" "reference" "$REFERENCE"
+              echo ""
+              echo "  probe (serial, one graph at a time):"
+              printf "    %-6s %-10s %9s %5s %6s\n" tile padded px rc min
+              if [ -f "$R/probe_table.txt" ]; then
+                while read -r t sh rc mn; do
+                  px=$(echo "$sh" | awk -Fx 'NF==2{print $1*$2}')
+                  printf "    %-6s %-10s %9s %5s %6s\n" "$t" "$sh" "${px:--}" "$rc" "$mn"
+                done < "$R/probe_table.txt"
+              else
+                echo "    (no probe rows)"
+              fi
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 48
+              memory: 248Gi
+            limits:
+              cpu: 150
+              memory: 1800Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: BRANCH
+              value: "main"
+            - name: MODE
+              value: "full"
+            - name: HALO
+              value: "128"
+            - name: GRID
+              value: "2x4"
+            - name: PREWARM_TILES
+              value: "1 5 0 4"
+            - name: RES
+              value: ""
+            - name: WARP
+              value: "gather"
+            - name: CORES
+              value: "1"
+            - name: ITERS
+              value: "1"
+            - name: FULLGRAPH
+              value: "1"
+            - name: WARPCMP_TILE
+              value: "9"
+            - name: WARPCMP_RES
+              value: "128x128 192x224 288x320"
+            - name: WARPEAGER_RES
+              value: ""
+            - name: WARPEAGER_WARP
+              value: "gridsample"
+            - name: WARPEAGER_ITERS
+              value: "3"
+            - name: WARPEAGER_CLEAN_ITERS
+              value: "5"
+            - name: STATIC_RESIZE
+              value: "3"
+            - name: WARPEAGER_TILE
+              value: "9"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_NUM_CORES
+              value: "8"
+            - name: NEURON_RT_VISIBLE_CORES
+              value: "0-7"
+            - name: NEURON_CC_FLAGS
+              value: "--lnc 1"
+            - name: XLA_IR_DEBUG
+              value: "1"
+            - name: XLA_HLO_DEBUG
+              value: "1"
+            - name: NEURON_FRAMEWORK_DEBUG
+              value: "1"
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
       volumes:
-      - name: dshm
-        emptyDir:
-          medium: Memory
-          sizeLimit: 32Gi
-      - name: 621547421844-ap-southeast-4-pvc
-        persistentVolumeClaim:
-          claimName: 621547421844-ap-southeast-4-pvc
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
