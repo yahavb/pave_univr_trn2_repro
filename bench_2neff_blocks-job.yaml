@@ -1,0 +1,88 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: univr-2neff-blocks
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: univr-2neff-blocks
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neurons
+          resourceClaimTemplateName: s-lnc1
+      containers:
+        - name: bench
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+
+              BRANCH="${BRANCH:-main}"
+              cd /tmp
+              git clone -b "$BRANCH" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
+              cd REPRO
+
+              echo "commit $(git rev-parse --short HEAD) ($(git rev-parse --abbrev-ref HEAD)) | cc $(neuronx-cc --version 2>&1 | head -1 | awk '{print $NF}') | ccflags ${NEURON_CC_FLAGS:-<unset>}"
+
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
+              mkdir -p /tmp/neff_cache
+              neffs() { find /tmp/neff_cache -name '*.neff' | wc -l; }
+
+              echo "=== run 1 (NEFFs at entry: $(neffs)) ==="
+              python -u pave_univr/bench_2neff_blocks.py --height 256 --width 384
+
+              echo "=== run 2 (NEFFs at entry: $(neffs)) ==="
+              python -u pave_univr/bench_2neff_blocks.py --height 256 --width 384
+
+              echo "=== NEFFs at exit: $(neffs) ==="
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 48
+              memory: 248Gi
+            limits:
+              cpu: 150
+              memory: 1800Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: BRANCH
+              value: "main"
+            - name: NEURON_RT_NUM_CORES
+              value: "1"
+            - name: NEURON_CC_FLAGS
+              value: "--target trn2 --lnc 1"
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
