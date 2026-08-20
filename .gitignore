@@ -26,3 +26,12 @@ upload/
 run_*/
 frame_*.png
 frame_*.npy
+
+# Downloaded run-artifact trees. warpeager_run/ contained a univr-bench-job.yaml that
+# `git add -A -- "*.yaml"` swept into a commit on 2026-08-20; the ignore patterns above
+# only covered binaries, not the directories.
+warpeager_run/
+taps_142240/
+explorer_ab/
+trace_processor
+upload/
