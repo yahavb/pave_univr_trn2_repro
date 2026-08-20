@@ -1,26 +1,26 @@
-# FULL 4K FRAME, ONE CORE, taps. The LOW-RISK path to the number that matters.
+# RUN B of 2 -- FULL GRAPH (fullgraph=1), one core, taps, full 4K frame.
 #
-# WHY ONE CORE. The --cores 8 arm crashed after 4.6 h of successful compiles
-# (exp_univr-4x8_h128_sr3-gather-fg1_20260819_145849): the frame needed a 9th graph the
-# 8-tile probe never built, that compile ran inside ThreadPoolExecutor(max_workers=8)
-# alongside already-compiled replicas, and torch raised
-#   RuntimeError: Detected that you are using FX to symbolically trace a dynamo-optimized
-#   function.
-# With --cores 1 there is no executor, no replicas and no concurrent compile, so that
-# failure mode does not exist. Any compile the frame still needs happens serially, which is
-# also the only safe way to compile these shapes (peak host memory = one compile).
+# This is the production shape: one graph per tile, no dynamo breaks. It is the arm whose
+# 8-core version crashed, so run B is the same model without the concurrency.
 #
-# WHAT IT PRODUCES, and what it does NOT:
-#   YES  whole-frame PNG + fp32 npy, real pixels, golden weights
-#   YES  whole-frame max_diff vs the CUDA reference -- the number to compare against 92.56 LSB,
-#        which is the failure that has blocked a shippable result
-#   NO   a competitive latency. One core is ~8x the wall clock, so the median here is NOT
-#        comparable to 3673.3 ms (README, 8 cores) or 3900.5 ms (prod-4x8-halo64, 8 cores).
-#        Do not put it in a latency table. Per-tile latency already exists.
+# ONE CORE, deliberately. The --cores 8 arm crashed after 4.6 h of successful compiles
+# (exp_univr-4x8_h128_sr3-gather-fg1_20260819_145849): the frame needed a 9th graph the 8-tile
+# probe never built, that compile ran inside ThreadPoolExecutor(max_workers=8) next to
+# already-compiled replicas, and torch raised "Detected that you are using FX to symbolically
+# trace a dynamo-optimized function". With --cores 1 there is no executor, no replicas and no
+# concurrent compile, so that failure cannot occur.
 #
-# The 9-NEFF cache from the crashed run is on the PVC under the same key
-# (neff_cache_4x8_h128_sr3.tar.gz), so [1/3] should report NEFFs +0 on every tile and the
-# 4.6 h of compiling is not repeated.
+# WHAT IT PRODUCES:  whole-frame PNG + fp32 npy, golden weights, and the whole-frame max_diff
+# against the CUDA reference -- the comparison against 92.56 LSB that has blocked a shippable
+# result.
+# WHAT IT DOES NOT:  a comparable latency. One core is ~8x the wall clock, so this median must
+# NEVER sit in a table beside 3673.3 ms (README) or 3900.5 ms (prod-4x8-halo64) -- both 8-core.
+#
+# The two manifests differ in ONE variable, FULLGRAPH, and they have SEPARATE NEFF caches
+# (the key carries _fg), so neither can restore the other's graphs.
+#
+# Its cache is adopted from the legacy un-suffixed key, so the probe should report NEFFs +0
+# throughout and none of the 4.6 h is repeated. Expect [1b] to be skipped (CORES=1).
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -74,12 +74,27 @@ spec:
               # AND the arm belongs in the cache key: level 0 and level 3 compile DIFFERENT graphs,
               # so a shared key restores the other arm's NEFFs and the run reports +0 while
               # executing the wrong model. HALO is in here for the same reason.
-              CFG="${GRID}_h${HALO}_sr${SR}"
+              # FULLGRAPH belongs in the cache key for the same reason HALO and SR do: fullgraph=0
+              # allows graph breaks, so it compiles a DIFFERENT SET of graphs. Sharing the key with
+              # a fullgraph=1 run restores the wrong NEFFs and the run prints "+0" while executing
+              # something it never compiled.
+              CFG="${GRID}_h${HALO}_sr${SR}_fg${FULLGRAPH}"
               TS=$(date -u +%Y%m%d_%H%M%S)
-              RUN="exp_univr-${CFG}-${WARP}-fg${FULLGRAPH}_${TS}"
+              RUN="exp_univr-${CFG}-${WARP}_${TS}"
               PVC=/var/mdl/univr
               RUNDIR="$PVC/runs/$RUN"
               CACHE_TGZ="$PVC/neff_cache_${CFG}.tar.gz"
+              # MIGRATION, one-way and read-only. The key gained _fg late, so the 4.6 h fullgraph=1
+              # cache from 20260819_145849 sits under the OLD name. Restore from it if the new key
+              # has nothing yet, but only for fullgraph=1 -- those NEFFs ARE fullgraph=1 graphs and
+              # handing them to a fullgraph=0 run is the exact confound this key change prevents.
+              # Archiving always writes the NEW name, so the legacy object is never updated.
+              LEGACY_TGZ="$PVC/neff_cache_${GRID}_h${HALO}_sr${SR}.tar.gz"
+              if [ ! -f "$CACHE_TGZ" ] && [ "$FULLGRAPH" = "1" ] && [ -f "$LEGACY_TGZ" ]; then
+                echo "cache: adopting legacy fullgraph=1 key $(basename "$LEGACY_TGZ")"
+                CACHE_TGZ="$LEGACY_TGZ"
+                ADOPTED_LEGACY=1
+              fi
 
               R=/tmp/results; rm -rf "$R"; mkdir -p "$R/explorer" "$R/perfetto" "$R/pairs"
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
@@ -138,6 +153,10 @@ spec:
               fi
               CACHE_BEFORE=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
               echo "cache[generic]: $CACHE_BEFORE NEFFs"
+              if [ "${ADOPTED_LEGACY:-0}" = "1" ]; then
+                CACHE_TGZ="$PVC/neff_cache_${CFG}.tar.gz"
+                echo "cache: further archives go to $(basename "$CACHE_TGZ")"
+              fi
 
               PROF=neuron-explorer
               command -v "$PROF" >/dev/null 2>&1 || PROF=neuron-profile
@@ -827,10 +846,8 @@ spec:
               value: ""
             - name: WARP
               value: "gather"
-            # ONE CORE: this is the whole point of this manifest. See the header.
             - name: CORES
               value: "1"
-            # One iteration: a 1-core frame is slow and the median is not a latency anyway.
             - name: ITERS
               value: "1"
             - name: FULLGRAPH

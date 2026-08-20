@@ -1,14 +1,44 @@
+# RUN A of 2 -- BROKEN GRAPH (fullgraph=0), one core, taps, full 4K frame.
+#
+# THE KNOWN-GOOD SHAPE. Every result that has actually produced pixels in this repo ran with
+# graph breaks allowed: MODE=warpeager forces --fullgraph 0 via --warp-region eager, and that is
+# what gave tile 9 at 0.05 LSB PASS and 647.3 ms. This run keeps the breaks and drops the
+# single-tile restriction, so it is the shortest path from something measured to a full frame.
+#
+# It differs from warpeager in one way worth stating: NO --warp-region, so the resample is
+# compiled with everything else rather than left eager. fullgraph=0 only ALLOWS breaks; dynamo
+# puts them where it wants.
+#
+# ONE CORE, deliberately. The --cores 8 arm crashed after 4.6 h of successful compiles
+# (exp_univr-4x8_h128_sr3-gather-fg1_20260819_145849): the frame needed a 9th graph the 8-tile
+# probe never built, that compile ran inside ThreadPoolExecutor(max_workers=8) next to
+# already-compiled replicas, and torch raised "Detected that you are using FX to symbolically
+# trace a dynamo-optimized function". With --cores 1 there is no executor, no replicas and no
+# concurrent compile, so that failure cannot occur.
+#
+# WHAT IT PRODUCES:  whole-frame PNG + fp32 npy, golden weights, and the whole-frame max_diff
+# against the CUDA reference -- the comparison against 92.56 LSB that has blocked a shippable
+# result.
+# WHAT IT DOES NOT:  a comparable latency. One core is ~8x the wall clock, so this median must
+# NEVER sit in a table beside 3673.3 ms (README) or 3900.5 ms (prod-4x8-halo64) -- both 8-core.
+#
+# The two manifests differ in ONE variable, FULLGRAPH, and they have SEPARATE NEFF caches
+# (the key carries _fg), so neither can restore the other's graphs.
+#
+# Expect a COLD cache: fullgraph=0 compiles a different set of graphs and now has its own key.
+# Graphs with breaks are smaller, so compiles should be cheaper than the fullgraph=1 set -- but
+# that is an expectation, not a measurement, and the 704x640 shape cost 127 min at fullgraph=1.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: univr-bench
+  name: univr-full-taps-1core-fg0
   namespace: default
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: univr-bench
+        app: univr-full-taps-1core-fg0
     spec:
       restartPolicy: Never
       nodeSelector:
@@ -814,7 +844,7 @@ spec:
             - name: BRANCH
               value: "main"
             - name: MODE
-              value: "warpeager"
+              value: "full"
             - name: HALO
               value: "128"
             - name: GRID
@@ -822,9 +852,13 @@ spec:
             - name: RES
               value: ""
             - name: WARP
-              value: "gridsample"
-            - name: FULLGRAPH
+              value: "gather"
+            - name: CORES
               value: "1"
+            - name: ITERS
+              value: "1"
+            - name: FULLGRAPH
+              value: "0"
             - name: WARPCMP_TILE
               value: "9"
             - name: WARPCMP_RES
