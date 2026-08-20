@@ -1,7 +1,81 @@
 # Session state
 
-HEAD `1d5e4fa`, `main`, pushed. Local `~/pave_univr_trn2_repro`.
+HEAD `5f3f19a`, `main`, pushed. Local `~/pave_univr_trn2_repro`.
 Origin repo for reference only: `~/pave-unrolling`.
+
+## RESUME HERE
+
+### Jobs in flight (2026-08-20)
+
+| job | what it answers | state when this was written |
+|---|---|---|
+| `univr-full-taps-1core` (`fg1`) | whole-frame `max_diff` vs **92.56 LSB**, fullgraph=1 | probe done `+0` (adopted the 9-NEFF cache), in `[2/3]` ~5 h, SILENT |
+| `univr-full-taps-1core-fg0` | same, fullgraph=0 -- the A/B on whether breaks matter | probe done, all 8 FUSE (8 NEFFs), entering `[2/3]` |
+| `univr-2x4-taps-probe` | does 2x4 h128 compile now that taps removed `F.interpolate`? | launched by hand; **36% less device work if it fuses** |
+
+For each: `grep -aE '^  tile |ALL 8|median=|max_diff=|gate=|NEFFs now' <log>`. Four lines matter.
+
+**`fg1`'s silence in `[2/3]` is the open question.** With a warm cache 32 tiles on one core should
+take minutes. Diagnose with
+`kubectl exec <pod> -- sh -c 'find /tmp/neff_cache -name "*.neff" | wc -l'` -- `10+` and climbing
+means it is compiling a graph the probe missed (expected, just slow); still `9` means it is stuck
+in execution, which is a different problem and not worth waiting on. **That count also answers a
+question this file had WRONG: how many graphs a frame really needs.** The 8-tile probe said 8, the
+frame demanded a 9th, and that 9th compiling inside `ThreadPoolExecutor(max_workers=8)` is what
+killed the 8-core run with `FX ... trace a dynamo-optimized function`. `[1b]` now compiles the real
+frame serially first; it is skipped when `CORES=1` because `[2/3]` IS that pass.
+
+### The agreed working loop
+
+The user names a run, I analyze it with the tooling, **they confirm against Neuron Explorer.**
+Disagreements are the point -- see the thresholds below.
+
+```bash
+# 1. point the job at the run and apply
+#    (edit RUN in analyze-job.yaml -- currently exp_univr-warpeager_gridsample_t9_h128_sr3_20260819_142240)
+kubectl delete job univr-analyze --ignore-not-found && kubectl apply -f analyze-job.yaml
+# 2. it prints PHASES and VERDICT before the raw tables; also in the timeline tarball
+#    as phases.txt / verdict.txt
+```
+
+Locally, on anything already downloaded:
+```bash
+D=scripts/neuron/diagnose_neff.py
+python3 $D <pairs-dir>                                   # ranked, one verdict per NEFF
+python3 $D --before <pair> --after <pair>                # what a fix changed
+python3 $D --instr <analyze.log> --src-root <src-tree>    # time by SOURCE LINE + names the op
+python3 scripts/neuron/pq_phases.py <pq-dir> lbl --src-root <src-tree>   # phases, needs parquet
+```
+`--src-root` must be the tree that BUILT the NEFF: `git show <sha>:file.py > /tmp/src/file.py`.
+`analyze-job` resolves that commit itself from `source.tar.gz`/`PROVENANCE.txt` and says so.
+
+### What to check the tooling AGAINST, and what a disagreement means
+
+**Every threshold came from ONE model.** 2 KiB payload floor, 2x issue-vs-move, 15% stall, 5%
+spill, 2% transpose. If Explorer shows a bottleneck the classifier missed, or it flags something
+Explorer says is fine, that is a threshold to move -- and the change must record WHICH measurement
+moved it.
+
+**Known blind spot:** phases merge on the dominant engine only, so a phase where the engine MIX
+shifts but the leader does not will not split. If Explorer's timeline shows a transition the phase
+table missed, that is the trigger to cluster on the full engine vector instead.
+
+### Two claims of mine that are UNVERIFIED and should be settled by the next analyze run
+
+1. **"pool-down's SWDGE trio (176.6 / 145.7 / 138.7 ms) was the `gridsample` graphs."** I wrote
+   that without resolving their source lines and it is probably WRONG: taps never touched the warp,
+   yet GpSimd fell 45% -> 1.3%, so those NEFFs were almost certainly `F.interpolate`'s UPSAMPLE.
+   Running analyze on either run resolves the `src=` lines and settles it. Fix this file either way.
+2. **"the SWDGE cost RELOCATES to the resample after the interpolate fix."** Same root -- it rests
+   on claim 1.
+
+### One number already retracted
+
+"5.1M descriptors x 40 ns = 200 ms" matched the measured 199.07 ms to 3% and was **arithmetic
+coincidence**. It multiplied `software_dynamic_dma_packet_count` by a per-descriptor cost, but
+packets are not descriptors: `dma_transfer_count` is 130,936 at 2,286 B average while packets are
+5,151,200 at 29 B. What IS solid: **GpSimd spent 199.07 ms on 160,512 `DMA_INDIRECT` instructions
+(1,094 ns each) while the DMA engine sat 89% idle.** The tool now labels every unit for this reason.
 
 ## The goal
 
@@ -583,7 +657,9 @@ deterministic compiler verdicts rather than flaky runs.
 | `full-taps-1core-fg0-job.yaml` | **live.** Same, `fullgraph=0` -- the A/B on whether graph breaks matter |
 | `full-taps-job.yaml` | 8 cores. Crashed once on a 9th graph; carries the `[1b]` serial full-frame warm-up that fixes it. The eventual latency number |
 | `tiles2x4-taps-probe-job.yaml` | **queued.** Does 2x4 halo 128 compile now that taps removed `F.interpolate`? 36% less device work if yes |
-| `analyze-job.yaml` | per-NEFF instruction + DMA attribution to source lines, via neuron-explorer + duckdb over the parquet |
+| `analyze-job.yaml` | per-NEFF attribution to source lines via neuron-explorer + duckdb over the parquet. Now also prints PHASES and VERDICT, and ships `phases.txt` / `verdict.txt` |
+| `scripts/neuron/diagnose_neff.py` | **reads a profile and states a verdict.** Discovers engines and DMA modes from key names, classifies by ratios between them, names the source line and the torch op. `--before/--after` diffs two profiles. Also the `neuron-profile-diagnose` skill |
+| `scripts/neuron/pq_phases.py` | splits a NEFF into PHASES over time and diagnoses each separately, because a whole-NEFF average of a graph that is compute-bound then issue-bound describes neither |
 | `scripts/neuron/` | the skill's helpers, committed so the pod's clone has them: `rank_neffs.py` (fixability + engine-mix gate), `profile_all_neffs.py`, `pick_neffs.py`, `top_neffs.py`, `pq_*.py`, `run_dma_analysis.sh`, `pf_op_summary.py` (chrome-trace op table, resample vs rest by SPAN CONTAINMENT) |
 | `s3-mount-test-pod.yaml` | 85-second PVC mount check on a chosen node |
 | `nki_shift_warp.py` | the dead kernel, kept for the measured op-level result |
