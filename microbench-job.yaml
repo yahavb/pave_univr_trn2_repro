@@ -32,9 +32,6 @@ spec:
               echo "commit $(git rev-parse HEAD)"
 
               OUT=/tmp/mb; mkdir -p "$OUT"
-              # ARCHIVE IN A TRAP, never as the last block. Under `set -euo pipefail` any earlier
-              # failure -- or an early `exit` from a branch like SET=sequence -- skips a trailing
-              # archive and takes every artifact with it. One S3 object, verified non-empty.
               finalize() {
                 echo ""
                 echo "=== FINALIZE (trap EXIT -- runs even on failure or early exit) ==="
@@ -59,20 +56,8 @@ spec:
               POUT=/tmp/perneff; mkdir -p "$POUT"
 
               SET="${SET:-both}"
-              # THE GRID AND HALO THE FRAME ACTUALLY USES. The arm list is DERIVED from these via
-              # the model's own plan_tiles, not hand-written:
-              #   4x8 halo 128  proven fusable on all 8 slots (job k2zwh). 448 warp calls a frame,
-              #                 100.4M pixel-warps, 4 padded shapes, 20 distinct (C,H,W)
-              #   4x8 halo  64  the config that measured 3900.5 / 3820.4 ms. 448 calls but only
-              #                 72.4M pixel-warps -- halo 128 is 39% MORE resample work
-              #   2x8 halo  64  224 calls, 61.7M pixel-warps, but a measured compile OOM
               GRID="${GRID:-4x8}"; HALO="${HALO:-128}"
 
-              # nkilib PREFLIGHT. The NKL kernel (CR-288764575) is UNMERGED, so it is absent from
-              # released images. Restore it from ONE tar object if present on the PVC -- never
-              # traverse the S3-FUSE mount file-by-file -- then TEST the import and let the answer
-              # decide whether the arms run. Predicting the failure and running the arms anyway,
-              # which is what the previous version did, wastes the run and tells us nothing.
               NKILIB_TGZ="${NKILIB_TGZ:-/var/mdl/univr/nkilib.tar.gz}"
               if [ -f "$NKILIB_TGZ" ]; then
                 cp "$NKILIB_TGZ" /tmp/nkilib.tar.gz && mkdir -p /tmp/nkilib \
@@ -92,66 +77,17 @@ spec:
               fi
               echo ""
 
-              # THE ARM LIST IS THE MODEL'S OWN OP INVENTORY. Nothing here is invented: warp
-              # dims come from the model's real call sites (6 pyramid warps at FULL tile resolution
-              # plus 4 Contextnet levels x {img0,img1}, per tile) and conv dims from conv_inventory,
-              # both evaluated at every padded shape plan_tiles produces for this grid/halo.
-              #
-              # This replaced a synthetic C=3..128 sweep at the FULL tile shape, which measured
-              # shapes the model never computes -- Contextnet's Conv2(stride=2) levels double C
-              # while QUARTERING area, so C=128 lives at 44x48 = 2,112 px, not 540,672. Chasing its
-              # "205 pkt/px" was chasing 0.1% of the work.
-              #
-              # WARP_IMPLS is the A/B. Weight-ordered, so a truncated run still covers the most
-              # work, and TOP prints exactly what it left out rather than capping silently:
-              #   the four C=3 dims alone are 90.0% of all resample work
-              #   all five C=128 dims together are 0.11%
-              # THE BAR IS nki-dyn, NOT gather. Getting this wrong made an entire comparison
-              # misleading, so it is spelled out:
-              #   gridsample  stock RIFE, the CORRECTNESS reference every arm is scored against on
-              #               CPU -- but NOT a latency baseline: it cannot compile fused at all
-              #               (OOM at 169 and 94 min), so the model never pays its 64.66 ms
-              #   gather      "the port's form", a portable 4-tap gather. Only the argparse
-              #               DEFAULT. Not the reference and not the fastest. 3900.5 ms fused
-              #   nki         the unrolled kernel the README's 3673.3 ms baseline used.
-              #               80-100 min to compile per 4K tile shape, so opt in deliberately
-              #   nki-dyn     device-loop kernel, compiles in seconds, 3820.4 ms fused --
-              #               the FASTEST resample on record, hence the bar
-              # gather stays in because it is what the current fused runs used, so it links these
-              # numbers to the 3900.5 ms on record. gridsample is out: its law (time = descriptors
-              # x ~40 ns, 1.006 vs 3.004 pkt/px) is settled and re-measuring it costs arms for a
-              # number we cannot use. Add either back explicitly via WARP_IMPLS.
               WARP_IMPLS="${WARP_IMPLS:-gather,nki-dyn}"
               if [ "$NKL" = "1" ]; then WARP_IMPLS="$WARP_IMPLS,gridsample-nkl"; fi
-              TOP="${TOP:-0}"          # 0 = every dim the model uses
+              TOP="${TOP:-0}"
 
               SPECS="${SPECS:-}"
               if [ -z "$SPECS" ]; then
                 python3 microbench.py --op x --grid "$GRID" --halo "$HALO" \
                     --warp-impls "$WARP_IMPLS" --top "$TOP" --list-op-sites | sed 's/^/  /'
                 echo ""
-                # SET=gsbackends: THE apples-to-apples comparison. ONE operation -- gridsample,
-                # stock RIFE semantics (bilinear / border / align_corners=True) -- across THREE
-                # backends, at the tile dims that minimise padding.
-                #
-                # This is cleaner than anything before it because it removes the confound: gather
-                # is a DIFFERENT formulation (4-tap indirect gather), numerically equivalent but
-                # not the same code path, so using it as the baseline made the bar arbitrary.
-                # Here every arm computes the same op, so the only variable is the lowering.
-                #
-                # GEOMETRY: 4x8 halo 64, because among everything tried it is the least padding
-                # that actually works -- padded/valid 1.535x, against h128's 2.130x (h128 is 39%
-                # more resample work), and the smaller-padding options are all dead:
-                #   2x8 h64  1.309x  compile OOM at 600/1000/1500Gi
-                #   2x4 h128 1.363x  OOM / DMA rejection
-                #   4x8 h48  1.389x  0 of 3 shapes fuse
-                #   4x8 h64  1.535x  FUSES, and is the config that measured 3900.5 ms  <- this
                 if [ "$SET" = "gsbackends" ]; then
-                  # GRID/HALO, the SAME knobs every other arm uses. A separate GSG/GSH pair
-                  # existed here and defaulted to 4x8/64 while the manifest declared HALO=128 --
-                  # the YAML would have said 128 while the run did 64. One set of knobs, declared.
                   GSG="$GRID"; GSH="$HALO"
-                  # the C=3 full-resolution dims: 6 of the 14 calls per tile and ~90% of the work
                   DIMS=$(python3 microbench.py --op x --grid "$GSG" --halo "$GSH" \
                          --warp-impls gather --top 4 --op-site-class warps --op-site-specs \
                          | sed 's/^gather://')
@@ -195,16 +131,9 @@ spec:
                   exit 0
                 fi
 
-                # SET=nklsweep: the ONE knob with headroom left. Measured with batching DISABLED
-                # (max_indices_per_indirect=None) the kernel matched gather's 1.006 desc/px -- it
-                # fully solved ATen gridsample's 3x blowup, a 2.7x win over gridsample -- but ran
-                # 44.2 ns/descriptor against gather's 40.4, so 9% SLOWER than gather overall. It
-                # did reach hardware_dynamic_dma 5.8% where gather is at 0.10%, and batched
-                # indirection is the kernel's headline feature, so raising that share is the only
-                # remaining lever. One dim, one warp, several caps.
                 if [ "$SET" = "nklsweep" ]; then
                   if [ "$NKL" != "1" ]; then echo "nklsweep needs nkilib; aborting"; exit 0; fi
-                  SWEEP_SHAPE="${SWEEP_SHAPE:-3,704,768}"      # the 38.75%-of-work dim
+                  SWEEP_SHAPE="${SWEEP_SHAPE:-3,704,768}"
                   CAPS="${CAPS:-none 128 256 512 1024}"
                   echo "nklsweep at $SWEEP_SHAPE   caps: $CAPS   (gather = 21.98 ms @ 40.39 ns/desc)"
                   for CAP in $CAPS; do
@@ -238,13 +167,6 @@ spec:
                   exit 0
                 fi
 
-                # SET=sequence: the model's WHOLE op sequence for one tile, one compiled graph,
-                # once per warp. This is the arm that assesses a resample kernel, because an
-                # isolated op has no pipelining, no layout reuse and no overlap with the convs
-                # around it -- and because the NKL kernel needs NHWC while the model is NCHW, so it
-                # adds two permutes per call that no single-op arm measures. gather runs first and
-                # saves its output; later warps are compared against it at the same seed, which
-                # isolates the resample without needing the golden.
                 if [ "$SET" = "sequence" ]; then
                   TILE="${TILE:-9}"; ITERS="${ITERS:-5}"; FULLGRAPH="${FULLGRAPH:-1}"
                   SEQ_WARPS="${SEQ_WARPS:-gather}"
@@ -290,7 +212,6 @@ spec:
                   exit 0
                 fi
 
-                # SET filters the classes: warps = the resample question, convs = dense compute.
                 SPECS=$(python3 microbench.py --op x --grid "$GRID" --halo "$HALO" \
                     --warp-impls "$WARP_IMPLS" --top "$TOP" --op-site-specs --op-site-class "$SET" \
                     | tr '\n' ' ')
@@ -304,8 +225,6 @@ spec:
               for SPEC in $SPECS; do
                 OPSPEC=${SPEC%%:*}
                 SHP=${SPEC#*:}
-                # "op" or "op/R". The radius is part of the TAG so the two nkishift runs
-                # land in separate logs and separate summary rows instead of colliding.
                 OP=${OPSPEC%%/*}
                 if [ "$OPSPEC" != "$OP" ]; then
                   RAD="--radius ${OPSPEC#*/}"
@@ -335,12 +254,6 @@ spec:
                 hash=$(basename "$BIG" .neff)
                 ntff="$POUT/$hash.ntff"; json="$POUT/$hash.json"
                 echo "  neff $hash ($(stat -c%s "$BIG") B)"
-                # neuron-profile is DEPRECATED on this image (cc 2.27): every capture failed with
-                # a banner pointing at neuron-explorer. 10/10 arms lost their profile data that way,
-                # so the whole descriptor payload was missing. Prefer neuron-explorer, fall back to
-                # neuron-profile for older images. This is the CAPTURE subcommand -- NOT the
-                # neuron-explorer view SERVER (--ingest-only, :3001/:3002), which hangs on big DMA
-                # NEFFs and must still never be used.
                 PROF=neuron-explorer
                 command -v "$PROF" >/dev/null 2>&1 || PROF=neuron-profile
                 timeout 3600 "$PROF" capture --single-io -n "$BIG" -s "$ntff" \
@@ -375,7 +288,6 @@ spec:
               done
               echo ""
 
-              # (the archive is the EXIT trap defined at the top)
           resources:
             claims:
               - name: neurons
@@ -395,32 +307,14 @@ spec:
               value: "1"
             - name: RES
               value: "256x384"
-            # ── the knobs. Defaults are the DECISIVE run for the resample question:
-            #    SET=warps TOP=4 = the four C=3 dims, which are 90.0% of all resample work,
-            #    x {gather, gridsample, gridsample-nkl} = 12 arms instead of 256.
-            #    SET=sequence  -> the whole tile op sequence per warp (the model-level answer;
-            #                     catches the NHWC permutes the NKL kernel adds, which no
-            #                     single-op arm can see)
-            #    SET=gsbackends -> ONE op (gridsample) across THREE backends -- cpu / neuron /
-            #                      NKI -- at the least-padding geometry that works (4x8 halo 64,
-            #                      padded/valid 1.535x vs h128's 2.130x). 12 arms. This is the
-            #                      apples-to-apples comparison: same op, same semantics, only the
-            #                      lowering varies, so no gather confound.
-            #    SET=nklsweep  -> sweep the kernel's max_indices_per_indirect at one dim
-            #    SET=both TOP=0 -> every op the model runs at every dim it runs it (256 arms)
             - name: SET
               value: "gsbackends"
             - name: TOP
               value: "4"
             - name: GRID
               value: "4x8"
-            # 64, not 128: among everything tried, 4x8 halo 64 is the LEAST PADDING that
-            # actually works (padded/valid 1.535x vs h128's 2.130x, so h128 is 39% more resample
-            # work) and it is the config that measured 3900.5 ms. h128 is proven fusable and is
-            # what the ACCURACY triage needed, so switch back to 128 for accuracy questions.
             - name: HALO
               value: "64"
-            # --op sequence only
             - name: TILE
               value: "9"
             - name: ITERS
@@ -431,9 +325,6 @@ spec:
               value: "1"
             - name: NEURON_RT_VISIBLE_CORES
               value: "0"
-            # No --model-type unet-inference: measured as the sole cause of the NCC_EBIR033 DMA
-            # rejection. 8 arms on one shape, every arm with it rejected at in=23,040, every arm
-            # without it fused. --target dropped too: the node is trn3 and the compiler detects it.
             - name: NEURON_CC_FLAGS
               value: "--lnc 1"
             - name: TORCH_NEURONX_NEFF_CACHE_DIR

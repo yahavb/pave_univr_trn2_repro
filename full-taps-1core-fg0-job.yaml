@@ -1,33 +1,3 @@
-# RUN A of 2 -- BROKEN GRAPH (fullgraph=0), one core, taps, full 4K frame.
-#
-# THE KNOWN-GOOD SHAPE. Every result that has actually produced pixels in this repo ran with
-# graph breaks allowed: MODE=warpeager forces --fullgraph 0 via --warp-region eager, and that is
-# what gave tile 9 at 0.05 LSB PASS and 647.3 ms. This run keeps the breaks and drops the
-# single-tile restriction, so it is the shortest path from something measured to a full frame.
-#
-# It differs from warpeager in one way worth stating: NO --warp-region, so the resample is
-# compiled with everything else rather than left eager. fullgraph=0 only ALLOWS breaks; dynamo
-# puts them where it wants.
-#
-# ONE CORE, deliberately. The --cores 8 arm crashed after 4.6 h of successful compiles
-# (exp_univr-4x8_h128_sr3-gather-fg1_20260819_145849): the frame needed a 9th graph the 8-tile
-# probe never built, that compile ran inside ThreadPoolExecutor(max_workers=8) next to
-# already-compiled replicas, and torch raised "Detected that you are using FX to symbolically
-# trace a dynamo-optimized function". With --cores 1 there is no executor, no replicas and no
-# concurrent compile, so that failure cannot occur.
-#
-# WHAT IT PRODUCES:  whole-frame PNG + fp32 npy, golden weights, and the whole-frame max_diff
-# against the CUDA reference -- the comparison against 92.56 LSB that has blocked a shippable
-# result.
-# WHAT IT DOES NOT:  a comparable latency. One core is ~8x the wall clock, so this median must
-# NEVER sit in a table beside 3673.3 ms (README) or 3900.5 ms (prod-4x8-halo64) -- both 8-core.
-#
-# The two manifests differ in ONE variable, FULLGRAPH, and they have SEPARATE NEFF caches
-# (the key carries _fg), so neither can restore the other's graphs.
-#
-# Expect a COLD cache: fullgraph=0 compiles a different set of graphs and now has its own key.
-# Graphs with breaks are smaller, so compiles should be cheaper than the fullgraph=1 set -- but
-# that is an expectation, not a measurement, and the 704x640 shape cost 127 min at fullgraph=1.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -74,28 +44,13 @@ spec:
               TOPN="${TOPN:-5}"
               REFERENCE="README trn2 eager 3673.3 ms / 0.64 LSB; g6e L40S 351.1 ms (161 ms ONNX+TRT)"
 
-              # SR MUST be global. MODE=full built BASE without --static-resize, so every
-              # STATIC_RESIZE=1/2/3 full run silently executed level 0 and logged as a success --
-              # the same class of bug as the WARPEAGER_RES default that ran 288x320 for a whole run.
               SR="${STATIC_RESIZE:-0}"
-              # AND the arm belongs in the cache key: level 0 and level 3 compile DIFFERENT graphs,
-              # so a shared key restores the other arm's NEFFs and the run reports +0 while
-              # executing the wrong model. HALO is in here for the same reason.
-              # FULLGRAPH belongs in the cache key for the same reason HALO and SR do: fullgraph=0
-              # allows graph breaks, so it compiles a DIFFERENT SET of graphs. Sharing the key with
-              # a fullgraph=1 run restores the wrong NEFFs and the run prints "+0" while executing
-              # something it never compiled.
               CFG="${GRID}_h${HALO}_sr${SR}_fg${FULLGRAPH}"
               TS=$(date -u +%Y%m%d_%H%M%S)
               RUN="exp_univr-${CFG}-${WARP}_${TS}"
               PVC=/var/mdl/univr
               RUNDIR="$PVC/runs/$RUN"
               CACHE_TGZ="$PVC/neff_cache_${CFG}.tar.gz"
-              # MIGRATION, one-way and read-only. The key gained _fg late, so the 4.6 h fullgraph=1
-              # cache from 20260819_145849 sits under the OLD name. Restore from it if the new key
-              # has nothing yet, but only for fullgraph=1 -- those NEFFs ARE fullgraph=1 graphs and
-              # handing them to a fullgraph=0 run is the exact confound this key change prevents.
-              # Archiving always writes the NEW name, so the legacy object is never updated.
               LEGACY_TGZ="$PVC/neff_cache_${GRID}_h${HALO}_sr${SR}.tar.gz"
               if [ ! -f "$CACHE_TGZ" ] && [ "$FULLGRAPH" = "1" ] && [ -f "$LEGACY_TGZ" ]; then
                 echo "cache: adopting legacy fullgraph=1 key $(basename "$LEGACY_TGZ")"
@@ -143,19 +98,11 @@ spec:
               }
               trap finalize EXIT
 
-              # THIS BANNER READS THE GENERIC KEY, and MODE=warpeager/warpcmp override CACHE_TGZ
-              # afterwards -- so for those modes it always claimed "(none)" and "LOADED: 0" while the
-              # mode's own restore was pulling 49 NEFFs a few lines later. Say which key it is.
-              # generic key; MODE=warpeager/warpcmp override CACHE_TGZ below
               if [ -f "$CACHE_TGZ" ]; then
                 cp "$CACHE_TGZ" /tmp/restore.tar.gz && tar -xzf /tmp/restore.tar.gz -C /tmp \
                   || echo "│ WARNING: restore failed"
                 echo "cache[generic]: $(basename "$CACHE_TGZ") $(du -h "$CACHE_TGZ" | cut -f1)"
               else
-                # No fabricated estimate. MEASURED at 704x768 tile 9 with the eager region:
-                # 597.9 s for the interpolate arm, 266.8 s and 245.0 s for the pooled arm. The
-                # "~75 min per shape" this used to print came from FUSED fullgraph=1 compiles and
-                # was wrong by an order of magnitude for every run that read it.
                 echo "cache[generic]: none"
               fi
               CACHE_BEFORE=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
@@ -191,11 +138,6 @@ spec:
               echo "  run dir   : $RUNDIR"
               echo ""
 
-              # nkilib is ONLY restored when an arm actually asks for gridsample-nkl. It was
-              # restoring and probing on every run, which put "nkilib: IMPORT OK" in the log of
-              # runs that never touch the kernel -- a standing invitation to read a gridsample
-              # number as an nkl number. The warpcmp arm still skips with its own message if the
-              # tar is missing, so the capability survives without the noise.
               NKILIB_TGZ="${NKILIB_TGZ:-$PVC/nkilib.tar.gz}"
               case "${WARP:-}:${WARPEAGER_WARP:-}:${WARPCMP_ARMS:-}" in
                 *gridsample-nkl*)
@@ -218,14 +160,6 @@ spec:
               esac
 
               if [ "${MODE:-full}" = "warpeager" ]; then
-                # NO COLON in the default: ${VAR:-d} substitutes d when VAR is unset OR EMPTY, so
-                # clearing WARPEAGER_RES to ask for the real tile silently ran 288x320 instead --
-                # a whole run at the wrong geometry that still logged as a success. ${VAR-d} honours
-                # an explicitly empty value, which is the only way to SAY "full tile".
-                # ONE ARM PER POD. The static-resize arms compile DIFFERENT graphs, so they get
-                # their own cache tar and run dir via the label -- sharing them would restore the
-                # other arm's NEFFs and the ranking would compare two different models.
-                # SR is set globally above -- do NOT re-derive it here.
                 WE_RES="${WARPEAGER_RES-288x320}"
                 WE_WARP="${WARPEAGER_WARP:-gridsample}"
                 WE_ITERS="${WARPEAGER_ITERS:-3}"
@@ -236,10 +170,6 @@ spec:
                   LBL="warpeager_${WE_WARP}_${WE_RES}_sr${SR}"
                 else
                   GEOM="--height 1728 --width 4096 --tiles $GRID --halo $HALO $REF --only-tile $WE_TILE"
-                  # HALO BELONGS IN THE LABEL. The NEFF cache tar and the run dir are keyed on
-                  # LBL, and tile 9 is 576x640 at halo 64 but 704x768 at halo 128 -- without the
-                  # halo a second run restores the FIRST geometry's NEFFs and the per-NEFF ranking
-                  # silently mixes two tile sizes.
                   LBL="warpeager_${WE_WARP}_t${WE_TILE}_h${HALO}_sr${SR}"
                 fi
                 RUN="exp_univr-${LBL}_${TS}"
@@ -272,9 +202,6 @@ spec:
                 wrc=${PIPESTATUS[0]}
                 set -e
                 echo "  rc=$wrc  NEFFs now $(find /tmp/neff_cache -name '*.neff' | wc -l)"
-                # WHICH graphs are new, not just how many. A warm-looking restore that still compiles
-                # 14 graphs is either a real code change or a cache miss, and "+14" alone cannot tell
-                # you which -- so list the hashes that were not in the restored set.
                 find /tmp/neff_cache -name '*.neff' -printf '%f\n' 2>/dev/null | sort > /tmp/neff_after.txt
                 if [ -s /tmp/neff_before.txt ]; then
                   NEW=$(comm -13 /tmp/neff_before.txt /tmp/neff_after.txt | wc -l)
@@ -369,9 +296,6 @@ spec:
                 POUT=/tmp/perneff_we; rm -rf "$POUT"; mkdir -p "$POUT"
                 mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)
                 echo "  NEFFs in cache: ${#NEFFS[@]}"
-                # HEARTBEAT. This loop is the longest stage in the job -- 63 NEFFs, each a capture
-                # plus a view with a 900 s ceiling -- and it used to print NOTHING until the last
-                # one finished, so a run mid-sweep is indistinguishable from a hung one.
                 OK=0; N=0; T0=$SECONDS
                 for neff in "${NEFFS[@]}"; do
                   N=$((N+1))
@@ -390,7 +314,6 @@ spec:
                   fi
                 done
                 echo "  captured+viewed OK: $OK / ${#NEFFS[@]}"
-                # per-NEFF table and full ranking go to the files; the log gets the summaries only
                 python3 scripts/neuron/profile_all_neffs.py "$POUT" > "$R/perneff_${LBL}.txt" 2>&1 || true
                 sed -n '/MODEL-LEVEL/,$p' "$R/perneff_${LBL}.txt" || true
                 python3 scripts/neuron/rank_neffs.py "$POUT" > "$R/ranking_${LBL}.txt" 2>&1 || true
@@ -503,8 +426,6 @@ spec:
 
               if [ "${MODE:-full}" = "warpcmp" ]; then
                 WT="${WARPCMP_TILE:-9}"; WI="${WARPCMP_ITERS:-3}"
-                # Same no-colon rule as WARPEAGER_RES: WARPCMP_RES="" means the REAL tile via
-                # --only-tile, and with :- it would have silently re-run the reduced ladder.
                 WRES_LIST="${WARPCMP_RES-128x128 192x224 288x320}"
                 WARPCMP_ARMS="${WARPCMP_ARMS:-aten:gridsample:neuron cpu:gridsample:cpu}"
                 echo "=== MODE=warpcmp  ${WRES:-$GRID halo $HALO tile $WT}  iters $WI ==="
@@ -607,23 +528,6 @@ spec:
               done
               echo "  ==> ALL 8 GRAPHS COMPILE = $PW_ALL  (cache holds $(find /tmp/neff_cache -name '*.neff' | wc -l) NEFFs)"
 
-              # [1b] SERIAL FULL-FRAME WARM-UP -- the per-tile probe is NOT sufficient and this is
-              # not a belt-and-braces step, it is the fix for a HARD CRASH.
-              #
-              # MEASURED, run exp_univr-4x8_h128_sr3-gather-fg1_20260819_145849: the 8-tile probe
-              # reported ALL 8 GRAPHS COMPILE = 1, and the --cores 8 arm then compiled a NINTH
-              # graph and died with
-              #   RuntimeError: Detected that you are using FX to symbolically trace a
-              #   dynamo-optimized function. This is not supported at the moment.
-              # because that compile ran inside ThreadPoolExecutor(max_workers=8) while the other
-              # workers held already-compiled replicas. The whole scored arm produced nothing after
-              # 4.6 h of successful compiles.
-              #
-              # So "a frame needs 8 graphs (4 shapes x 2 passes)" is WRONG -- something else is
-              # specialised per tile as well (row0 is a python int to dynamo). Rather than guess the
-              # complete key, compile what the real frame actually asks for: ONE pass over ALL 32
-              # tiles on ONE core. Serial, so peak host memory is one compile, and after it the
-              # --cores 8 arm has nothing left to build.
               if [ "$PW_ALL" = "1" ] && [ "$CORES" = "1" ]; then
                 echo ""
                 echo "=== [1b] SKIPPED: CORES=1, so [2/3] IS the serial full-frame pass ==="
@@ -869,25 +773,8 @@ spec:
               value: "gridsample"
             - name: WARPEAGER_ITERS
               value: "3"
-            # Iterations for the CLEAN pass in [L] -- no profiler, warm cache. This median is the
-            # only latency this mode produces; [A] and [C] both run with a profiler attached.
             - name: WARPEAGER_CLEAN_ITERS
               value: "5"
-            # 0 = F.interpolate as written (the baseline: 009cee17, 301.7 ms, swdyn 97%, 512 B
-            # descriptors). 1 = pooled downsample + drop the identity resize at scale=1.
-            # 2 = also the upsample as a depthwise transposed conv. All EXACT -- whole-model check
-            # on cpu gave max_diff 0.00 LSB / cosine 1.000000 against level 0 for both.
-            # 3 = PRECOMPUTED TAPS, and it is the ONLY arm that answers the question the thread
-            # actually asked. MEASURED so far, tile 9 halo 128, clean median: sr0 1313.3 ms,
-            # sr1 986.9 and 1039.2 ms across two runs (so the pooling win is 274-326 ms, and
-            # 52 ms of that is run-to-run). Pooling wins by DELETING the gather -- at 1/2 and 1/4
-            # the two taps are adjacent with weights exactly 1/2 -- so it says nothing about the
-            # general form. Level 3 moves only the ADDRESS ARITHMETIC out of the graph (i0/i1/wl/wr
-            # built once on the host in float64, cached) and keeps an indexed read via
-            # index_select. Whether neuronx-cc folds a CONSTANT index tensor into static
-            # descriptors, or reproduces the same 512 B SWDGE pattern, is unknown and is the whole
-            # experiment. Read it as: near sr1 = constant indices suffice; near sr0 = the
-            # indirection survives them and only removing the gather helps.
             - name: STATIC_RESIZE
               value: "3"
             - name: WARPEAGER_TILE

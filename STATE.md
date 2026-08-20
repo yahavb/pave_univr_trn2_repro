@@ -475,9 +475,8 @@ deterministic compiler verdicts rather than flaky runs.
   upsample.** Tile 9 went 22.17 -> **0.05 LSB (PASS)** with precomputed taps on both resizes.
   Unconfirmed at the FRAME level -- that needs a `MODE=full` taps run, and it is now the single
   highest-value job in the repo. Everything below in this bullet is the pre-answer state.
-  `accuracy-triage-job.yaml` runs `gather` at halo 128 -- the only remaining variable, since
-  gridsample cannot compile fused and the two warps already agree to every digit. That job
-  also produces the system-profile bundle.
+  `full-taps-1core-job.yaml` and `-fg0-` are the runs that settle it (`accuracy-triage-job.yaml`,
+  which used to own this, is deleted -- `univr-bench-job.yaml` supersedes it).
 
   **Two attempts OOMKilled and BOTH were wasted on a self-inflicted confound**:
   `univr-accuracy-triage-rh7rz` at 8 h and `-jcbd4` at 5 h 32 m. Both logs stop at
@@ -501,7 +500,7 @@ deterministic compiler verdicts rather than flaky runs.
   `1`/`25` 576x768 442,368, `0`/`24` 576x640 368,640. This is why `prod-4x8-halo64`'s serial
   warm-up of tile 9 alone still left **+7 NEFFs** for the 8-core run to compile concurrently:
   one tile seeds one of eight slots. A prewarm must cover all eight or the confound survives.
-* **The system-profile bundle for Neuron Explorer.** `accuracy-triage-job.yaml` stages 3-4
+* **The system-profile bundle for Neuron Explorer.** `univr-bench-job.yaml` stages [5]-[6]
   build the directory-upload format: `trace_info.pb` (required), the host `.pb` files,
   `.neff`, `.ntff` with a backfill, plus the source and a PROVENANCE.txt. `trace_info.pb`
   comes from the runtime INSPECT env vars, NOT from a capture command -- capture only ever
@@ -579,21 +578,32 @@ deterministic compiler verdicts rather than flaky runs.
 | `microbench.py` | the microbenchmark: 14 resamples + 54 convs, one op per invocation, each scored against a CPU reference |
 | `profile_roofline.py` | reads a `summary.json`, prints per-engine time and MFU |
 | `microbench-job.yaml` | runs it. `SET=warps|convs|both`, now the four 4x8 **halo-128** shapes and `CHANS=3 16 32 64 128`. **Every earlier warp arm ran at C=3 only** -- the cheapest site -- so gridsample was judged on its best case while its descriptor rate climbs to 205 pkt/px at C=128 (`_C=16`, so the resample runs at C=3/16/32/64/128) |
-| `ccflag-fusion-job.yaml` | the flag sweep that found `--model-type unet-inference`. Done |
-| `prod-4x8-halo64-job.yaml` | the fused timing run that produced 3900.5 / 3820.4 ms |
-| `repro-job.yaml` | whole model, original hardcoded `nki` arms |
-| `bigtile-noflag-job.yaml` | the job that proved 4x8 halo 64 fuses on all four shapes |
-| `fused-config-search-job.yaml` | geometry x warp under fullgraph. Superseded |
-| `accuracy-triage-job.yaml` | **the live job.** 4 stages: serial 8-graph compile probe, then the gated 8-core scored arm, then the Neuron Explorer system-profile bundle |
-| `univr-bench-job.yaml` | **the job to use from now on.** Adopts `/neuron-3run-benchmark`: persistent NEFF cache, 3-run methodology, consumer-split archive |
+| `univr-bench-job.yaml` | **the base every job is generated from.** `/neuron-3run-benchmark`: persistent NEFF cache, 3-run flow, consumer-split archive. Currently `MODE=warpeager` |
+| `full-taps-1core-job.yaml` | **live.** Full 4K frame, 1 core, taps, `fullgraph=1`. The whole-frame accuracy number |
+| `full-taps-1core-fg0-job.yaml` | **live.** Same, `fullgraph=0` -- the A/B on whether graph breaks matter |
+| `full-taps-job.yaml` | 8 cores. Crashed once on a 9th graph; carries the `[1b]` serial full-frame warm-up that fixes it. The eventual latency number |
+| `tiles2x4-taps-probe-job.yaml` | **queued.** Does 2x4 halo 128 compile now that taps removed `F.interpolate`? 36% less device work if yes |
+| `analyze-job.yaml` | per-NEFF instruction + DMA attribution to source lines, via neuron-explorer + duckdb over the parquet |
 | `scripts/neuron/` | the skill's helpers, committed so the pod's clone has them: `rank_neffs.py` (fixability + engine-mix gate), `profile_all_neffs.py`, `pick_neffs.py`, `top_neffs.py`, `pq_*.py`, `run_dma_analysis.sh`, `pf_op_summary.py` (chrome-trace op table, resample vs rest by SPAN CONTAINMENT) |
 | `s3-mount-test-pod.yaml` | 85-second PVC mount check on a chosen node |
 | `nki_shift_warp.py` | the dead kernel, kept for the measured op-level result |
 
-Deleted this session as dead ends: `profile-model-job.yaml`, `compile-modes-job.yaml`,
+Deleted earlier as dead ends: `profile-model-job.yaml`, `compile-modes-job.yaml`,
 `fused-4x8-timing-job.yaml`, `halo-shapeset-job.yaml`, `halo64-fusion-job.yaml`,
 `fusion-threshold-job.yaml`, `single-graph-retest-job.yaml`, `settle-2x8-job.yaml`,
 `AB_RUN.md`, `profile_hotspots.py`.
+
+Deleted 2026-08-20, each having served its purpose -- `git show <sha>~1` restores any of them:
+`accuracy-triage-job.yaml` (superseded by `univr-bench-job.yaml`), `ccflag-fusion-job.yaml`
+(found `--model-type unet-inference`, done), `bigtile-noflag-job.yaml` (proved 4x8 h64 fuses),
+`prod-4x8-halo64-job.yaml` (produced 3900.5 / 3820.4 ms), `fused-config-search-job.yaml`
+(superseded), `repro-job.yaml` (needs the eager path, which no longer exists in the script),
+`taps-fg1-probe-job.yaml` (answered: taps DOES trace under `fullgraph=True`).
+
+**Every `#` comment is stripped from the YAML and from `repro_unrolling_trn2.py`.** The reasoning
+that used to sit in them lives here now. Two consequences: a manifest no longer explains itself,
+and **`repro_unrolling_trn2.py` keeps only the 51 prints some job greps** -- a print added for
+human reading will be deleted by the next strip unless a manifest parses it.
 
 ## The benchmark harness: `univr-bench-job.yaml`
 
@@ -845,8 +855,9 @@ at taps exists**, so the 32-tiles/8-cores arithmetic is unearned. Next, in order
   Always use `421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest`.
 * **`--per-block` requires `--compile none`**, so that block table is an EAGER measurement
   and is not comparable to compiled runs.
-* **`repro-job.yaml` never passes `--compile`**, so it defaults to eager. The README's
-  3673.3 ms is an eager number, and 275 NEFFs is what eager costs.
+* **The README's 3673.3 ms is an EAGER number** and 275 NEFFs is what eager costs. It cannot be
+  reproduced: the eager path is gone from the script and `repro-job.yaml`, which relied on it, is
+  deleted. Fused numbers are comparable only to other fused numbers.
 * **`d2h` is NOT a transfer measurement, and it must never be used to argue device work is
   small.** The forward returns before the device finishes and the completion barrier is the
   `.cpu()` read, so **async device execution is attributed to `d2h`**. The code says so at
