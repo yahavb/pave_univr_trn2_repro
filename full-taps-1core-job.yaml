@@ -1,14 +1,37 @@
+# FULL 4K FRAME, ONE CORE, taps. The LOW-RISK path to the number that matters.
+#
+# WHY ONE CORE. The --cores 8 arm crashed after 4.6 h of successful compiles
+# (exp_univr-4x8_h128_sr3-gather-fg1_20260819_145849): the frame needed a 9th graph the
+# 8-tile probe never built, that compile ran inside ThreadPoolExecutor(max_workers=8)
+# alongside already-compiled replicas, and torch raised
+#   RuntimeError: Detected that you are using FX to symbolically trace a dynamo-optimized
+#   function.
+# With --cores 1 there is no executor, no replicas and no concurrent compile, so that
+# failure mode does not exist. Any compile the frame still needs happens serially, which is
+# also the only safe way to compile these shapes (peak host memory = one compile).
+#
+# WHAT IT PRODUCES, and what it does NOT:
+#   YES  whole-frame PNG + fp32 npy, real pixels, golden weights
+#   YES  whole-frame max_diff vs the CUDA reference -- the number to compare against 92.56 LSB,
+#        which is the failure that has blocked a shippable result
+#   NO   a competitive latency. One core is ~8x the wall clock, so the median here is NOT
+#        comparable to 3673.3 ms (README, 8 cores) or 3900.5 ms (prod-4x8-halo64, 8 cores).
+#        Do not put it in a latency table. Per-tile latency already exists.
+#
+# The 9-NEFF cache from the crashed run is on the PVC under the same key
+# (neff_cache_4x8_h128_sr3.tar.gz), so [1/3] should report NEFFs +0 on every tile and the
+# 4.6 h of compiling is not repeated.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: univr-bench
+  name: univr-full-taps-1core
   namespace: default
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: univr-bench
+        app: univr-full-taps-1core
     spec:
       restartPolicy: Never
       nodeSelector:
@@ -795,7 +818,7 @@ spec:
             - name: BRANCH
               value: "main"
             - name: MODE
-              value: "warpeager"
+              value: "full"
             - name: HALO
               value: "128"
             - name: GRID
@@ -803,7 +826,13 @@ spec:
             - name: RES
               value: ""
             - name: WARP
-              value: "gridsample"
+              value: "gather"
+            # ONE CORE: this is the whole point of this manifest. See the header.
+            - name: CORES
+              value: "1"
+            # One iteration: a 1-core frame is slow and the median is not a latency anyway.
+            - name: ITERS
+              value: "1"
             - name: FULLGRAPH
               value: "1"
             - name: WARPCMP_TILE
