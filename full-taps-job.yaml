@@ -578,6 +578,49 @@ spec:
                 sleep 5
               done
               echo "  ==> ALL 8 GRAPHS COMPILE = $PW_ALL  (cache holds $(find /tmp/neff_cache -name '*.neff' | wc -l) NEFFs)"
+
+              # [1b] SERIAL FULL-FRAME WARM-UP -- the per-tile probe is NOT sufficient and this is
+              # not a belt-and-braces step, it is the fix for a HARD CRASH.
+              #
+              # MEASURED, run exp_univr-4x8_h128_sr3-gather-fg1_20260819_145849: the 8-tile probe
+              # reported ALL 8 GRAPHS COMPILE = 1, and the --cores 8 arm then compiled a NINTH
+              # graph and died with
+              #   RuntimeError: Detected that you are using FX to symbolically trace a
+              #   dynamo-optimized function. This is not supported at the moment.
+              # because that compile ran inside ThreadPoolExecutor(max_workers=8) while the other
+              # workers held already-compiled replicas. The whole scored arm produced nothing after
+              # 4.6 h of successful compiles.
+              #
+              # So "a frame needs 8 graphs (4 shapes x 2 passes)" is WRONG -- something else is
+              # specialised per tile as well (row0 is a python int to dynamo). Rather than guess the
+              # complete key, compile what the real frame actually asks for: ONE pass over ALL 32
+              # tiles on ONE core. Serial, so peak host memory is one compile, and after it the
+              # --cores 8 arm has nothing left to build.
+              if [ "$PW_ALL" = "1" ]; then
+                echo ""
+                echo "=== [1b] SERIAL FULL-FRAME WARM-UP (--cores 1, all tiles, not timed) ==="
+                WB=$(find /tmp/neff_cache -name '*.neff' | wc -l)
+                S=$(date -u +%s)
+                set +e
+                NEURON_LAUNCH_BLOCKING=1 \
+                python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \
+                    --cores 1 --warp "$WARP" --iters 0 \
+                    2>&1 | tee "$R/warm_full.log" \
+                  | grep -aiE "replica|forward complete|Killed|Error|MemoryError" || true
+                wrc=${PIPESTATUS[0]}
+                set -e
+                WA=$(find /tmp/neff_cache -name '*.neff' | wc -l)
+                echo "  rc=$wrc  $(( ($(date -u +%s) - S) / 60 )) min  NEFFs $WB -> $WA (+$((WA-WB)))"
+                if [ "$wrc" != "0" ]; then
+                  PW_ALL=0
+                  echo "  ==> the full frame does NOT run on one core; the 8-core arm cannot work either"
+                  { grep -aoE "RuntimeError: [^\"]{0,120}|MemoryError|Killed" "$R/warm_full.log" || true; } \
+                    | head -2 | sed 's/^/      /'
+                else
+                  echo "  ==> full frame RUNS serially; cache is now complete for --cores $CORES"
+                  archive_cache
+                fi
+              fi
               fi
               echo ""
 
@@ -778,9 +821,7 @@ spec:
             - name: RES
               value: ""
             # gather, NOT gridsample. gridsample CANNOT compile fused -- OOM-killed at 169 min
-            # and again at 94 min at 1500Gi on this exact geometry, because its lowering issues
-            # 3-205x more DMA descriptors so the fused graph is far larger. gather is what the
-            # model ships with and it is already at the 1 descriptor/px floor.
+            # and again at 94 min at 1500Gi on this exact geometry.
             - name: WARP
               value: "gather"
             - name: FULLGRAPH
