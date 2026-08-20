@@ -124,8 +124,14 @@ spec:
             - name: PYTHONUNBUFFERED
               value: "1"
             # WHICH run to analyze -- the directory name under /var/mdl/univr/runs
+            # TAPS run. Its NEFFs are the ones to attribute now: the SWDGE trio that dominated
+            # the pool-down profile (176.6/145.7/138.7 ms) is GONE here, and the open question is
+            # which source lines the remaining top NEFFs belong to -- specifically whether any of
+            # them is warp_gridsample (repro_unrolling_trn2.py:195-206) or whether the eager warp
+            # is spread across the small NEFFs. src= lines resolve against the commit that BUILT
+            # them, so read them against 1d5e4fa, not HEAD.
             - name: RUN
-              value: "exp_univr-warpeager_gridsample_t9_h128_sr1_20260819_112538"
+              value: "exp_univr-warpeager_gridsample_t9_h128_sr3_20260819_142240"
             # Cap the work: ingest cost tracks trace size and a big one can take most of an hour,
             # so an uncapped run over many pairs never finishes. 0 = no cap.
             - name: MAX_PAIRS
