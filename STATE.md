@@ -11,19 +11,67 @@ Origin repo for reference only: `~/pave-unrolling`.
 |---|---|---|
 | `univr-full-taps-1core` (`fg1`) | whole-frame `max_diff` vs **92.56 LSB**, fullgraph=1 | probe done `+0` (adopted the 9-NEFF cache), in `[2/3]` ~5 h, SILENT |
 | `univr-full-taps-1core-fg0` | same, fullgraph=0 -- the A/B on whether breaks matter | probe done, all 8 FUSE (8 NEFFs), entering `[2/3]` |
-| `univr-2x4-taps-probe` | does 2x4 h128 compile now that taps removed `F.interpolate`? | launched by hand; **36% less device work if it fuses** |
+| `univr-2x4-taps-probe` | does 2x4 h128 compile now that taps removed `F.interpolate`? | **YES -- 992x1280 FUSES in 27 and 26 min.** See below |
 
 For each: `grep -aE '^  tile |ALL 8|median=|max_diff=|gate=|NEFFs now' <log>`. Four lines matter.
 
-**`fg1`'s silence in `[2/3]` is the open question.** With a warm cache 32 tiles on one core should
-take minutes. Diagnose with
-`kubectl exec <pod> -- sh -c 'find /tmp/neff_cache -name "*.neff" | wc -l'` -- `10+` and climbing
-means it is compiling a graph the probe missed (expected, just slow); still `9` means it is stuck
-in execution, which is a different problem and not worth waiting on. **That count also answers a
-question this file had WRONG: how many graphs a frame really needs.** The 8-tile probe said 8, the
-frame demanded a 9th, and that 9th compiling inside `ThreadPoolExecutor(max_workers=8)` is what
-killed the 8-core run with `FX ... trace a dynamo-optimized function`. `[1b]` now compiles the real
-frame serially first; it is skipped when `CORES=1` because `[2/3]` IS that pass.
+### MEASURED 2026-08-20: A FRAME NEEDS AT LEAST 15 GRAPHS, NOT 8
+
+`fg1` entered `[2/3]` with a warm 9-NEFF cache and, ~5 h later,
+`find /tmp/neff_cache -name '*.neff' | wc -l` returned **15** and was still climbing. So the
+frame compiled **6+ graphs the 8-tile probe never built**, at roughly 50 min each.
+
+**Every "a frame needs 8 graphs (4 shapes x 2 passes)" statement elsewhere in this file is WRONG**
+and is kept only because the SHAPE inventory is still right. What is wrong is the claim that
+(shape x pass) enumerates the graph set. Something else is specialised per tile -- `row0` reaches
+dynamo as a python int, and `px0` may too -- and the axes are not known.
+
+Three consequences:
+
+* **This is the definitive cause of the 8-core crash.** The probe builds 8, the frame wants 15+,
+  so 7+ compiled concurrently inside `ThreadPoolExecutor(max_workers=8)` and torch raised
+  `RuntimeError: Detected that you are using FX to symbolically trace a dynamo-optimized function`.
+  Not a subtle race -- a 7-graph pile-up.
+* **A prewarm list cannot be derived from tile geometry.** `PREWARM_TILES` is a heuristic and will
+  always be incomplete. `[1b]`'s serial full-frame pass (`--cores 1`, all tiles, `--iters 0`) is
+  the ONLY sound way to warm the cache, because it compiles exactly what the frame asks for. It is
+  skipped when `CORES=1` because `[2/3]` IS that pass.
+* **`ALL 8 GRAPHS COMPILE = 1` does not mean the frame will run.** It means the 8 probed shapes
+  compile. Do not read it as a green light for `--cores 8`.
+
+Open: WHICH axis produces 15. Worth one cheap run -- `--cores 1` full frame with dynamo's recompile
+reasons logged (`TORCH_LOGS=recompiles`) names the guard that fires. Until then the count is
+measured and the cause is not.
+
+### MEASURED 2026-08-20: 2x4 halo 128 FUSES -- the "2x4 OOMs" verdict was VOID
+
+```
+host mem before tile 1: total 1999G used 106G free 1850G avail 1893G
+tile 1  992x1280  FUSES  27 min  NEFFs +1
+tile 5  992x1280  FUSES  26 min  NEFFs +1
+```
+
+**1,269,760 px per graph -- 2.3x larger than any shape that had ever compiled here -- fuses in 27
+min.** The OOM at 600, 1000 AND 1500Gi was measured with `F.interpolate` in the graph and is void,
+exactly like every rejection measured with `--model-type unet-inference`. 1850 GB free at the time,
+so it was nowhere near a memory limit.
+
+Two shapes remain (`992x1152`, tiles 0 and 4). If they behave the same it is 4 NEFFs in ~1.8 h
+against 4x8's 8 in 4.8 h.
+
+| | 4x8 h128 | **2x4 h128** |
+|---|---|---|
+| total padded px | 15,073,280 | **9,650,176 -- 36% less** |
+| tiles / cores | 32 on 8 | **8 on 8, exact** |
+| distinct shapes | 4 | **2** |
+
+**And it makes the 704x640 anomaly a 12x inversion, not 3x.** 992x1280 (1.27 M px) compiles in
+27 min; 704x640 (0.45 M px) takes 127. **2.8x bigger, 4.7x faster.** Whatever is pathological is
+specific to that shape, and 2x4 does not contain it. Still unexplained; one `--only-tile 8` run
+with neuronx-cc verbose timing would name the pass that eats it.
+
+Retired by this: "Geometry / halo sweeps" and "2x4 1.0M px OOM" in the Dead list are void for the
+same reason. 2x8 and 3x4 have NOT been retested and their OOMs are equally contaminated.
 
 ### The agreed working loop
 
