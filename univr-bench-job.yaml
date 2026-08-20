@@ -501,6 +501,7 @@ spec:
                 TAG="pw_${CFG}_t${T}"
                 B=$(find /tmp/neff_cache -name '*.neff' 2>/dev/null | wc -l)
                 S=$(date -u +%s)
+                echo "  host mem before tile $T: $(free -g 2>/dev/null | awk '/^Mem:/{print "total "$2"G used "$3"G free "$4"G avail "$7"G"}')"
                 set +e
                 NEURON_LAUNCH_BLOCKING=1 \
                 python -u repro_unrolling_trn2.py $FRAMES $REF $BASE \
