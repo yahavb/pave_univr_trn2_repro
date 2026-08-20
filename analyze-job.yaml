@@ -56,6 +56,8 @@ spec:
               fi
 
               chmod +x "$S/analyze_trace.sh"
+              PY3=python3
+              [ -x "$W/venv/bin/python" ] && PY3="$W/venv/bin/python"
               T=$(ls "$SRC"/univr_results_*.tar.gz 2>/dev/null | head -1)
               if [ -z "${T:-}" ]; then
                 echo "NO results tar in $SRC -- nothing to analyze"; ls -la "$SRC" || true; exit 1
@@ -67,10 +69,38 @@ spec:
                 HEAD="${HEAD:-60}" BUCKETS="${BUCKETS:-80}" \
                 INGEST_TIMEOUT="${INGEST_TIMEOUT:-5400}" \
                 bash "$S/analyze_trace.sh" /tmp/res.tar.gz "$W"
+              [ -x "$W/venv/bin/python" ] && PY3="$W/venv/bin/python"
               REPORT="$W/timeline_report.txt"
 
               echo ""
-              echo "################ REPORT ################"
+              echo "################ PHASES -- per-NEFF time series, diagnosed per phase ########"
+              PH="$W/phases.txt"; : > "$PH"
+              for pq in "$W"/pq_*; do
+                [ -d "$pq" ] || continue
+                "$PY3" "$S/pq_phases.py" "$pq" "$(basename "$pq")" \
+                    --buckets "${PHASE_BUCKETS:-200}" \
+                    --min-phase-frac "${MIN_PHASE_FRAC:-0.02}" \
+                    --src-root /tmp/REPRO 2>&1 | tee -a "$PH"
+                echo "" | tee -a "$PH"
+              done
+              [ -s "$PH" ] || echo "  no pq_* parquet dirs -- ingest produced nothing to phase"
+
+              echo ""
+              echo "################ VERDICT -- whole-NEFF classification ######################"
+              VD="$W/verdict.txt"; : > "$VD"
+              PAIRS_DIR=$(find "$W" -type d -name pairs | head -1)
+              if [ -n "${PAIRS_DIR:-}" ]; then
+                "$PY3" "$S/diagnose_neff.py" "$PAIRS_DIR" 2>&1 | tee -a "$VD"
+              else
+                echo "  no pairs/ dir found under $W -- skipping the summary.json classifier" | tee -a "$VD"
+              fi
+              echo ""
+              echo "---- time attributed to SOURCE LINES (from the instruction tables above) ----"
+              "$PY3" "$S/diagnose_neff.py" --instr "$REPORT" --src-root /tmp/REPRO \
+                  --top "${SRC_TOP:-10}" 2>&1 | tee -a "$VD"
+
+              echo ""
+              echo "################ REPORT (raw tables) ################"
               cat "$REPORT"
 
               mkdir -p "$SRC/perfetto" || true
@@ -83,7 +113,7 @@ spec:
               done
               ls -la "$SRC/perfetto/" 2>/dev/null | sed 's/^/  /' || true
 
-              tar -czf /tmp/timeline_$RUN.tar.gz -C "$W" timeline_report.txt \
+              tar -czf /tmp/timeline_$RUN.tar.gz -C "$W" timeline_report.txt phases.txt verdict.txt \
                   $(cd "$W" && ls -d pq_* 2>/dev/null || true) \
                   $(cd "$W" && ls *_pair.pftrace.gz *_pair.json.gz 2>/dev/null || true) 2>/dev/null || true
               if [ -s /tmp/timeline_$RUN.tar.gz ]; then
