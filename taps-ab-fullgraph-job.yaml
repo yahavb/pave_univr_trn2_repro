@@ -1,0 +1,128 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: univr-taps-ab-fg1
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: univr-taps-ab-fg1
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neurons
+          resourceClaimTemplateName: s-lnc1
+      containers:
+        - name: bench
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+
+              cd /tmp
+              git clone -b "${BRANCH:-main}" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
+              cd REPRO
+
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
+              mkdir -p /tmp/neff_cache /tmp/out
+
+              W="${WARP:-gather}"
+              TS=$(date -u +%Y%m%d_%H%M%S)
+              RUN="exp_univr-4x8_h128_ab-resize_fg1-${W}_t9_${TS}"
+              RUNDIR="/var/mdl/univr/runs/$RUN"
+
+              finalize() {
+                tar -czf "/tmp/univr_results_${TS}.tar.gz" -C /tmp out 2>/dev/null || true
+                cp "/tmp/univr_results_${TS}.tar.gz" /tmp/out/ 2>/dev/null || true
+                mkdir -p "$RUNDIR"
+                cp -r /tmp/out/. "$RUNDIR"/ 2>/dev/null || true
+                ls -la "$RUNDIR"
+              }
+              trap finalize EXIT
+
+              CMD0="python -u repro_unrolling_trn2.py --rs0 rs70.png --rs1 rs71.png --rs2 rs72.png --height 1728 --width 4096 --tiles 4x8 --halo 128 --only-tile 9 --gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth --bar 3 --dtype fp32 --device neuron --cores 1 --warp $W --fullgraph 1 --iters 5"
+              printf '%s\n' \
+                "run       : $RUN" \
+                "provenance: $(git rev-parse --abbrev-ref HEAD)@$(git rev-parse HEAD)" \
+                "config    : tile 9 of 4x8 halo 128 (padded 704x768) warp $W = 4x index_select bilinear, FUSED (fullgraph 1, no warp-region)" \
+                "cc        : $(neuronx-cc --version 2>&1 | head -1 | awk '{print $NF}')" \
+                "ccflags   : ${NEURON_CC_FLAGS:-<unset>}" \
+                "compile   : torch.compile(backend=neuron, dynamic=False, fullgraph=True), lazy on first forward" \
+                "cmd interp   : $CMD0 --resize interpolate --save-ref /tmp/out/frame_interpolate.npy" \
+                "cmd precomp   : $CMD0 --resize precomputed --save-ref /tmp/out/frame_precomputed.npy" \
+                > /tmp/out/PROVENANCE.txt
+
+              python -u repro_unrolling_trn2.py \
+                  --rs0 rs70.png --rs1 rs71.png --rs2 rs72.png \
+                  --height 1728 --width 4096 --tiles 4x8 --halo 128 --only-tile 9 \
+                  --gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth \
+                  --bar 3 --dtype fp32 --device neuron --cores 1 \
+                  --warp "$W" --fullgraph 1 \
+                  --resize interpolate --iters 5 \
+                  --save-ref /tmp/out/frame_interpolate.npy 2>&1 | tee /tmp/out/interpolate.log
+
+              python -u repro_unrolling_trn2.py \
+                  --rs0 rs70.png --rs1 rs71.png --rs2 rs72.png \
+                  --height 1728 --width 4096 --tiles 4x8 --halo 128 --only-tile 9 \
+                  --gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth \
+                  --bar 3 --dtype fp32 --device neuron --cores 1 \
+                  --warp "$W" --fullgraph 1 \
+                  --resize precomputed --iters 5 \
+                  --save-ref /tmp/out/frame_precomputed.npy 2>&1 | tee /tmp/out/precomputed.log
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 48
+              memory: 248Gi
+            limits:
+              cpu: 150
+              memory: 1800Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: BRANCH
+              value: "main"
+            - name: WARP
+              value: "gather"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_NUM_CORES
+              value: "8"
+            - name: NEURON_RT_VISIBLE_CORES
+              value: "0-7"
+            - name: NEURON_CC_FLAGS
+              value: "--lnc 1"
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc

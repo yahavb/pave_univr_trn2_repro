@@ -1,0 +1,208 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: univer-interpolate-gridsample
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: univer-interpolate-gridsample
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neurons
+          resourceClaimTemplateName: s-lnc1
+      containers:
+        - name: bench
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+
+              cd /tmp
+              git clone -b "${BRANCH:-main}" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
+              cd REPRO
+
+              export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
+              mkdir -p /tmp/neff_cache
+              R=/tmp/out; rm -rf "$R"; mkdir -p "$R/pairs" "$R/explorer"
+
+              TOPN="${TOPN:-5}"
+              TS=$(date -u +%Y%m%d_%H%M%S)
+              RUN="exp_univer-interpolate-gridsample_t9_${TS}"
+              RUNDIR="/var/mdl/univr/runs/$RUN"
+              CACHE_TGZ="/var/mdl/univr/neff_cache_interpolate-gridsample_t9.tar.gz"
+
+              PROF=neuron-explorer
+              command -v "$PROF" >/dev/null 2>&1 || PROF=neuron-profile
+
+              finalize() {
+                if [ "$(find /tmp/neff_cache -name '*.neff' | wc -l)" -gt 0 ]; then
+                  tar -czf /tmp/neff_cache.tar.gz -C /tmp neff_cache 2>/dev/null || true
+                  cp /tmp/neff_cache.tar.gz "$CACHE_TGZ" 2>/dev/null || true
+                fi
+                tar -czf "/tmp/univr_results_${TS}.tar.gz" -C /tmp out 2>/dev/null || true
+                cp "/tmp/univr_results_${TS}.tar.gz" "$R/" 2>/dev/null || true
+                mkdir -p "$RUNDIR"
+                cp -r "$R"/. "$RUNDIR"/ 2>/dev/null || true
+                ls -la "$RUNDIR"
+              }
+              trap finalize EXIT
+
+              if [ -f "$CACHE_TGZ" ]; then
+                cp "$CACHE_TGZ" /tmp/restore.tar.gz && tar -xzf /tmp/restore.tar.gz -C /tmp || true
+              fi
+
+              BASE="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png
+                    --height 1728 --width 4096 --tiles 4x8 --halo 128 --only-tile 9
+                    --gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth
+                    --bar 3 --dtype fp32 --device neuron --cores 1
+                    --warp gridsample --fullgraph 0 --resize interpolate"
+
+              printf '%s\n' \
+                "run       : $RUN" \
+                "provenance: $(git rev-parse --abbrev-ref HEAD)@$(git rev-parse HEAD)" \
+                "config    : resize=interpolate  warp=gridsample  fullgraph=false" \
+                "geometry  : tile 9 of 4x8 halo 128 (padded 704x768) 1 core fp32" \
+                "cc        : $(neuronx-cc --version 2>&1 | head -1 | awk '{print $NF}')" \
+                "ccflags   : ${NEURON_CC_FLAGS:-<unset>}" \
+                "cmd       : python -u repro_unrolling_trn2.py $(echo $BASE) --iters 5" \
+                > "$R/PROVENANCE.txt"
+
+              set +e
+              python -u repro_unrolling_trn2.py $BASE --iters 0 2>&1 | tee "$R/compile.log" >/dev/null
+              set -e
+              for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+              sleep 5
+              B0=$(find /tmp/neff_cache -name '*.neff' | wc -l)
+
+              set +e
+              python -u repro_unrolling_trn2.py $BASE --iters 5 \
+                  --save-ref "$R/frame_interpolate.npy" 2>&1 | tee "$R/clean.log"
+              set -e
+              A0=$(find /tmp/neff_cache -name '*.neff' | wc -l)
+              printf 'NEFFs %d -> %d during timed run (must be +0)\n' "$B0" "$A0"
+              for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+              sleep 5
+
+              SYSTRACE=/tmp/systrace; rm -rf "$SYSTRACE"; mkdir -p "$SYSTRACE"
+              set +e
+              NEURON_RT_INSPECT_ENABLE=1 \
+              NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
+              NEURON_RT_INSPECT_DEVICE_PROFILE=1 \
+              NEURON_RT_INSPECT_OUTPUT_DIR="$SYSTRACE" \
+              python -u repro_unrolling_trn2.py $BASE --iters 1 2>&1 | tee "$R/profiled.log" >/dev/null
+              set -e
+              for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+              sleep 5
+
+              POUT=/tmp/perneff; rm -rf "$POUT"; mkdir -p "$POUT"
+              mapfile -t NEFFS < <(find /tmp/neff_cache -name '*.neff' | sort)
+              OK=0
+              for neff in "${NEFFS[@]}"; do
+                hash=$(basename "$neff" .neff)
+                NEURON_RT_ENABLE_DGE_NOTIFICATIONS=1 timeout 900 \
+                  "$PROF" capture --single-io -n "$neff" -s "$POUT/${hash}.ntff" >/dev/null 2>&1 || continue
+                [ -f "$POUT/${hash}.ntff" ] || continue
+                timeout 300 "$PROF" view -n "$neff" -s "$POUT/${hash}.ntff" \
+                  --output-format summary-json > "$POUT/${hash}.json" 2>/dev/null || true
+                [ -s "$POUT/${hash}.json" ] && OK=$((OK+1))
+              done
+              printf 'captured+viewed OK: %d / %d\n' "$OK" "${#NEFFS[@]}"
+
+              python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$R/perneff_breakdown.txt" || true
+              python3 scripts/neuron/rank_neffs.py "$POUT" 2>&1 | tee "$R/neff_ranking.txt" || true
+
+              BIGHASH=$(python3 scripts/neuron/pick_neffs.py "$POUT" /tmp/neff_cache 2>/dev/null | head -1 || true)
+              if [ -n "${BIGHASH:-}" ] && [ -f "$POUT/${BIGHASH}.ntff" ]; then
+                BIGNEFF=$(find /tmp/neff_cache -name "${BIGHASH}.neff" | head -1)
+                timeout 300 "$PROF" view -n "$BIGNEFF" -s "$POUT/${BIGHASH}.ntff" \
+                  --output-format summary-text 2>/dev/null > "$R/hotspots_${BIGHASH}.txt" || true
+              fi
+
+              i=0
+              for hash in $(python3 scripts/neuron/top_neffs.py "$POUT" "$TOPN" 2>/dev/null || true); do
+                i=$((i+1))
+                src_neff=$(find /tmp/neff_cache -name "${hash}.neff" | head -1)
+                [ -n "$src_neff" ] && [ -f "$POUT/${hash}.ntff" ] || continue
+                MB=$(( $(wc -c < "$src_neff") / 1048576 ))
+                d="$R/pairs/$(printf 'rank%02d' $i)_${hash:0:8}__${MB}MB"
+                mkdir -p "$d"
+                cp "$src_neff" "$d/" && cp "$POUT/${hash}.ntff" "$d/"
+                [ -f "$POUT/${hash}.json" ] && cp "$POUT/${hash}.json" "$d/summary.json"
+              done
+
+              BEST=$(find "$SYSTRACE" -name 'trace_info.pb' -printf '%s %h\n' 2>/dev/null | sort -rn | head -1 | awk '{print $2}' || true)
+              if [ -n "${BEST:-}" ]; then
+                UP=/tmp/upload_bundle; rm -rf "$UP"; mkdir -p "$UP"
+                cp "$BEST"/* "$UP/" 2>/dev/null || true
+                for hash in $(python3 scripts/neuron/top_neffs.py "$POUT" "$TOPN" 2>/dev/null || true); do
+                  src_neff=$(find /tmp/neff_cache -name "${hash}.neff" | head -1)
+                  [ -n "$src_neff" ] && cp "$src_neff" "$UP/neff_${hash}.neff" 2>/dev/null || true
+                done
+                tar -czf /tmp/upload_bundle.tar.gz -C /tmp upload_bundle 2>/dev/null || true
+                cp /tmp/upload_bundle.tar.gz "$R/explorer/upload_bundle.tar.gz" 2>/dev/null || true
+              fi
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 48
+              memory: 248Gi
+            limits:
+              cpu: 150
+              memory: 1800Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: BRANCH
+              value: "main"
+            - name: TOPN
+              value: "5"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_NUM_CORES
+              value: "8"
+            - name: NEURON_RT_VISIBLE_CORES
+              value: "0-7"
+            - name: NEURON_CC_FLAGS
+              value: "--lnc 1"
+            - name: XLA_IR_DEBUG
+              value: "1"
+            - name: XLA_HLO_DEBUG
+              value: "1"
+            - name: NEURON_FRAMEWORK_DEBUG
+              value: "1"
+            - name: TORCH_NEURONX_NEFF_CACHE_DIR
+              value: "/tmp/neff_cache"
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc

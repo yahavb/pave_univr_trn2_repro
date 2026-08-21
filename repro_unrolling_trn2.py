@@ -522,40 +522,7 @@ class Contextnet(nn.Module):
         return outs
 
 
-_STATIC_RESIZE = 0
-
-
-def resize_down(x, inv):
-    if inv == 2:
-        return F.avg_pool2d(x, 2)
-    if inv == 4:
-        return F.avg_pool2d(x[..., 1:, 1:], kernel_size=2, stride=4)
-    if not resize_down.warned:
-        resize_down.warned = True
-        print("  --static-resize: 1/%s downsample has no exact pooling form; using F.interpolate"
-              % inv)
-    return F.interpolate(x, scale_factor=1.0 / inv, mode="bilinear", align_corners=False)
-
-
-resize_down.warned = False
-
-
-def resize_up(x, s):
-    if s % 2 or s < 2:
-        if not resize_up.warned:
-            resize_up.warned = True
-            print("  --static-resize 2: x%s upsample is not an even factor; using F.interpolate" % s)
-        return F.interpolate(x, scale_factor=s, mode="bilinear", align_corners=False)
-    C = x.shape[1]
-    r = torch.arange(2 * s, device=x.device, dtype=x.dtype)
-    tri = (1.0 - ((r + 0.5) / s - 1.0).abs()).clamp_min(0.0)
-    k = (tri[:, None] * tri[None, :]).expand(C, 1, 2 * s, 2 * s).contiguous()
-    o = F.conv_transpose2d(F.pad(x, (1, 1, 1, 1), mode="replicate"), k,
-                           stride=s, padding=s // 2, groups=C)
-    return o[..., s:-s, s:-s]
-
-
-resize_up.warned = False
+_PRECOMPUTE_RESIZE = False
 
 _RESIZE_TAPS: dict = {}
 
@@ -586,18 +553,14 @@ def resize_precomputed(x, f):
 
 
 def do_down(x, inv):
-    if _STATIC_RESIZE == 3:
+    if _PRECOMPUTE_RESIZE:
         return resize_precomputed(x, 1.0 / inv)
-    if _STATIC_RESIZE:
-        return resize_down(x, inv)
     return F.interpolate(x, scale_factor=1.0 / inv, mode="bilinear", align_corners=False)
 
 
 def do_up(x, s):
-    if _STATIC_RESIZE == 3:
+    if _PRECOMPUTE_RESIZE:
         return resize_precomputed(x, float(s))
-    if _STATIC_RESIZE >= 2:
-        return resize_up(x, s)
     return F.interpolate(x, scale_factor=s, mode="bilinear", align_corners=False)
 
 
@@ -639,7 +602,7 @@ class IFBlock(nn.Module):
         if flow is not None:
 
 
-            if not (_STATIC_RESIZE and scale == 1):
+            if not (_PRECOMPUTE_RESIZE and scale == 1):
                 flow = do_down(flow, scale) * (1.0 / scale)
             x = torch.cat((x, flow), 1)
         x = self.conv0(x)
@@ -1057,22 +1020,7 @@ def self_test():
 
     tol = 1e-5
     x = torch.randn(1, 5, 704, 768)
-    for inv in (2, 4):
-        ref = F.interpolate(x, scale_factor=1.0 / inv, mode="bilinear", align_corners=False)
-        got = resize_down(x, inv)
-        d = (ref - got).abs().max().item() if ref.shape == got.shape else float("inf")
-        print("  down 1/%d  %s vs %s  max|diff| %.2e  %s"
-              % (inv, tuple(ref.shape), tuple(got.shape), d, "OK" if d < tol else "FAIL"))
-        bad += d >= tol
     small = torch.randn(1, 5, 88, 96)
-    for s in (2, 4, 8):
-        ref = F.interpolate(small, scale_factor=s, mode="bilinear", align_corners=False)
-        got = resize_up(small, s)
-        d = (ref - got).abs().max().item() if ref.shape == got.shape else float("inf")
-        print("  up   x%d    %s vs %s  max|diff| %.2e  %s"
-              % (s, tuple(ref.shape), tuple(got.shape), d, "OK" if d < tol else "FAIL"))
-        bad += d >= tol
-
 
     for t, f, ftol in ((x, 0.5, tol), (x, 0.25, tol), (small, 2.0, tol), (small, 8.0, tol),
                        (torch.randn(1, 5, 96, 96), 1.0 / 3, tol),
@@ -1164,18 +1112,17 @@ def main():
                          "aten events, with 99.6%% of its 760 ms inside one opaque .cpu() wait. "
                          "Eager is the only way a profiler can see the operations. Latency from an "
                          "eager run is NOT comparable to a compiled one.")
-    ap.add_argument("--static-resize", type=int, choices=(0, 1, 2, 3), default=0,
-                    help="replace the FIXED-FACTOR F.interpolate calls with static-pattern ops. "
-                         "0 (default) = as written. 1 = pooled downsample (avg_pool2d) plus skip "
-                         "the identity resize at scale=1. 2 = also the upsample, as a depthwise "
-                         "transposed conv. Every form is EXACT (self-test asserts ~1e-7), so this "
-                         "is a lowering experiment, not an approximation: the scales are (4,2,1), "
-                         "known at compile time, yet interpolate lowers to SWDGE indirect DMA -- "
-                         "MEASURED at tile 9 halo 128, the dominant NEFF is 301.7 ms of a 376.8 ms "
-                         "capture sum at swdyn 97%%, writing 512-byte descriptors while TensorE is "
-                         "near zero, with the source stamps on IFBlock's two interpolate calls. "
-                         "Level 2 is separate because a depthwise conv_transpose2d is its own "
-                         "lowering risk and must be measured, not assumed. 3 = PRECOMPUTED TAPS: the general form, any scale factor -- index_select with CONSTANT index vectors and baked weights, so the coordinate arithmetic leaves the graph but the read stays indexed. That is the A/B for whether constant indices alone are enough; 1/2 need no indices at all.")
+    ap.add_argument("--resize", choices=("interpolate", "precomputed"), default="interpolate",
+                    help="how the FIXED-FACTOR resizes in IFBlock are expressed. interpolate "
+                         "(default) = F.interpolate, which derives the coordinates in-graph and "
+                         "lowers to SWDGE indirect DMA. precomputed = resize_precomputed: the "
+                         "coordinates are computed once on the host and baked in as constant "
+                         "index vectors, so the reads lower to static DMA. Both are exact "
+                         "(self-test asserts ~1e-7); this is a lowering choice, not an "
+                         "approximation. MEASURED at tile 9 halo 128: interpolate's dominant NEFF "
+                         "is 301.7 ms at gpsimd 66%% / tensor 14%%, precomputed is 41.4 ms at "
+                         "gpsimd 2%% / tensor 29%%, and it also takes max_diff from 22.38 to 0.06 "
+                         "LSB because interpolate's UPSAMPLE was the accuracy bug.")
     ap.add_argument("--warp-region", choices=("none", "neuron", "cpu", "eager"), default="none",
                     help="compile the RESAMPLE as its own region with its own backend, separate "
                          "from the model. none = inline in the model graph (default). neuron = its "
@@ -1233,7 +1180,7 @@ def main():
         ap.error("--gt <image> with --random-weights would print a meaningless PSNR. Use a "
                  "self-generated .npy reference for equivalence testing, or supply --weights.")
 
-    global _NKI_DYN, _PRELU, _PROFILE_BLOCKS, _NKI_FN, _NKI_FN_DYN, _STATIC_RESIZE
+    global _NKI_DYN, _PRELU, _PROFILE_BLOCKS, _NKI_FN, _NKI_FN_DYN, _PRECOMPUTE_RESIZE
     global _SHIFTWARP_FN, _SHIFTWARP_R, _SHIFTWARP_MAXC
     global _NKL_GATHER_METHOD, _NKL_MAX_INDICES
     _NKI_DYN = (a.warp == "nki-dyn")
@@ -1253,14 +1200,9 @@ def main():
     _PROFILE_BLOCKS = a.per_block
 
 
-    _STATIC_RESIZE = a.static_resize
-    if _STATIC_RESIZE == 3:
-
-
-        print("  --static-resize 3: fixed-factor interpolate -> PRECOMPUTED TAPS. The coordinate")
-    elif _STATIC_RESIZE:
-        print("  --static-resize %d: fixed-factor interpolate -> %s. Scales are (4,2,1), so every"
-              % (_STATIC_RESIZE, "pooling" if _STATIC_RESIZE == 1 else "pooling + deconv upsample"))
+    _PRECOMPUTE_RESIZE = (a.resize == "precomputed")
+    print("  resize        : %s" % ("resize_precomputed (host-baked constant indices)"
+                                    if _PRECOMPUTE_RESIZE else "F.interpolate (indices in-graph)"))
     _PRELU = NeuronPReLU
     if not a.neuron_prelu:
         pass

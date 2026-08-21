@@ -45,6 +45,11 @@ spec:
               REFERENCE="README trn2 eager 3673.3 ms / 0.64 LSB; g6e L40S 351.1 ms (161 ms ONNX+TRT)"
 
               SR="${STATIC_RESIZE:-0}"
+              case "$SR" in
+                0) RESIZE_FLAG="--resize interpolate" ;;
+                3) RESIZE_FLAG="--resize precomputed" ;;
+                *) echo "STATIC_RESIZE=$SR no longer exists; use 0 or 3"; exit 1 ;;
+              esac
               CFG="${GRID}_h${HALO}_sr${SR}_fg${FULLGRAPH}"
               TS=$(date -u +%Y%m%d_%H%M%S)
               RUN="exp_univr-${CFG}-${WARP}_${TS}"
@@ -118,14 +123,14 @@ spec:
 
               FRAMES="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png"
               REF="--gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth"
-              BASE="--height 1728 --width 4096 --tiles $GRID --halo $HALO --bar 3 --device neuron --dtype fp32 --fullgraph $FULLGRAPH --static-resize $SR"
+              BASE="--height 1728 --width 4096 --tiles $GRID --halo $HALO --bar 3 --device neuron --dtype fp32 --fullgraph $FULLGRAPH $RESIZE_FLAG"
 
               RES="${RES:-}"
               SKIP_PROBE=0
               if [ -n "$RES" ]; then
                 RH=${RES%%x*}; RW=${RES##*x}
                 REF="--random-weights"
-                BASE="--height $RH --width $RW --tiles 1x1 --bar 3 --device neuron --dtype fp32 --fullgraph $FULLGRAPH --static-resize $SR"
+                BASE="--height $RH --width $RW --tiles 1x1 --bar 3 --device neuron --dtype fp32 --fullgraph $FULLGRAPH $RESIZE_FLAG"
                 CORES=1
                 SKIP_PROBE=1
                 CFG="${RES}_sr${SR}"
@@ -196,7 +201,7 @@ spec:
                 set +e
                 python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
                     --dtype fp32 --device neuron --cores 1 \
-                    --warp "$WE_WARP" --warp-region eager --static-resize "$SR" --iters 0 \
+                    --warp "$WE_WARP" --warp-region eager $RESIZE_FLAG --iters 0 \
                     2>&1 | tee "$R/${LBL}_warm.log" \
                   | grep -aiE "only-tile|first call|Killed|Error|MemoryError" || true
                 wrc=${PIPESTATUS[0]}
@@ -217,7 +222,7 @@ spec:
                 set +e
                 python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
                     --dtype fp32 --device neuron --cores 1 \
-                    --warp "$WE_WARP" --warp-region eager --static-resize "$SR" --iters "$WE_CLEAN_ITERS" \
+                    --warp "$WE_WARP" --warp-region eager $RESIZE_FLAG --iters "$WE_CLEAN_ITERS" \
                     --save-ref "$R/frame_${LBL}.npy" \
                     2>&1 | tee "$R/${LBL}_clean.log" \
                   | grep -aE "steady state|max_diff|PSNR|only-tile|Killed|Error|Traceback" || true
@@ -241,7 +246,7 @@ spec:
                 set +e
                 python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
                     --dtype fp32 --device neuron --cores 1 \
-                    --warp "$WE_WARP" --warp-region eager --static-resize "$SR" --iters "$WE_ITERS" \
+                    --warp "$WE_WARP" --warp-region eager $RESIZE_FLAG --iters "$WE_ITERS" \
                     --perfetto "$R/perfetto/trace_${LBL}.json" \
                     2>&1 | tee "$R/$LBL.log"
                 arc=${PIPESTATUS[0]}
@@ -273,7 +278,7 @@ spec:
                 NEURON_RT_INSPECT_OUTPUT_DIR="$SYSTRACE" \
                 python -u repro_unrolling_trn2.py $FRAMES $GEOM --bar 3 \
                     --dtype fp32 --device neuron --cores 1 \
-                    --warp "$WE_WARP" --warp-region eager --static-resize "$SR" --iters 1 \
+                    --warp "$WE_WARP" --warp-region eager $RESIZE_FLAG --iters 1 \
                     2>&1 | tee "$R/${LBL}_inspect.log" | grep -aiE "median|warp region|Killed|Error" || true
                 set -e
                 echo "  trace_info.pb count: $(find "$SYSTRACE" -name 'trace_info.pb' | wc -l)"
