@@ -1,7 +1,93 @@
 # Session state
 
-HEAD `5f3f19a`, `main`, pushed. Local `~/pave_univr_trn2_repro`.
+HEAD `83ccc70`, `main`, pushed. Local `~/pave_univr_trn2_repro`.
 Origin repo for reference only: `~/pave-unrolling`.
+
+## THE EXPERIMENT MATRIX (2026-08-21) -- three dimensions, measured
+
+Everything below is **tile 9 of 4x8 halo 128 (padded 704x768), 1 core, fp32, real weights,
+`--gt ref_cuda_fp32_1728x4096.npy`**. One tile, NOT a frame -- do not multiply by 32.
+
+Three independent switches. They were confounded for most of this project; they are not now.
+
+| dimension | flag | values | what it changes |
+|---|---|---|---|
+| **resize** | `--resize` | `interpolate` / `precomputed` | step 5. `F.interpolate` derives coordinates IN-GRAPH from `scale_factor`, so the reads lower to SWDGE indirect DMA. `resize_precomputed` computes them once on the host (`_resize_taps`, fp64, cached on `(in_sz, f, dtype, device)`) and bakes them as constant index vectors, so the reads lower to static DMA. |
+| **warp** | `--warp` | `gridsample` / `gather` | step 3, the pixel move. Both are BILINEAR -- same rule, two spellings. `gridsample` = one `F.grid_sample(mode="bilinear")`. `gather` = 4x `index_select` + the weighted sum. MEASURED equivalent to **0.003 LSB** in fp32. The label "gather" is a misnomer; the op is `index_select`. |
+| **fullgraph** | `--fullgraph` | `0` / `1` | how `torch.compile(backend="neuron")` is invoked. Not a step in the model. |
+
+### The 8 cells
+
+| # | resize | warp | fullgraph | latency | max_diff | PSNR | gate |
+|---|---|---|---|---|---|---|---|
+| 1 | interpolate | gridsample | 0 | not run | | | |
+| 2 | precomputed | gridsample | 0 | not run | | | |
+| 3 | interpolate | index_select | 0 | 1102.6 ms | 22.38 LSB | 48.45 dB | FAIL |
+| 4 | precomputed | index_select | 0 | **393.8 ms** | **0.06 LSB** | **102.27 dB** | **PASS** |
+| 5 | interpolate | gridsample | 1 | **OOMKilled** | | | |
+| 6 | precomputed | gridsample | 1 | never reached | | | |
+| 7 | interpolate | index_select | 1 | 1090.0 ms | 22.38 LSB | 48.45 dB | FAIL |
+| 8 | precomputed | index_select | 1 | **384.0 ms** | **0.06 LSB** | **102.27 dB** | **PASS** |
+
+Provenance: cells 3/4 = `univr-taps-ab-fg0-idxsel-nznz6`; cells 7/8 = `univr-taps-ab-fg1-bfxdr`;
+cells 5/6 = `univr-taps-ab-fg1-gridsample-l4q85`, **OOMKilled after 10 h at 1800Gi, still inside
+the FIRST arm's compile** -- it never printed `forward complete`. That reproduces the prediction in
+`repro_unrolling_trn2.py`'s own `--fullgraph` help (OOM at 169 min, 94 min at 1500Gi) at larger
+memory and longer runtime.
+
+### The three factor effects, each now unconfounded
+
+* **resize is the whole story: ~2.8x AND the accuracy fix.** 1102.6 -> 393.8 (2.80x) at
+  fullgraph=0, 1090.0 -> 384.0 (2.84x) at fullgraph=1. Replicated, and `max_diff` 22.38 -> 0.06 LSB
+  both times. Accuracy is bit-identical across all four measured cells, as expected -- neither the
+  warp nor fullgraph touches the resize math.
+* **fullgraph is worth 1-3%.** 3 vs 7 = 1.1%; 4 vs 8 = 2.5%. fullgraph=1 wins, but it is not the
+  lever. **This retires the earlier impression from `654.8 -> 384.0`, which moved two factors at
+  once** (fullgraph AND warp) and made fusion look like a 1.7x win.
+* **warp: unmeasurable at fullgraph=1, and that IS the verdict.** Fused gridsample does not
+  compile. A config that cannot fuse cannot scale to 32 tiles, whatever its per-tile number.
+
+**Cells 1-2 are not worth running.** They only pay if gridsample could win, and it cannot: it has
+to beat 384 ms, its closest datapoint is 654.8 ms, it issues 3.0-205 packets/px against
+index_select's 1.006 (the measured floor), and it cannot fuse.
+
+**WINNER: cell 8** -- `--resize precomputed --warp gather --fullgraph 1`.
+
+### Off-cube: `--warp-region eager` is a FOURTH thing, not fullgraph=0
+
+| resize | warp | latency | max_diff | PSNR |
+|---|---|---|---|---|
+| interpolate | gridsample + eager region | 1333.9 ms | 22.38 LSB | 48.45 dB |
+| precomputed | gridsample + eager region | 654.8 ms | 0.05 LSB | 102.22 dB |
+
+`--warp-region eager` wraps the warp in `torch._dynamo.disable` (`:446`), so dynamo refuses to
+trace into it: the warp runs as eager ATen **on device** while the convs around it stay compiled.
+That forces `fullgraph=0` (`:1216`) because the region boundary IS a graph break. So these two rows
+are NOT cells 1-2 -- plain `--fullgraph 0` leaves the warp compiled and lets dynamo pick the break
+points. Pod `univr-taps-ab-h6gd8`.
+
+**The implication only runs one way: eager region => fullgraph=0, never the converse.**
+
+Why the option exists at all, and only for the warp: the warp's addresses come from `flow`, a
+runtime tensor, so they can NEVER be precomputed -- and `gather` already measures 1.006 desc/px
+against a printed floor of 1.0. When an op cannot be made cheaper, the only remaining variable is
+where it executes, hence a region flag with four backends. The resize needed no region because
+`scale_factor` is a compile-time constant, so the fix lives inside the graph.
+
+### `--static-resize` is gone
+
+`--static-resize {0,1,2,3}` -> **`--resize {interpolate,precomputed}`** at `83ccc70`.
+`1` (pool-down) and `2` (pool+deconv) are deleted along with `resize_down`/`resize_up`: 1 was
+measured at 986.9 ms / **22.17 LSB** -- it swaps only the downsample and leaves `F.interpolate` on
+the upsample, which IS the accuracy bug, so it can never pass; 2 was never run and existed only to
+separate mechanism from coverage. The five legacy job specs keep `STATIC_RESIZE=0|3` as their env
+knob and translate it, so their `CFG` labels and PVC cache keys are unchanged.
+
+### Every timed median so far except one contains a compile
+
+`min 392.4 / median 393.8 / max 393412.2`. Three runs in a row. `min ~= median` so the numbers are
+real, but the two profiling jobs added at `83ccc70` run `--iters 0` first and print
+`NEFFs B -> A during timed run (must be +0)` so it is checkable rather than assumed.
 
 ## RESUME HERE
 
