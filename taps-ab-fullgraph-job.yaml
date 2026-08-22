@@ -33,7 +33,7 @@ spec:
               export TORCH_NEURONX_NEFF_CACHE_DIR=/tmp/neff_cache
               mkdir -p /tmp/neff_cache /tmp/out
 
-              W="${WARP:-gather}"
+              W="${WARP:-index_select}"
               TS=$(date -u +%Y%m%d_%H%M%S)
               RUN="exp_univr-4x8_h128_ab-resize_fg1-${W}_t9_${TS}"
               RUNDIR="/var/mdl/univr/runs/$RUN"
@@ -51,7 +51,7 @@ spec:
               printf '%s\n' \
                 "run       : $RUN" \
                 "provenance: $(git rev-parse --abbrev-ref HEAD)@$(git rev-parse HEAD)" \
-                "config    : tile 9 of 4x8 halo 128 (padded 704x768) warp $W = 4x index_select bilinear, FUSED (fullgraph 1, no warp-region)" \
+                "config    : tile 9 of 4x8 halo 128 (padded 704x768) warp index_select = 4x index_select bilinear, FUSED (fullgraph 1, no warp-region)" \
                 "cc        : $(neuronx-cc --version 2>&1 | head -1 | awk '{print $NF}')" \
                 "ccflags   : ${NEURON_CC_FLAGS:-<unset>}" \
                 "compile   : torch.compile(backend=neuron, dynamic=False, fullgraph=True), lazy on first forward" \
@@ -96,7 +96,7 @@ spec:
             - name: BRANCH
               value: "main"
             - name: WARP
-              value: "gather"
+              value: "index_select"
             - name: NEURON_LOGICAL_NC_CONFIG
               value: "1"
             - name: NEURON_RT_NUM_CORES

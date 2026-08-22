@@ -46,11 +46,11 @@ spec:
               }
               trap finalize EXIT
 
-              CMD0="python -u repro_unrolling_trn2.py --rs0 rs70.png --rs1 rs71.png --rs2 rs72.png --height 1728 --width 4096 --tiles 4x8 --halo 128 --only-tile 9 --gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth --bar 3 --dtype fp32 --device neuron --cores 1 --warp gather --fullgraph 0 --iters 5"
+              CMD0="python -u repro_unrolling_trn2.py --rs0 rs70.png --rs1 rs71.png --rs2 rs72.png --height 1728 --width 4096 --tiles 4x8 --halo 128 --only-tile 9 --gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth --bar 3 --dtype fp32 --device neuron --cores 1 --warp index_select --fullgraph 0 --iters 5"
               printf '%s\n' \
                 "run       : $RUN" \
                 "provenance: $(git rev-parse --abbrev-ref HEAD)@$(git rev-parse HEAD)" \
-                "matrix    : fullgraph=0 x warp=gather (4x index_select bilinear), warp IN the graph, no warp-region" \
+                "matrix    : fullgraph=0 x warp=index_select (4x index_select bilinear), warp IN the graph, no warp-region" \
                 "config    : tile 9 of 4x8 halo 128 (padded 704x768) 1 core fp32" \
                 "cc        : $(neuronx-cc --version 2>&1 | head -1 | awk '{print $NF}')" \
                 "ccflags   : ${NEURON_CC_FLAGS:-<unset>}" \
@@ -63,7 +63,7 @@ spec:
                   --height 1728 --width 4096 --tiles 4x8 --halo 128 --only-tile 9 \
                   --gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth \
                   --bar 3 --dtype fp32 --device neuron --cores 1 \
-                  --warp gather --fullgraph 0 \
+                  --warp index_select --fullgraph 0 \
                   --resize interpolate --iters 5 \
                   --save-ref /tmp/out/frame_interpolate.npy 2>&1 | tee /tmp/out/interpolate.log
 
@@ -72,7 +72,7 @@ spec:
                   --height 1728 --width 4096 --tiles 4x8 --halo 128 --only-tile 9 \
                   --gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth \
                   --bar 3 --dtype fp32 --device neuron --cores 1 \
-                  --warp gather --fullgraph 0 \
+                  --warp index_select --fullgraph 0 \
                   --resize precomputed --iters 5 \
                   --save-ref /tmp/out/frame_precomputed.npy 2>&1 | tee /tmp/out/precomputed.log
           resources:

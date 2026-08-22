@@ -120,9 +120,9 @@ def warp_gridsample(tenInput, tenFlow):
     return F.grid_sample(tenInput, g, mode="bilinear", padding_mode="border", align_corners=True)
 
 
-def warp_gather(tenInput, tenFlow):
+def warp_index_select(tenInput, tenFlow):
     if _RECORD:
-        CALL_SITES.append(("gather", tenInput.shape[1], tenInput.shape[2], tenInput.shape[3]))
+        CALL_SITES.append(("index_select", tenInput.shape[1], tenInput.shape[2], tenInput.shape[3]))
     x0, y0, ax, ay, (B, C, H, W) = _bilinear_terms(tenInput, tenFlow)
     N = H * W
     src = tenInput.reshape(B, C, N).permute(0, 2, 1).reshape(B * N, C).float()
@@ -382,7 +382,7 @@ def _build_shiftwarp():
 def warp_shiftwarp(tenInput, tenFlow):
     B, C, H, W = tenInput.shape
     if C > _SHIFTWARP_MAXC:
-        return warp_gather(tenInput, tenFlow)
+        return warp_index_select(tenInput, tenFlow)
     if _RECORD:
         CALL_SITES.append(("shiftwarp", C, H, W))
     global _SHIFTWARP_FN
@@ -410,7 +410,7 @@ def warp_shiftwarp(tenInput, tenFlow):
     return out.permute(2, 0, 1).unsqueeze(0).to(tenInput.dtype)
 
 
-WARPS = {"gridsample": warp_gridsample, "gather": warp_gather,
+WARPS = {"gridsample": warp_gridsample, "index_select": warp_index_select,
          "window": warp_window, "nki": warp_nki, "nki-dyn": warp_nki,
          "shiftwarp": warp_shiftwarp, "gridsample-nkl": warp_gridsample_nkl}
 _WARP = warp_gridsample
@@ -1006,7 +1006,7 @@ def self_test():
         img = torch.rand(1, C, H, W)
         flow = (torch.rand(1, 2, H, W) - 0.5) * 8.0
         ref = warp_gridsample(img, flow)
-        got = warp_gather(img, flow)
+        got = warp_index_select(img, flow)
         win = warp_window(img, flow, radius=1)
         cg = F.cosine_similarity(ref.flatten().double(), got.flatten().double(), dim=0).item()
         cw = F.cosine_similarity(ref.flatten().double(), win.flatten().double(), dim=0).item()
@@ -1014,7 +1014,7 @@ def self_test():
 
         if cg < 0.999999:
             bad += 1
-    print("  %s" % ("PASS -- the gather is the same op as grid_sample" if bad == 0
+    print("  %s" % ("PASS -- index_select is the same op as grid_sample" if bad == 0
                     else "FAIL -- %d shape(s) disagree" % bad))
 
 
@@ -1047,7 +1047,7 @@ def main():
     ap.add_argument("--height", type=int, default=1728)
     ap.add_argument("--width", type=int, default=4096)
     ap.add_argument("--gamma", type=float, default=0.98)
-    ap.add_argument("--warp", default="gather", choices=sorted(WARPS),
+    ap.add_argument("--warp", default="index_select", choices=sorted(WARPS),
                     help="nki = unrolled kernel (best runtime, 80-100 min compile at 4K tiles); "
                          "nki-dyn = device-loop kernel (seconds to compile, ~2x runtime)")
     ap.add_argument("--nkl-gather-method", choices=("transpose", "copy"), default=None,

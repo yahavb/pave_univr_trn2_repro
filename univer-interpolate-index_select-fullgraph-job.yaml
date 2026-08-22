@@ -64,7 +64,7 @@ spec:
                     --height 1728 --width 4096 --tiles 4x8 --halo 128 --only-tile 9
                     --gt ref_cuda_fp32_1728x4096.npy --weights pre_net_flow.pth
                     --bar 3 --dtype fp32 --device neuron --cores 1
-                    --warp gather --fullgraph 1 --resize interpolate"
+                    --warp index_select --fullgraph 1 --resize interpolate"
 
               printf '%s\n' \
                 "run       : $RUN" \

@@ -28,7 +28,7 @@ def warp_gridsample(x, flow):
     return F.grid_sample(x, g, mode="bilinear", padding_mode="border", align_corners=True)
 
 
-def warp_gather(x, flow):
+def warp_index_select(x, flow):
     B, C, H, W = x.shape
     d = flow.device
     gx = torch.arange(W, device=d, dtype=torch.float32).view(1, 1, 1, W)
@@ -238,7 +238,7 @@ OPS = {
     "nki": warp_nki_repo,
     "nki-dyn": warp_nki_dyn_repo,
     "gridsample-nkl": warp_gridsample_nkl,
-    "gather": warp_gather,
+    "index_select": warp_index_select,
     "transpose": transpose_only,
     "shift": shift_only,
     "window1": warp_window,
@@ -332,7 +332,7 @@ def warp_inventory(ph, pw):
     return sites
 
 
-def op_sites(grid="4x8", halo=128, warps=("gather",)):
+def op_sites(grid="4x8", halo=128, warps=("index_select",)):
     """EVERY op the model performs, at the dimensions it performs them, weighted by calls/frame.
 
     Nothing here is synthetic. Warp dims come from warp_inventory (which reads the model's real
@@ -375,7 +375,7 @@ def op_sites(grid="4x8", halo=128, warps=("gather",)):
     return out
 
 
-def print_op_sites(grid="4x8", halo=128, warps=("gather",), top=0, specs_only=False, only="both"):
+def print_op_sites(grid="4x8", halo=128, warps=("index_select",), top=0, specs_only=False, only="both"):
     """The arm list, derived. With specs_only emit `op:shape` lines the job consumes directly."""
     rows = op_sites(grid, halo, warps)
     if only != "both":
@@ -669,7 +669,7 @@ def main():
                          "weight-ordered with cumulative coverage. Nothing synthetic.")
     ap.add_argument("--op-site-specs", action="store_true",
                     help="machine-readable --list-op-sites: `op:shape` lines for the job.")
-    ap.add_argument("--warp-impls", default="gather",
+    ap.add_argument("--warp-impls", default="index_select",
                     help="comma-separated warp implementations to emit arms for, e.g. "
                          "gather,gridsample-nkl")
     ap.add_argument("--op-site-class", default="both", choices=("warps", "convs", "both"),
@@ -691,7 +691,7 @@ def main():
     ap.add_argument("--tile", type=int, default=9,
                     help="--op sequence: which tile. 9 is the LARGEST shape at 4x8; tile 1 is NOT "
                          "the largest and testing it once produced a false FUSES verdict.")
-    ap.add_argument("--warp", default="gather",
+    ap.add_argument("--warp", default="index_select",
                     help="--op sequence: the resample implementation inside the sequence")
     ap.add_argument("--iters", type=int, default=5,
                     help="timed iterations after the compile/warmup call, for both the single-op "

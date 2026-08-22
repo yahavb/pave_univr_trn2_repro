@@ -46,7 +46,6 @@ spec:
                 "resolution: ${W}x${H}, --tiles 1x1, no halo, 1 core, fp32, real weights" \
                 "baseline  : resize=interpolate  warp=gridsample     fullgraph=0" \
                 "best      : resize=precomputed  warp=index_select   fullgraph=1" \
-                "note      : the script's flag for index_select is spelled --warp gather; the op is index_select, NOT a collective gather" \
                 "why 288x320: gridsample does not compile in-graph at the production tile (OOMKilled twice at 1800Gi), so this is the largest size where BOTH configs run and the profiles are comparable" \
                 "cc        : $(neuronx-cc --version 2>&1 | head -1 | awk '{print $NF}')" \
                 "ccflags   : ${NEURON_CC_FLAGS:-<unset>}" \
@@ -123,7 +122,7 @@ spec:
               }
 
               run_arm baseline gridsample interpolate  0
-              run_arm best     gather     precomputed  1
+              run_arm best     index_select  precomputed  1
 
               for A in baseline best; do
                 printf '%-9s %s | %s\n' "$A" \

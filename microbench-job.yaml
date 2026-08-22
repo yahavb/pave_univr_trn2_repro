@@ -77,7 +77,7 @@ spec:
               fi
               echo ""
 
-              WARP_IMPLS="${WARP_IMPLS:-gather,nki-dyn}"
+              WARP_IMPLS="${WARP_IMPLS:-index_select,nki-dyn}"
               if [ "$NKL" = "1" ]; then WARP_IMPLS="$WARP_IMPLS,gridsample-nkl"; fi
               TOP="${TOP:-0}"
 
@@ -89,8 +89,8 @@ spec:
                 if [ "$SET" = "gsbackends" ]; then
                   GSG="$GRID"; GSH="$HALO"
                   DIMS=$(python3 microbench.py --op x --grid "$GSG" --halo "$GSH" \
-                         --warp-impls gather --top 4 --op-site-class warps --op-site-specs \
-                         | sed 's/^gather://')
+                         --warp-impls index_select --top 4 --op-site-class warps --op-site-specs \
+                         | sed 's/^index_select://')
                   echo "gsbackends  grid $GSG halo $GSH   dims: $(echo $DIMS | tr '\n' ' ')"
                   echo ""
                   for D in $DIMS; do
@@ -169,13 +169,13 @@ spec:
 
                 if [ "$SET" = "sequence" ]; then
                   TILE="${TILE:-9}"; ITERS="${ITERS:-5}"; FULLGRAPH="${FULLGRAPH:-1}"
-                  SEQ_WARPS="${SEQ_WARPS:-gather}"
+                  SEQ_WARPS="${SEQ_WARPS:-index_select}"
                   if [ "$NKL" = "1" ]; then SEQ_WARPS="$SEQ_WARPS gridsample-nkl"; fi
                   REF=/tmp/ref_seq.npy
                   for W in $SEQ_WARPS; do
                     echo "################ sequence_${W}_t${TILE}"
                     EX=""
-                    if [ "$W" = "gather" ]; then EX="--save-out $REF"
+                    if [ "$W" = "index_select" ]; then EX="--save-out $REF"
                     elif [ -f "$REF" ]; then EX="--cmp $REF"; fi
                     set +e
                     python -u microbench.py --op sequence --grid "$GRID" --halo "$HALO" \
