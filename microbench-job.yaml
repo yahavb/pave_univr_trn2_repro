@@ -135,7 +135,7 @@ spec:
                   if [ "$NKL" != "1" ]; then echo "nklsweep needs nkilib; aborting"; exit 0; fi
                   SWEEP_SHAPE="${SWEEP_SHAPE:-3,704,768}"
                   CAPS="${CAPS:-none 128 256 512 1024}"
-                  echo "nklsweep at $SWEEP_SHAPE   caps: $CAPS   (gather = 21.98 ms @ 40.39 ns/desc)"
+                  echo "nklsweep at $SWEEP_SHAPE   caps: $CAPS   (index_select = 21.98 ms @ 40.39 ns/desc)"
                   for CAP in $CAPS; do
                     MI=""; [ "$CAP" = "none" ] || MI="--nkl-max-indices $CAP"
                     echo "################ nklcap${CAP}_$(echo $SWEEP_SHAPE | tr ',' 'x')"
@@ -161,8 +161,8 @@ spec:
                     printf "  %-10s %5s %10s %9s %8s %9s\n" "$CAP" "-" "${A:--}" "${N:--}" "${HW:--}" "${L:--}"
                   done
                   echo ""
-                  echo "  BEAT gather = ns_desc below 40.39. If no cap does, the kernel cannot"
-                  echo "  displace gather in this model and the CR is a win only over ATen"
+                  echo "  BEAT index_select = ns_desc below 40.39. If no cap does, the kernel cannot"
+                  echo "  displace index_select in this model and the CR is a win only over ATen"
                   echo "  gridsample, which the model does not use."
                   exit 0
                 fi
@@ -206,7 +206,7 @@ spec:
                   echo ""
                   echo "  tile_ms is the ONLY comparable latency here; per-op single-io us are noise."
                   echo "  frame_8core is a LOWER bound (equal cost per tile, perfect 8-way overlap)."
-                  echo "  The bar is GATHER, not ATen gridsample: gather already sits at the"
+                  echo "  The bar is INDEX_SELECT, not ATen gridsample: index_select already sits at the"
                   echo "  1 desc/px floor at 40.40 ns, so a kernel wins only by beating ns/desc."
                   echo "  Whole resample is ~510 ms of the 3900 ms frame, so that is the ceiling."
                   exit 0

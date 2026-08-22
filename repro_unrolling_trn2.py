@@ -1055,7 +1055,7 @@ def main():
                          "gather_method='transpose' requires a 2-byte dtype -- so fp32 gets "
                          "'copy'. Override only to test the assert or to force the slower path.")
     ap.add_argument("--nkl-max-indices", type=int, default=None,
-                    help="gridsample-nkl only: max_indices_per_indirect, the cap on gather indices "
+                    help="gridsample-nkl only: max_indices_per_indirect, the cap on index_select indices "
                          "per batched indirect gather (None disables the batched path). This is "
                          "THE tuning knob at our scale: the kernel's tests sample to 64x64 (~4k "
                          "queries) while a 704x768 tile is ~540k, so the default may not fit SBUF.")
@@ -1068,7 +1068,7 @@ def main():
                          "the smallest that passes the gate on the real 2.33 px flow (R=2 measured "
                          "76.19 LSB, a clean FAIL)")
     ap.add_argument("--shiftwarp-max-c", type=int, default=3,
-                    help="shiftwarp handles sites with C <= this; larger C falls back to gather. "
+                    help="shiftwarp handles sites with C <= this; larger C falls back to index_select. "
                          "Default 3 = only the image-warp site, the one where the kernel is verified")
     ap.add_argument("--per-block", action="store_true",
                     help="time each module (a0/a1/a2 conv+warp, ctx, unet) with a device barrier, "
@@ -1139,7 +1139,7 @@ def main():
     ap.add_argument("--fullgraph", type=int, choices=(0, 1), default=1,
                     help="1 (default) = torch.compile(fullgraph=True), one fused graph per tile "
                          "shape. 0 = allow graph breaks, which is what makes --warp gridsample "
-                         "usable: F.grid_sample issues 3-205x more DMA descriptors than gather "
+                         "usable: F.grid_sample issues 3-205x more DMA descriptors than index_select "
                          "(3.0 pkt/px at C=3 up to 205 at C=128) and its FUSED graph exceeds "
                          "compiler memory (OOM at 169 and 94 min at 1500Gi). gridsample is the "
                          "resample REFERENCE every other warp is scored against, and the resample "
@@ -1242,7 +1242,7 @@ def main():
     if a.fullgraph == 0 and a.warp in ("nki", "nki-dyn"):
         ap.error("--fullgraph 0 is unsafe with --warp %s: a graph break around the "
                  "view(torch.uint32) index bitcast silently corrupts which pixels are sampled. "
-                 "Use --warp gridsample or gather with --fullgraph 0, or keep --fullgraph 1."
+                 "Use --warp gridsample or index_select with --fullgraph 0, or keep --fullgraph 1."
                  % a.warp)
     if a.record_flow and a.fullgraph == 1 and a.compile:
         ap.error("--record-flow cannot run under fullgraph=True: it appends to a Python list and "

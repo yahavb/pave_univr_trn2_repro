@@ -13,7 +13,7 @@ Three independent switches. They were confounded for most of this project; they 
 | dimension | flag | values | what it changes |
 |---|---|---|---|
 | **resize** | `--resize` | `interpolate` / `precomputed` | step 5. `F.interpolate` derives coordinates IN-GRAPH from `scale_factor`, so the reads lower to SWDGE indirect DMA. `resize_precomputed` computes them once on the host (`_resize_taps`, fp64, cached on `(in_sz, f, dtype, device)`) and bakes them as constant index vectors, so the reads lower to static DMA. |
-| **warp** | `--warp` | `gridsample` / `gather` | step 3, the pixel move. Both are BILINEAR -- same rule, two spellings. `gridsample` = one `F.grid_sample(mode="bilinear")`. `gather` = 4x `index_select` + the weighted sum. MEASURED equivalent to **0.003 LSB** in fp32. The label "gather" is a misnomer; the op is `index_select`. |
+| **warp** | `--warp` | `gridsample` / `index_select` | step 3, the pixel move. Both are BILINEAR -- same rule, two spellings. `gridsample` = one `F.grid_sample(mode="bilinear")`. `index_select` = 4x `index_select` reads + the weighted sum. MEASURED equivalent to **0.003 LSB** in fp32. Renamed at `c1be3a8`; run dirs and logs from before that spell it differently, which is the only reason to know the old name. |
 | **fullgraph** | `--fullgraph` | `0` / `1` | how `torch.compile(backend="neuron")` is invoked. Not a step in the model. |
 
 ### The 8 cells
@@ -32,7 +32,7 @@ Three independent switches. They were confounded for most of this project; they 
 Provenance: 3/4 `univr-taps-ab-fg0-idxsel-nznz6`; 7/8 `univr-taps-ab-fg1-bfxdr` (384.0 ms) and
 `univer-precomputed-index-select-fullgraph-qm26g` (387.0 ms, the profiled re-run -- agree to 0.8%);
 5/6 `univr-taps-ab-fg1-gridsample-l4q85`; 1/2 `univer-interpolate-gridsample-xg9r6`. Both gridsample
-pods died **inside the FIRST arm's compile at 1800Gi**, never printing `forward complete`, so cells
+pods died **inside the FIRST config's compile at 1800Gi**, never printing `forward complete`, so cells
 2 and 6 were never reached.
 
 ### MEASURED: gridsample cannot be COMPILED at this tile size, at either fullgraph setting
@@ -61,7 +61,7 @@ before/after story must either hold the warp fixed (cell 7 -> 8) or accept the o
 * **warp: unmeasurable in-graph at either fullgraph, and that IS the verdict.** gridsample does not
   compile. A config that cannot compile cannot scale to 32 tiles, whatever its per-tile number.
 
-**WINNER: cell 8** -- `--resize precomputed --warp gather --fullgraph 1`, 387.0 ms / 0.06 LSB PASS.
+**WINNER: cell 8** -- `--resize precomputed --warp index_select --fullgraph 1`, 387.0 ms / 0.06 LSB PASS.
 
 **The defensible improvement number is 2.8x** (cell 7 -> 8: one variable, same warp, same
 fullgraph, both gated). 1333.9 -> 387.0 = 3.4x is the end-to-end journey but moves three factors
@@ -172,7 +172,7 @@ graph, `fullgraph=0`, real weights, `--gate` (no CUDA golden exists at reduced r
 | precomputed | **466.0 ms** | **0.00 LSB** | **121.91 dB** | 66.8% | 11.9% | **5.6x** |
 
 **1.63x, not 2.8x -- and the starvation is NOT cleared.** All dominant NEFFs stay `SWDGE-heavy` at
-gpsimd 72-75%, and `diagnose_neff.py` fires `DESCRIPTOR-ISSUE BOUND on GPSIMD` on BOTH arms.
+gpsimd 72-75%, and `diagnose_neff.py` fires `DESCRIPTOR-ISSUE BOUND on GPSIMD` on BOTH configs.
 
 Why the same fix pays 1.63x here and 2.82x at the production tile: **the resize is only worth what
 the warp leaves on the table.**
@@ -185,7 +185,7 @@ the warp leaves on the table.**
 gridsample's own descriptors swamp the graph, so removing `F.interpolate`'s is a smaller fraction.
 **The 3x only manifests once the warp is at the descriptor floor** -- i.e. with `index_select`.
 
-A/B on the dominant NEFF of each arm (`--before rank01_65233172 --after rank01_2bff75b9`):
+A/B on the dominant NEFF of each config (`--before rank01_65233172 --after rank01_2bff75b9`):
 
 | | before | after |
 |---|---|---|
@@ -198,7 +198,7 @@ ns/instruction is FLAT at ~1200, so the saving is purely count. Time (-38.2%) tr
 count (-40.3%) essentially 1:1 -- in this graph, time IS descriptor count.
 
 **Tooling note.** `diagnose_neff.py --before/--after` prints the same five verdict labels for both
-arms and looks like boilerplate. It is not: the labels collide because both arms land in the same
+configs and looks like boilerplate. It is not: the labels collide because both configs land in the same
 threshold bands, and the A/B code path COMPUTES the per-verdict evidence and then discards it
 (`for sev, label, ev, fix in classify(mb)` prints only `sev` and `label`, dropping `ev`). Tier 1
 prints that evidence. Until the skill is patched, re-run tier 1 on each pair separately to see the
@@ -220,7 +220,7 @@ points. Pod `univr-taps-ab-h6gd8`.
 **The implication only runs one way: eager region => fullgraph=0, never the converse.**
 
 Why the option exists at all, and only for the warp: the warp's addresses come from `flow`, a
-runtime tensor, so they can NEVER be precomputed -- and `gather` already measures 1.006 desc/px
+runtime tensor, so they can NEVER be precomputed -- and `index_select` already measures 1.006 desc/px
 against a printed floor of 1.0. When an op cannot be made cheaper, the only remaining variable is
 where it executes, hence a region flag with four backends. The resize needed no region because
 `scale_factor` is a compile-time constant, so the fix lives inside the graph.
@@ -408,7 +408,7 @@ one-off the NEFF cache absorbs and is **not** the critical path; steady-state la
 ### Two independent causes had to be separated to get here
 
 **1. `--model-type unet-inference` caused the DMA rejection.** Perfect separation across
-8 arms on one fixed shape (4x8 h64 tile 0, 512x576), job `univr-ccflag-fusion-fc4d6`:
+8 configs on one fixed shape (4x8 h64 tile 0, 512x576), job `univr-ccflag-fusion-fc4d6`:
 
 | flags | verdict |
 |---|---|
@@ -421,7 +421,7 @@ one-off the NEFF cache absorbs and is **not** the critical path; steady-state la
 | ... `unet-inference --enable-saturate-infinity` | REJ `in=23,040` |
 | `--model-type unet-inference` (no `--lnc`) | REJ `in=23,040` |
 
-Every arm carrying `unet-inference` rejected with the identical operand; every arm without
+Every config carrying `unet-inference` rejected with the identical operand; every config without
 it fused. `--lnc` is irrelevant. The VALUE is what matters, not the flag -- `transformer`
 and `generic` both work. That flag came from `~/pave-unrolling`, was never varied there
 either, and was carried unquestioned into every run including all the geometry and halo
@@ -450,7 +450,7 @@ graphs at once says nothing about it -- see the accuracy-triage OOMs below.
 
 ## MEASURED: halo 128 fuses on all 8 slots, and EVERY TILE STILL FAILS ACCURACY
 
-`univr-accuracy-triage-k2zwh`, 4x8 halo 128, `gather`, serial probe, `--cores 1 --only-tile`,
+`univr-accuracy-triage-k2zwh`, 4x8 halo 128, `index_select`, serial probe, `--cores 1 --only-tile`,
 **neuronx-cc 2.27.2878.0** (not the 2.26.6360.0 every earlier result used):
 
 | tile | padded | px | compile | max_diff | PSNR |
@@ -474,7 +474,7 @@ of 3.** Everything the frame adds is therefore exonerated:
 * **not the 8-core path** -- one core fails
 * **not tile stitching or the merge seam** -- one tile has neither
 * **not the replica deep-copy** -- a single replica fails
-* **not the resample** -- already known, `gather` and `nki-dyn` agreed to every digit
+* **not the resample** -- already known, `index_select` and `nki-dyn` agreed to every digit
 
 What is left is the per-tile fused graph itself: a conv, `interpolate`, or `NeuronPReLU`
 lowering difference under `fullgraph=True`. The next step is a per-stage numeric diff of one
@@ -498,7 +498,7 @@ bracket came from 2x8 at 593,920 px (928x640) OOMing, so the limit is not area a
 ratio or the resulting tile geometry matters. 2x4 (1.0M px) and 2x8 remain measured OOMs; do not
 generalise a px threshold from them.
 
-## The 8-core arm produced NO latency: the dynamo fix had silently stopped working
+## The 8-core config produced NO latency: the dynamo fix had silently stopped working
 
 Same job, stage 2, against a fully warm cache (`NEFFs +0`, so the prewarm design worked):
 
@@ -509,7 +509,7 @@ torch._dynamo.exc.Unsupported: Dynamo recompile limit exceeded
 
 The script sets `torch._dynamo.config.cache_size_limit = 64`. **On the torch shipped with
 neuronx-cc 2.27 the attribute is `recompile_limit`, and assigning the old name neither raises
-nor aliases** -- so the limit stayed at 8 and the arm died after the 8 probe compiles had
+nor aliases** -- so the limit stayed at 8 and the config died after the 8 probe compiles had
 already spent 11.5 h. Now fixed by setting every name that exists AND verifying the effective
 value at import, raising `SystemExit` if it is still below 64.
 
@@ -518,12 +518,12 @@ at `tau = (t + gamma - gamma * rows / fh ...)` (~line 831) and which varies per 
 of shape and timestamp. The failing frame reached recompile **22**, so "8 graphs" understates the
 host-side trace count even though it is exactly right about NEFFs.
 
-## MEASURED: the resample is descriptor-bound, and `gather` is already AT the floor
+## MEASURED: the resample is descriptor-bound, and `index_select` is already AT the floor
 
-Job `univr-microbench-c8lm6`, arm `3x704x768` -- the C=3 flow-pyramid site of the largest
+Job `univr-microbench-c8lm6`, config `3x704x768` -- the C=3 flow-pyramid site of the largest
 4x8 halo-128 tile, which is 38.75% of all resample work:
 
-| | gather | gridsample | ratio |
+| | index_select | gridsample | ratio |
 |---|---|---|---|
 | total_active_time | **21.98 ms** | **64.66 ms** | 2.94x |
 | sw_dynamic_dma packets | 544,064 | 1,624,192 | **2.99x** |
@@ -534,11 +534,11 @@ Job `univr-microbench-c8lm6`, arm `3x704x768` -- the C=3 flow-pyramid site of th
 
 **Time = descriptor count x ~40 ns and nothing else.** Not compute (MFU 0.00%, tensor 0.1%),
 not bandwidth (gridsample moves FEWER bytes -- same data in 3x more, smaller transfers).
-`gather` wins because it is laid out so a pixel's channels are contiguous (`[B*N, C]`, one
+`index_select` wins because it is laid out so a pixel's channels are contiguous (`[B*N, C]`, one
 descriptor covers the C-run); `F.grid_sample` works on NCHW where channels are strided by H*W.
 
-**The tool prints its own floor -- `min_desc 540672 at 1/px` -- and gather measured 1.006.
-gather is AT the theoretical minimum.** So no kernel can beat it by cutting descriptors; the
+**The tool prints its own floor -- `min_desc 540672 at 1/px` -- and index_select measured 1.006.
+index_select is AT the theoretical minimum.** So no kernel can beat it by cutting descriptors; the
 only remaining axis is the 40.40 ns, i.e. getting off software DGE. `hardware_dynamic_dma` is
 0.1% / 0.0% on both -- everything goes through the software path today.
 
@@ -547,12 +547,12 @@ single-core, **~510 ms across 8 cores = ~13% of the 3900 ms frame**. That is the
 resample, all 448 calls, and it is already descriptor-optimal. So ~510 ms is the absolute
 ceiling on any resample optimisation, and only if the resample became free.
 
-Two per-op numbers on record are now corrected: **`gather` is 1.006 pkt/px, not 2.0** (the old
+Two per-op numbers on record are now corrected: **`index_select` is 1.006 pkt/px, not 2.0** (the old
 figure was taken at 992x1280 with `--model-type unet-inference`, so it is void), while
 **`gridsample` at 3.0 and ~40 ns/descriptor are CONFIRMED** (3.004 and 40.40 vs the recorded
 ~38 ns).
 
-## How to assess a resample kernel: `--op sequence`, not per-op arms
+## How to assess a resample kernel: `--op sequence`, not per-op configs
 
 `microbench.py` answers "how many descriptors does this op issue" and it answered it. It CANNOT
 answer "what does swapping the resample do to the model", for three reasons:
@@ -561,12 +561,12 @@ answer "what does swapping the resample do to the model", for three reasons:
   per-op numbers do not sum to the sequence
 * absolute single-io microseconds are noise across runs -- only shares and counts are stable
 * a swapped resample changes the LAYOUT its neighbours see. The NKL kernel asserts NHWC while the
-  model is NCHW, so it adds two permutes per call that no per-op arm measures at all
+  model is NCHW, so it adds two permutes per call that no per-op config measures at all
 
 **`microbench.py --op sequence`** runs the real sequence at a real padded tile shape as one
 compiled graph and reports a warm median, which IS comparable between warps. It reuses the
 model's own modules, so it cannot drift from the thing it claims to represent. `SET=sequence` in
-`microbench-job.yaml` runs it once per warp, gather first with `--save-out`, the rest `--cmp`.
+`microbench-job.yaml` runs it once per warp, index_select first with `--save-out`, the rest `--cmp`.
 
 It is a MODE of the microbenchmark, not a separate script. It briefly was one (`distill_tile.py`,
 `distill-job.yaml`) and that was the same naming/divergence mistake this file already records
@@ -574,46 +574,46 @@ twice -- `warp_op_bench.py` and `conv_op_bench.py` were merged for exactly this 
 script, one job.
 
 Two rules for reading it:
-* **the bar is `gather`, not ATen `gridsample`.** gather is what the model uses, and it already
+* **the bar is `index_select`, not ATen `gridsample`.** index_select is what the model uses, and it already
   sits at the 1 descriptor/px floor at 40.40 ns, so a kernel only wins by beating ns/descriptor
   -- i.e. by leaving the software DGE path (`hardware_dynamic_dma` is ~0% today).
 * **the ceiling is ~510 ms of a 3900 ms frame (~13%)**, the whole resample, even if it became
   free. Any claimed win larger than that is a measurement error.
 
-## MEASURED: the NKL GridSample kernel WORKS, solves gridsample, and still loses to gather
+## MEASURED: the NKL GridSample kernel WORKS, solves gridsample, and still loses to index_select
 
 Job `univr-microbench-snk4g`, `SET=warps TOP=4`, cc 2.27, `nkilib` restored from the PVC,
 `max_indices_per_indirect=None` (batching OFF), fp32 so `gather_method="copy"`:
 
-| dim | warp | active | pkt/px | ns/desc | hwDMA% | max_LSB | vs gather |
+| dim | warp | active | pkt/px | ns/desc | hwDMA% | max_LSB | vs index_select |
 |---|---|---|---|---|---|---|---|
-| 3x704x768 | gather | 21.98 ms | 1.006 | **40.39** | 0.10 | 0.028 | -- |
+| 3x704x768 | index_select | 21.98 ms | 1.006 | **40.39** | 0.10 | 0.028 | -- |
 | | gridsample | 64.66 ms | 3.004 | 39.81 | 0.00 | 0.028 | 2.94x slower |
 | | **gridsample-nkl** | **24.06 ms** | **1.006** | **44.22** | **5.80** | 0.028 | **1.09x slower** |
-| 3x576x768 | gather | 18.00 ms | 1.006 | 40.44 | 0.10 | 0.0236 | -- |
+| 3x576x768 | index_select | 18.00 ms | 1.006 | 40.44 | 0.10 | 0.0236 | -- |
 | | gridsample | 52.95 ms | 3.004 | 39.85 | 0.00 | 0.0234 | 2.94x slower |
 | | **gridsample-nkl** | **19.73 ms** | **1.007** | **44.31** | **5.90** | 0.0234 | **1.10x slower** |
 
 **The kernel does exactly what it was built to do.** It collapsed the descriptor blowup
-**3.004 -> 1.006 pkt/px**, matching gather exactly -- a **2.7x win over ATen gridsample** -- and
+**3.004 -> 1.006 pkt/px**, matching index_select exactly -- a **2.7x win over ATen gridsample** -- and
 its accuracy is identical to both other warps to three decimals, so it is numerically correct.
 
-**But it does not beat `gather`, which is what the model uses: it is 9-10% slower.** Exactly what
-the descriptor-floor argument predicted -- gather already sat at 1 descriptor per output pixel, so
+**But it does not beat `index_select`, which is what the model uses: it is 9-10% slower.** Exactly what
+the descriptor-floor argument predicted -- index_select already sat at 1 descriptor per output pixel, so
 there was no descriptor headroom, and the kernel costs **~9.6% more per descriptor** (44.2 vs
 40.4 ns).
 
-One lead remains: `hardware_dynamic_dma` is **5.8%** on the kernel against **0.10%** on gather, so
+One lead remains: `hardware_dynamic_dma` is **5.8%** on the kernel against **0.10%** on index_select, so
 it does reach hardware DGE -- for ~6% of the work, 94% still software. And this was measured with
 **batching DISABLED** (`max_indices_per_indirect=None`), which is the kernel's headline feature.
-`SET=nklsweep` sweeps the cap at the 38.75%-of-work dim. **Beating gather means ns/desc below
+`SET=nklsweep` sweeps the cap at the 38.75%-of-work dim. **Beating index_select means ns/desc below
 40.39**; if no cap does that, the CR is a win only over an implementation this model does not use.
 
 ## MEASURED: gridsample on CPU is NOT a lever, and the ratio is size-dependent
 
 Job `univr-bench-79h4g`/`univr-bench` at `f26eb21`, `MODE=warpcmp`. The model runs on **neuron**
-in every arm; only the RESAMPLE REGION differs (`--warp-region`, its own `torch.compile`, its own
-backend). `--warp-region` forces `fullgraph=0` in all arms, so the break structure is identical
+in every config; only the RESAMPLE REGION differs (`--warp-region`, its own `torch.compile`, its own
+backend). `--warp-region` forces `fullgraph=0` in all configs, so the break structure is identical
 and the resample is the only variable. Random weights, so ratios only -- no accuracy claim.
 
 | size | px | aten (neuron) | cpu (inductor) | nki (fallback) | **cpu/aten** |
@@ -624,7 +624,7 @@ and the resample is the only variable. Random weights, so ratios only -- no accu
 
 **The CPU advantage is small and VANISHING with size: 0.851 -> 0.924 -> 0.967, converging on
 1.0.** The production tile (576x640, 368,640 px) is 4x the largest rung, so on this trend the host
-arm is at or past parity there. **Running gridsample on CPU is not a lever.**
+config is at or past parity there. **Running gridsample on CPU is not a lever.**
 
 **A single small tile would have produced the OPPOSITE conclusion** -- 128x128 alone says "CPU is
 15% faster" -- which is exactly why the ladder exists. The work MIX is scale-invariant (90.04% of
@@ -667,7 +667,7 @@ the kernel instead of a missing dependency:
 |---|---|
 | `software_dynamic_dma` | ~99% of gpsimd time |
 | `hardware_dynamic_dma` | **0.0 - 0.1%** |
-| ns/descriptor | 44.2 (kernel) vs 40.4 (gather) |
+| ns/descriptor | 44.2 (kernel) vs 40.4 (index_select) |
 | kernel config dump | `batched_indirect_gather=False, M_batch=1` |
 
 `batched_indirect_gather=False` was not only our flag: **the ucode in this image cannot do it.**
@@ -680,7 +680,7 @@ blocking comment; and **both dry-run builds FAIL** (`cayman-inkling/master` and
 `kaena-runtime/ucode`), so there is no artifact to consume.
 
 So the two numbers on record are fallback measurements and must not be quoted as the kernel's
-performance: **op-level 24.06 ms** (vs gather 21.98) and **region-split 6908.5 ms** (vs ATen 98.0
+performance: **op-level 24.06 ms** (vs index_select 21.98) and **region-split 6908.5 ms** (vs ATen 98.0
 at 128x128, i.e. ~493 ms of per-call dispatch once the kernel is not fused).
 
 **Waiting on the ucode reaching the SDK/driver.** The harness is correct and cheap; re-enable with
@@ -700,16 +700,16 @@ to other fused numbers.
 
 `univr-prod-4x8-h64-vggks`, 4x8 halo 64, 8 cores, `--iters 3`, `NEURON_CC_FLAGS="--lnc 1"`:
 
-| arm | median | max_diff | PSNR | NEFFs |
+| config | median | max_diff | PSNR | NEFFs |
 |---|---|---|---|---|
-| gather | **3900.5 ms** (3871.4-3946.7) | 92.56 LSB | 48.74 dB | +7 |
+| index_select | **3900.5 ms** (3871.4-3946.7) | 92.56 LSB | 48.74 dB | +7 |
 | nki-dyn | **3820.4 ms** (3801.4-3836.4) | 92.56 LSB | 48.74 dB | +8 |
 
 Against 3673.3 ms in the README and 4125.5 ms for the same command re-run here. So fusion
 RUNS and sits between them -- not a win yet, not a disaster. Both fail the 3-LSB gate.
 
 **The accuracy is bit-identical across two different resample implementations** -- 92.56 LSB
-and 48.74 dB to every digit, from plain-torch indirect gather and from an NKI indirect-DMA
+and 48.74 dB to every digit, from plain-torch indirect index_select and from an NKI indirect-DMA
 kernel. The fault is in code they SHARE, not in either warp.
 
 **And it is not halo starvation**, which is what dropping halo 128 -> 64 would predict. The
@@ -730,15 +730,15 @@ at 4.4%. The script's own caveat says `dev+d2h` is reliable as a sum and the spl
 indicative, but device work is clearly a small fraction of that wall clock.
 
 **`gridsample` cannot compile FUSED.** OOM-killed at 169 min and again at 94 min at 1500Gi,
-on the same geometry where gather and nki-dyn both compile. Consistent with the
-microbenchmark: it issues 3-205x more DMA descriptors than gather (3.0 pkt/px at C=3 rising
+on the same geometry where index_select and nki-dyn both compile. Consistent with the
+microbenchmark: it issues 3-205x more DMA descriptors than index_select (3.0 pkt/px at C=3 rising
 to 205 at C=128), so its fused graph is far larger.
 
 **Read that as a statement about FUSION, not about gridsample.** `fullgraph=True` is the only
 thing that ever blocked it, and it is not a requirement -- it was chosen so a dynamo break would
 RAISE rather than silently emit a subgraph, because an unguarded break around the
 `view(torch.uint32)` index bitcast corrupts which pixels get sampled. **That bitcast is in the
-NKI warps only** (`warp_nki`, ~line 480); `gridsample`, `gather` and `window` carry none. So
+NKI warps only** (`warp_nki`, ~line 480); `gridsample`, `index_select` and `window` carry none. So
 `--fullgraph 0` is safe for gridsample and is now available, refused for `nki`/`nki-dyn`.
 
 Why this matters: **the resample is the largest device cost** -- 614.2 ms of 973.2 ms
@@ -848,7 +848,7 @@ deterministic compiler verdicts rather than flaky runs.
 
   So 540,672 px was never tested against the ceiling. Its only other verdict is a DMA
   rejection (`in=7,569,408`) earned **with** `--model-type unet-inference`. The job now runs
-  a serial probe first (8 graphs, largest first, shared cache) and gates the 8-core scored arm
+  a serial probe first (8 graphs, largest first, shared cache) and gates the 8-core scored config
   on it, at 1800Gi to match `prod-4x8-halo64`, the only 8-core run that ever completed.
 
 * **A frame needs 8 graphs and each tile compiles exactly ONE.** `run_tiled` picks the pass
@@ -867,7 +867,7 @@ deterministic compiler verdicts rather than flaky runs.
   and the runtime device-profiler emits nothing for async workloads.
 * **`--warp gridsample-nkl`: the NKL GridSample kernel, WIRED, never run.**
   `CR-288764575` (`KaenaNeuronKernelLibrary`, author `ethschan`) -- **OPEN at revision 3, NOT
-  merged**, so it is absent from every released image and the arm raises `SystemExit` on import
+  merged**, so it is absent from every released image and the config raises `SystemExit` on import
   until the package is on `PYTHONPATH`. Source is `@nki.jit grid_sample(value, grid,
   sampling_mode, coord_mode, input_layout, align_corners, padding_mode,
   max_indices_per_indirect, gather_method)` at
@@ -896,20 +896,20 @@ deterministic compiler verdicts rather than flaky runs.
   align_corners=True row is bf16/zeros). C is covered 8-260 **except C=3**, below the smallest
   tested width, and several resample sites here are C=3.
 
-  First test, cheapest first: the microbench arm (`gridsample-nkl` at every C, `NKL=0` disables),
+  First test, cheapest first: the microbench config (`gridsample-nkl` at every C, `NKL=0` disables),
   then one tile -- `--cores 1 --only-tile 9 --halo 128 --warp gridsample-nkl` -- scored against
-  `gather`'s **22.38 LSB** on that exact tile.
+  `index_select`'s **22.38 LSB** on that exact tile.
 
   Architecturally it is the right shape where `shiftwarp` was wrong: shiftwarp approximated a
   warp as a bounded shift-sum and silently clamped past R, which is why it hit 229.72 LSB against
   a measured 29.02 px displacement. A real grid_sample with explicit OOB handling cannot fail
   that way. `GridSampleBwd` is irrelevant here (inference only).
 * **Re-measure the microbenchmark at the fused shapes.** Every existing per-op number --
-  49,278 us for gather, ~38 ns/descriptor, 2.0 packets/pixel -- was taken at 992x1280 under
+  49,278 us for index_select, ~38 ns/descriptor, 2.0 packets/pixel -- was taken at 992x1280 under
   `--model-type unet-inference`. Both are now wrong for the running config: the fused shapes
   are 294k-368k px, and the flag is gone. `microbench-job.yaml` defaults to the four fused
   shapes. **Whether the flag changed single-op numbers is untested** -- it demonstrably
-  changes DMA lowering at whole-graph scale. One arm settles it: `gather` at one shape, flag
+  changes DMA lowering at whole-graph scale. One config settles it: `index_select` at one shape, flag
   on vs flag off, compare descriptor counts. Same means the old numbers stand; different
   means they are void.
 * **`--model-type transformer` / `generic` also fuse.** Untested for correctness or speed.
@@ -936,7 +936,7 @@ deterministic compiler verdicts rather than flaky runs.
 | `METHOD.md` / `REPRO_README.md` | original bundle docs |
 | `microbench.py` | the microbenchmark: 14 resamples + 54 convs, one op per invocation, each scored against a CPU reference |
 | `profile_roofline.py` | reads a `summary.json`, prints per-engine time and MFU |
-| `microbench-job.yaml` | runs it. `SET=warps|convs|both`, now the four 4x8 **halo-128** shapes and `CHANS=3 16 32 64 128`. **Every earlier warp arm ran at C=3 only** -- the cheapest site -- so gridsample was judged on its best case while its descriptor rate climbs to 205 pkt/px at C=128 (`_C=16`, so the resample runs at C=3/16/32/64/128) |
+| `microbench-job.yaml` | runs it. `SET=warps|convs|both`, now the four 4x8 **halo-128** shapes and `CHANS=3 16 32 64 128`. **Every earlier warp config ran at C=3 only** -- the cheapest site -- so gridsample was judged on its best case while its descriptor rate climbs to 205 pkt/px at C=128 (`_C=16`, so the resample runs at C=3/16/32/64/128) |
 | `univr-bench-job.yaml` | **the base every job is generated from.** `/neuron-3run-benchmark`: persistent NEFF cache, 3-run flow, consumer-split archive. Currently `MODE=warpeager` |
 | `full-taps-1core-job.yaml` | **live.** Full 4K frame, 1 core, taps, `fullgraph=1`. The whole-frame accuracy number |
 | `full-taps-1core-fg0-job.yaml` | **live.** Same, `fullgraph=0` -- the A/B on whether graph breaks matter |
@@ -1066,7 +1066,7 @@ localised it to IFBlock's `F.interpolate` calls. Confirmed: baseline's rank-1 NE
 Tile 9 halo 128 (704x768), `gridsample`, `--warp-region eager`, 1 core, warm cache, NO profiler.
 `[L] CLEAN LATENCY` is the number:
 
-| arm | clean median | spread | `dev` | vs baseline | max_diff | PSNR | gate |
+| config | clean median | spread | `dev` | vs baseline | max_diff | PSNR | gate |
 |---|---|---|---|---|---|---|---|
 | baseline | **1313.3 ms** | 1308.0-1323.0 | 1191.1 | -- | 22.45 LSB | 48.46 dB | FAIL |
 | pool-down A | **986.9 ms** | 981.7-1022.3 | 869.2 | 1.33x | 22.17 LSB | 48.77 dB | FAIL |
@@ -1074,7 +1074,7 @@ Tile 9 halo 128 (704x768), `gridsample`, `--warp-region eager`, 1 core, warm cac
 | **taps** | **647.3 ms** | 643.6-**67203** | 526.3 | **2.03x** | **0.05 LSB** | **102.22 dB** | **PASS** |
 
 **THE 22 LSB FAILURE WAS `F.interpolate`'s UPSAMPLE.** Nothing in this file had ever passed the
-3 LSB bar; every arm sat at 22-48 LSB and "why does it fail accuracy" was the live blocking
+3 LSB bar; every config sat at 22-48 LSB and "why does it fail accuracy" was the live blocking
 question. Read the dispatch and it falls out -- `do_up` keeps `F.interpolate` at level 1 and only
 level 2/3 replace it:
 
@@ -1116,10 +1116,10 @@ entire accuracy of the op and computing them in the activation dtype quantises t
 Cached on `(in_sz, f, dtype, device)`. Exact vs `F.interpolate`: 2.4e-07 at 1/2 and 1/4, 4.8e-07
 at x2/x4/x8, 0.0 at 1/3, 1.5e-05 at x2.5.
 
-**It is NOT a verdict on Liran's NKI kernel.** His H pass has no gather at all -- rows become
+**It is NOT a verdict on Liran's NKI kernel.** His H pass has no index_select at all -- rows become
 literal partition offsets with scalar weights (`nisa.tensor_scalar`, `scalar_tensor_tensor`) and
 only the W pass gathers, via `nc_n_gather` on the free axis, channels on partitions in NHWC so
-zero transposes. torch `index_select` on NCHW cannot express that. Our taps arm keeps the
+zero transposes. torch `index_select` on NCHW cannot express that. Our taps config keeps the
 indirection deliberately -- it measures whether CONSTANT indices are enough on their own, which is
 his open question, not his answer.
 
@@ -1127,7 +1127,7 @@ his open question, not his answer.
 
 Run `exp_univr-warpeager_gridsample_t9_h128_sr3_20260819_142240` on `/var/mdl/univr/runs/`.
 Stages `[D]`/`[E]`/`[F]` were **still running** when this was written, so the per-NEFF ranking and
-the NEFF+NTFF pairs for the taps arm are **not yet recorded here** -- fill them in from
+the NEFF+NTFF pairs for the taps config are **not yet recorded here** -- fill them in from
 `ranking_..._sr3.txt` and `perneff_..._sr3.txt`.
 
 | artifact | what it answers |
@@ -1148,7 +1148,7 @@ rebuilding the join by filename stem is where wrong attribution creeps in. Use o
 counterpart in the taps profile. Confirm that from `ranking_..._sr3.txt` rather than assuming it,
 and check whether the remaining SWDGE-heavy entries are the `gridsample` graphs -- in pool-down
 they were 176.6 / 145.7 / 138.7 ms, and after the interpolate fix the SWDGE cost RELOCATES to the
-resample rather than disappearing. That one is harder: `gather` already measures 1.006 desc/px
+resample rather than disappearing. That one is harder: `index_select` already measures 1.006 desc/px
 against a printed floor of 1.0 at 40.4 ns/desc, and the NKL kernel needs unmerged DGE ucode. Do
 not scope an interpolate kernel expecting it to fix the resample.
 
@@ -1194,7 +1194,7 @@ at taps exists**, so the 32-tiles/8-cores arithmetic is unearned. Next, in order
   error. It is a HOST trace counter: unrelated to cores or device memory, and reducing `--cores`
   would only double wall clock. **The config attribute was RENAMED** (`cache_size_limit` ->
   `recompile_limit` on the torch with neuronx-cc 2.27) and assigning the old name is a **silent
-  no-op** -- no raise, no alias -- which cost the 8-core arm of `k2zwh` after 11.5 h of compiles
+  no-op** -- no raise, no alias -- which cost the 8-core config of `k2zwh` after 11.5 h of compiles
   were already paid for. The script now sets every name that exists and VERIFIES the effective
   value at import. Never set a config knob without reading it back.
 * **Names drifted from what the files do**, twice. `warp_op_bench.py` benchmarked warps AND
@@ -1210,8 +1210,8 @@ at taps exists**, so the 32-tiles/8-cores arithmetic is unearned. Next, in order
   `s3-mount-test-pod.yaml` checks a node in 85 s instead of hours.
 * **`--only-tile 1` is not the largest tile.** Tile 10 for 3x9, tile 9 for 4x8. Testing
   tile 1 produced a false "4x8 FUSES" that stood for several runs.
-* **One arm per pod.** Each arm holds its compiled graph, so peak memory is the sum across
-  arms. A 2x8 arm killed the pod that would otherwise have timed 4x8.
+* **One config per pod.** Each config holds its compiled graph, so peak memory is the sum across
+  configs. A 2x8 config killed the pod that would otherwise have timed 4x8.
 * **The image tag lies.** `native-pytorch:...sdk2.31.0...` contains `neuronx-cc 2.26.6360.0`.
   Always use `421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest`.
 * **`--per-block` requires `--compile none`**, so that block table is an EAGER measurement

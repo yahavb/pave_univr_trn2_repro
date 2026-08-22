@@ -146,8 +146,8 @@ _NKL_GS_FN = None
 # Set from --nkl-max-indices / --nkl-gather-method in main(), read by the warp below.
 # max_indices_per_indirect=None DISABLES the kernel's batched indirect gather -- the feature its
 # own description leads with. Measured with batching OFF it reached hardware_dynamic_dma 5.8%
-# (vs gather's 0.10%) at 44.2 ns/descriptor against gather's 40.4, i.e. 9% slower overall despite
-# matching gather's 1.006 desc/px. Raising the hardware-DGE share is the only lever left, so this
+# (vs index_select's 0.10%) at 44.2 ns/descriptor against index_select's 40.4, i.e. 9% slower overall despite
+# matching index_select's 1.006 desc/px. Raising the hardware-DGE share is the only lever left, so this
 # knob must be reachable rather than hardcoded.
 _NKL_MAX_IDX = None
 _NKL_GM = None
@@ -210,14 +210,14 @@ def warp_nki_repo(x, flow):
     through the model's own `warp_nki` host wrapper so index construction cannot drift.
 
     THIS IS THE CONFIG THAT WAS MISSING, and its absence made every earlier comparison misleading.
-    gather is only the argparse default and "the port's form"; it is not the reference and not the
-    fastest. At the model level nki-dyn measured 3820.4 ms against gather's 3900.5, and the
+    index_select is only the argparse default and "the port's form"; it is not the reference and not the
+    fastest. At the model level nki-dyn measured 3820.4 ms against index_select's 3900.5, and the
     README's 3673.3 ms baseline used --warp nki. So the bar for any new resample kernel is
-    nki-dyn, not gather.
+    nki-dyn, not index_select.
 
     NOT to be confused with `nkishift`, which is the DEAD shiftwarp kernel: 1.16x at the op level
     and then 229.72 LSB in the model, because it clamps at R=3 px while measured displacement is
-    29.02 px. This one is accurate -- gather and nki-dyn agreed to every digit in the fused model.
+    29.02 px. This one is accurate -- index_select and nki-dyn agreed to every digit in the fused model.
     """
     import repro_unrolling_trn2 as M
     M._NKI_DYN = _NKI_DYN_SEL
@@ -290,9 +290,9 @@ def _prelu(o):
 #
 # Consequence for the gridsample-vs-NKI question: the headline "3.0 pkt/px at C=3 rising to 205
 # at C=128" is real per call, but C=128 is only ~0.12% of the frame's pixel-warps. Weighted by
-# the actual inventory, gridsample is roughly 3.2x gather in total descriptors, not 100x, and the
+# the actual inventory, gridsample is roughly 3.2x index_select in total descriptors, not 100x, and the
 # dominant site is C=3 at FULL resolution (54.5% of channel-pixels, 6 calls per tile) where
-# gridsample is only 3.0 vs gather's ~2.0. Any claim about the kernel's headroom has to be made
+# gridsample is only 3.0 vs index_select's ~2.0. Any claim about the kernel's headroom has to be made
 # against this table, not against the per-call peak.
 #
 # The 14 sites per tile match the count in STATE.md: 6 full-resolution pyramid warps (3 stages x
@@ -504,7 +504,7 @@ def run_sequence(a):
     """`--op sequence`: the model's WHOLE op sequence for one tile, compiled, timed.
 
     The other ops here measure ONE call in isolation. That answers "how many descriptors does a
-    resample issue" -- and it did: gather 1.006 desc/px at 40.40 ns, gridsample 3.004 at 39.81.
+    resample issue" -- and it did: index_select 1.006 desc/px at 40.40 ns, gridsample 3.004 at 39.81.
     It cannot answer "what does swapping the resample do to the model", because an isolated op has
     no pipelining, no layout reuse, and no overlap with the convs around it; because absolute
     single-io microseconds are noise across runs; and because a swapped resample changes the
@@ -671,7 +671,7 @@ def main():
                     help="machine-readable --list-op-sites: `op:shape` lines for the job.")
     ap.add_argument("--warp-impls", default="index_select",
                     help="comma-separated warp implementations to emit configs for, e.g. "
-                         "gather,gridsample-nkl")
+                         "index_select,gridsample-nkl")
     ap.add_argument("--op-site-class", default="both", choices=("warps", "convs", "both"),
                     help="restrict --list-op-sites/--op-site-specs to one op class.")
     ap.add_argument("--top", type=int, default=0,
@@ -836,8 +836,8 @@ def main():
         print("nkl kernel    imported and wrapped OK (gather_method picked by dtype)")
     # backend="neuron" is only valid ON neuron. A CPU config exists so gridsample can be compared
     # across BACKENDS -- same op, same semantics, three lowerings -- which is the only truly
-    # apples-to-apples comparison available: gather is a different formulation (4-tap indirect
-    # gather), numerically equivalent but not the same code path, and mixing it in is what made
+    # apples-to-apples comparison available: index_select is a different formulation (4-tap indirect
+    # index_select), numerically equivalent but not the same code path, and mixing it in is what made
     # the earlier baseline arbitrary.
     if a.device == "cpu":
         try:
