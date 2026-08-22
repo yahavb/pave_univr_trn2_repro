@@ -1,21 +1,25 @@
-# WBR — UniVR rolling-shutter correction on Trainium: 2.8x faster, and it now passes accuracy
+# WBR — UniVR rolling-shutter correction on Trainium: 7.1x faster, and it now passes accuracy
 
 ## Headline
 
-We made the model **2.8x faster on Trainium and simultaneously fixed a correctness failure that
-had blocked the port for weeks.** Both came from one change: computing memory addresses on the host
-instead of on the device.
+We made the model **7.1x faster on Trainium and simultaneously fixed a correctness failure that
+had blocked the port for weeks.** Two changes did it, and neither works without the other.
 
 | | before | after |
 |---|---|---|
-| latency (one tile) | 1090.0 ms | **387.0 ms** |
-| accuracy vs GPU reference | 22.38 LSB — **FAIL** | **0.06 LSB — PASS** |
-| image quality | 48.45 dB | **102.27 dB** |
+| latency | 758.9 ms | **106.8 ms** |
+| accuracy vs reference | 52.65 LSB — **FAIL** | **0.00 LSB — PASS** |
+| image quality | 44.08 dB | **122.79 dB** |
+| device time | 761.4 ms | **188.7 ms** |
 
-The bar is 3 LSB. Before this change nothing we ran had ever passed it.
+The bar is 3 LSB. Before this work nothing we ran had ever passed it.
 
-Measured on tile 9 of a 4x8 grid, 704x768 pixels, one NeuronCore, fp32, against the same CUDA
-golden frame production uses.
+Measured back-to-back in one job at 288x320, one NeuronCore, fp32, production weights.
+Independently reproduced in a second job to the same 106.8 ms.
+
+**At full production tile size we measure 2.8x**, not 7.1x — because the larger tile can only run
+one of the two changes (see *The compiler constraint*). Both numbers are real; they answer
+different questions.
 
 ## What the model actually does
 
@@ -31,9 +35,9 @@ skewed. The model removes that skew by estimating how each pixel moved and warpi
 
 Steps 3 and 5 both read memory at computed locations. That is where the whole story sits.
 
-## What we changed, and the two choices that mattered
+## What we changed
 
-**Dimension 1 — where addresses get computed. This is the win.**
+**Change 1 — where addresses get computed.**
 
 Step 5's shrink used `F.interpolate`, which derives its read addresses *on the device, at runtime*.
 The hardware then cannot use its fast bulk-transfer path; it falls back to a mode where a helper
@@ -44,19 +48,18 @@ The shrink factor is fixed and known before the model ever runs. So we compute t
 **once on the host** and bake them in as constants. Same arithmetic, same result — verified exact
 to 2.4e-07 — but the compiler now sees a regular pattern instead of a list of addresses.
 
-Evidence, from the hardware profiler:
+Isolating this one change (holding the warp fixed), the profiler shows:
 
 | | before | after |
 |---|---|---|
 | descriptor-issuing instructions | 237,197 | **141,738** (−40%) |
 | cost per instruction | 1209 ns | 1200 ns — **unchanged** |
 | small-transfer packets | 7.50 M | **4.48 M** (−40%) |
-| helper engine vs data-mover | 6.0x — **starved** | **1.0x — resolved** |
 
 The cost per operation did not improve at all. We simply stopped issuing 40% of the operations,
 and the time fell by the same 40%. That 1:1 relationship is the proof the diagnosis was right.
 
-**Dimension 2 — how the warp is written. This decides whether the win is visible.**
+**Change 2 — how the warp is written.**
 
 Step 3 can be expressed two ways, mathematically identical (we measured them equal to 0.003 LSB):
 
@@ -67,12 +70,24 @@ Step 3 can be expressed two ways, mathematically identical (we measured them equ
 hardware's theoretical minimum. That matters because **the address fix is only worth whatever the
 warp leaves on the table:**
 
-| warp | address fix delivers |
-|---|---|
-| `gridsample` | **1.63x** — its own transfers still dominate |
-| `index_select` | **2.8x** — the fix is now the majority of the cost |
+| the change we made | in isolation | with the other change also made |
+|---|---|---|
+| host-computed addresses | 1.6x | **3.9x** |
+| explicit warp | 1.8x | **4.4x** |
 
-Same one-line change, very different payoff. Getting the full 2.8x required both choices together.
+**They multiply: 1.8 x 3.9 = 7.1, against a measured 7.11x.**
+
+That is the central finding. Neither change is worth much alone, because whichever source of
+small transfers you leave behind keeps the data-mover starved. Fix both and the starvation clears:
+
+| share of device time | before | after |
+|---|---|---|
+| helper engine building addresses | **71.1%** | **33.8%** |
+| arithmetic units | **2.4%** | **21.9%** |
+| bulk-pattern transfers | 1.0% | **5.5%** |
+| total device time | 761.4 ms | **188.7 ms** |
+
+The hardware finally spends its time computing instead of preparing to move data.
 
 ## The compiler constraint, stated plainly
 
@@ -115,8 +130,8 @@ transfers — a kernel-level effort, not a flag.
 
 ## Caveats we are carrying
 
-* The 2.8x is **one tile**, not a frame, and the 8-core figure is a projection from a one-core
-  measurement, not a measurement.
+* Both the 7.1x and the 2.8x are **one tile**, not a whole frame, and at different tile sizes.
+  The 8-core figure is a projection from a one-core measurement, not a measurement.
 * Four of our timed runs had a compilation land inside the measurement window. The medians survive
   it and agree across independent runs to under 1%, but our harness now checks for this explicitly.
 * fp32 only. Lower precision was measured at 23 dB — far outside the quality bar — so it is closed.
