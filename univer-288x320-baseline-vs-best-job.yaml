@@ -51,7 +51,7 @@ spec:
                 "ccflags   : ${NEURON_CC_FLAGS:-<unset>}" \
                 > "$RUNDIR/PROVENANCE.txt"
 
-              run_arm() {
+              run_config() {
                 local NAME="$1" WARP="$2" RZ="$3" FG="$4"
                 local O="/tmp/out_${NAME}"
                 rm -rf "$O"; mkdir -p "$O/pairs"
@@ -121,8 +121,8 @@ spec:
                 rm -rf "$TORCH_NEURONX_NEFF_CACHE_DIR"
               }
 
-              run_arm baseline gridsample interpolate  0
-              run_arm best     index_select  precomputed  1
+              run_config baseline gridsample interpolate  0
+              run_config best     index_select  precomputed  1
 
               for A in baseline best; do
                 printf '%-9s %s | %s\n' "$A" \

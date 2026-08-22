@@ -68,9 +68,9 @@ spec:
                 echo "nkilib: no tar at $NKILIB_TGZ"
               fi
               if python3 -c "import nkilib.experimental.indirect.grid_sample" 2>/dev/null; then
-                NKL="${NKL:-1}"; echo "nkilib: IMPORT OK  -> gridsample-nkl arms ENABLED (NKL=$NKL)"
+                NKL="${NKL:-1}"; echo "nkilib: IMPORT OK  -> gridsample-nkl configs ENABLED (NKL=$NKL)"
               else
-                NKL="${NKL:-0}"; echo "nkilib: IMPORT FAILS -> gridsample-nkl arms SKIPPED (NKL=$NKL)"
+                NKL="${NKL:-0}"; echo "nkilib: IMPORT FAILS -> gridsample-nkl configs SKIPPED (NKL=$NKL)"
                 echo "  to enable: tar the package as ONE object and put it on the PVC --"
                 echo "    cd ~/KaenaNeuronKernelLibrary && tar -czf /tmp/nkilib.tar.gz -C src/nkilib_src nkilib"
                 echo "    aws s3 cp /tmp/nkilib.tar.gz s3://621547421844-ap-southeast-4/univr/nkilib.tar.gz"
@@ -125,7 +125,7 @@ spec:
                   done
                   echo ""
                   echo "  Same op, same semantics, three lowerings -- the only variable is the"
-                  echo "  backend. cpu is the golden (it IS the reference every arm is scored"
+                  echo "  backend. cpu is the golden (it IS the reference every config is scored"
                   echo "  against), so its LSB is 0 by construction; its wall time is a sanity"
                   echo "  anchor, not a target. The question is whether NKI beats ATen on neuron."
                   exit 0
@@ -217,7 +217,7 @@ spec:
                     | tr '\n' ' ')
               fi
               echo "SET=$SET  GRID=$GRID  HALO=$HALO  NKL=$NKL  TOP=$TOP  IMPLS=$WARP_IMPLS"
-              echo "arms: $(echo $SPECS | wc -w)"
+              echo "configs: $(echo $SPECS | wc -w)"
               echo ""
 
               FLOW="--flow-smooth --flow-mag 2.33"

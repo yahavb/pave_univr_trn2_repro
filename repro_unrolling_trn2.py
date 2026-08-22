@@ -1262,7 +1262,7 @@ def main():
 
     if a.warp == "gridsample-nkl" and a.device != "neuron":
         ap.error("--warp gridsample-nkl is an NKI kernel and requires --device neuron; use "
-                 "--warp gridsample for the host arm (same op, same semantics)")
+                 "--warp gridsample for the host config (same op, same semantics)")
     if a.warp.startswith("nki"):
 
 

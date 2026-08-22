@@ -209,7 +209,7 @@ def warp_nki_repo(x, flow):
     """The repo's WORKING NKI resample -- `bilinear_2x2_gather_blend` from the model, reached
     through the model's own `warp_nki` host wrapper so index construction cannot drift.
 
-    THIS IS THE ARM THAT WAS MISSING, and its absence made every earlier comparison misleading.
+    THIS IS THE CONFIG THAT WAS MISSING, and its absence made every earlier comparison misleading.
     gather is only the argparse default and "the port's form"; it is not the reference and not the
     fastest. At the model level nki-dyn measured 3820.4 ms against gather's 3900.5, and the
     README's 3673.3 ms baseline used --warp nki. So the bar for any new resample kernel is
@@ -282,7 +282,7 @@ def _prelu(o):
 # =============================================================================================
 # THE REAL RESAMPLE INVENTORY -- what a 4K frame actually warps, and at what shapes
 # =============================================================================================
-# This exists because the synthetic arms were WRONG in the way that matters. They swept
+# This exists because the synthetic configs were WRONG in the way that matters. They swept
 # C=3,16,32,64,128 all at the FULL padded tile shape, but the model never does that: Contextnet
 # is four Conv2(stride=2) levels, so every step DOUBLES the channel count and QUARTERS the area.
 # C=128 runs at ph/16 x pw/16 -- 44x48 = 2,112 px for a 704x768 tile, not 540,672. Benchmarking
@@ -376,13 +376,13 @@ def op_sites(grid="4x8", halo=128, warps=("index_select",)):
 
 
 def print_op_sites(grid="4x8", halo=128, warps=("index_select",), top=0, specs_only=False, only="both"):
-    """The arm list, derived. With specs_only emit `op:shape` lines the job consumes directly."""
+    """The config list, derived. With specs_only emit `op:shape` lines the job consumes directly."""
     rows = op_sites(grid, halo, warps)
     if only != "both":
         want = "warp" if only == "warps" else "conv"
         rows = [r for r in rows if r[0] == want]
-    # Coverage is per DIMENSION, not per arm: measuring one dim with two implementations is two
-    # arms but ONE unit of the model's work, so summing arm weights would report 200% coverage.
+    # Coverage is per DIMENSION, not per config: measuring one dim with two implementations is two
+    # configs but ONE unit of the model's work, so summing config weights would report 200% coverage.
     dim_w = {}
     for cls, _o, _shape, _k, wt, unit in rows:
         dim_w[(cls, unit)] = wt
@@ -418,13 +418,13 @@ def print_op_sites(grid="4x8", halo=128, warps=("index_select",), top=0, specs_o
             print("  ^ %d of %d %s DIMS measured -- %.1f%% of %s weight NOT measured"
                   % (len(seen), ndim, cls, 100.0 - cum, cls))
     print()
-    print("arms selected: %d of %d" % (len(keep), len(rows)))
+    print("configs selected: %d of %d" % (len(keep), len(rows)))
     return 0
 
 
 def print_warp_sites(grid="4x8", halo=128, specs_only=False):
     """The frame-wide inventory. With specs_only, emit `C,H,W:calls_per_frame` for the job to
-    consume, deduplicated across shapes, so the arm list is derived rather than hand-written."""
+    consume, deduplicated across shapes, so the config list is derived rather than hand-written."""
     shapes = tile_shapes(grid, halo)
     weight = {}
     for ph, pw, ntiles in shapes:
@@ -509,7 +509,7 @@ def run_sequence(a):
     no pipelining, no layout reuse, and no overlap with the convs around it; because absolute
     single-io microseconds are noise across runs; and because a swapped resample changes the
     LAYOUT its neighbours see -- the NKL kernel asserts NHWC while the model is NCHW, so it adds
-    two permutes per call that no single-op arm measures.
+    two permutes per call that no single-op config measures.
 
     So this runs the real sequence: IFNet's three pyramid stages with their six full-resolution
     warps, Contextnet's four levels x {img0, img1}, and the Unet -- 14 warps and 54 convs -- as
@@ -662,24 +662,24 @@ def main():
                     help="print the resample inventory a 4K frame actually performs: the real "
                          "(C,H,W) of every warp call across all four padded tile shapes, weighted "
                          "by call count and tile multiplicity. Read this BEFORE trusting any warp "
-                         "arm -- the Contextnet levels halve resolution as they double channels, "
-                         "so C=128 lives at ph/16 and a C=128 arm at full tile size is fiction.")
+                         "config -- the Contextnet levels halve resolution as they double channels, "
+                         "so C=128 lives at ph/16 and a C=128 config at full tile size is fiction.")
     ap.add_argument("--list-op-sites", action="store_true",
                     help="EVERY op the model runs (warps AND convs) at the dims it runs them, "
                          "weight-ordered with cumulative coverage. Nothing synthetic.")
     ap.add_argument("--op-site-specs", action="store_true",
                     help="machine-readable --list-op-sites: `op:shape` lines for the job.")
     ap.add_argument("--warp-impls", default="index_select",
-                    help="comma-separated warp implementations to emit arms for, e.g. "
+                    help="comma-separated warp implementations to emit configs for, e.g. "
                          "gather,gridsample-nkl")
     ap.add_argument("--op-site-class", default="both", choices=("warps", "convs", "both"),
                     help="restrict --list-op-sites/--op-site-specs to one op class.")
     ap.add_argument("--top", type=int, default=0,
-                    help="keep only the top N arms per class by weight (0 = all). A truncated run "
+                    help="keep only the top N configs per class by weight (0 = all). A truncated run "
                          "PRINTS what it left out -- never a silent cap.")
     ap.add_argument("--warp-site-specs", action="store_true",
                     help="machine-readable form of --list-warp-sites: `C,H,W:calls_per_frame`, "
-                         "deduplicated. The job builds its arm list from this.")
+                         "deduplicated. The job builds its config list from this.")
     ap.add_argument("--fused-shapes", action="store_true")
     ap.add_argument("--device", default="neuron")
     ap.add_argument("--flow-mag", type=float, default=8.0)
@@ -695,7 +695,7 @@ def main():
                     help="--op sequence: the resample implementation inside the sequence")
     ap.add_argument("--iters", type=int, default=5,
                     help="timed iterations after the compile/warmup call, for both the single-op "
-                         "arms and --op sequence")
+                         "configs and --op sequence")
     ap.add_argument("--fullgraph", type=int, choices=(0, 1), default=1)
     ap.add_argument("--gamma", type=float, default=0.98)
     ap.add_argument("--seed", type=int, default=0,
@@ -834,7 +834,7 @@ def main():
                 "Put nkilib on PYTHONPATH; the job can restore it from a single tar object on "
                 "the PVC." % e)
         print("nkl kernel    imported and wrapped OK (gather_method picked by dtype)")
-    # backend="neuron" is only valid ON neuron. A CPU arm exists so gridsample can be compared
+    # backend="neuron" is only valid ON neuron. A CPU config exists so gridsample can be compared
     # across BACKENDS -- same op, same semantics, three lowerings -- which is the only truly
     # apples-to-apples comparison available: gather is a different formulation (4-tap indirect
     # gather), numerically equivalent but not the same code path, and mixing it in is what made
@@ -851,7 +851,7 @@ def main():
         print("torch.compile fullgraph=True")
 
     # WARM WALL-CLOCK MEDIAN. This path previously ran the op exactly ONCE and never timed it --
-    # every latency number came from the neuron-only profiler (total_active_time), so a CPU arm
+    # every latency number came from the neuron-only profiler (total_active_time), so a CPU config
     # would have produced no number at all and the three-backend comparison was impossible.
     # The first call compiles, so it is discarded; the median of the rest is the comparable figure.
     import time as _time
