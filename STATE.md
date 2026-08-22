@@ -110,6 +110,49 @@ stamps live in the ingested parquet. Run `analyze-job.yaml` with
   returned two lines for nine hours of work. Let the compile phase stream to stdout -- for an
   OOM-prone run it is the ONLY observability, precisely because the trap cannot fire.
 
+### MEASURED 2026-08-22: gridsample DOES compile at 288x320, and the resize fix wins far less there
+
+`univer-gridsample-hotspots-small-scqrt`, `--tiles 1x1 --height 288 --width 320`, gridsample IN the
+graph, `fullgraph=0`, real weights, `--gate` (no CUDA golden exists at reduced resolution).
+
+| resize | latency | max_diff | PSNR | gpsimd | DMA engine | ratio |
+|---|---|---|---|---|---|---|
+| interpolate | 759.0 ms | 52.65 LSB | 44.08 dB | 71.1% | 11.6% | **6.1x** |
+| precomputed | **466.0 ms** | **0.00 LSB** | **121.91 dB** | 66.8% | 11.9% | **5.6x** |
+
+**1.63x, not 2.8x -- and the starvation is NOT cleared.** All dominant NEFFs stay `SWDGE-heavy` at
+gpsimd 72-75%, and `diagnose_neff.py` fires `DESCRIPTOR-ISSUE BOUND on GPSIMD` on BOTH arms.
+
+Why the same fix pays 1.63x here and 2.82x at the production tile: **the resize is only worth what
+the warp leaves on the table.**
+
+| | warp descriptor rate | resize saved | share of total |
+|---|---|---|---|
+| gridsample @ 288x320 | 3.0-205 pkt/px | 293 ms of 759 | 38.6% |
+| index_select @ tile 9 | 1.006 desc/px (the floor) | 706 ms of 1090 | 64.8% |
+
+gridsample's own descriptors swamp the graph, so removing `F.interpolate`'s is a smaller fraction.
+**The 3x only manifests once the warp is at the descriptor floor** -- i.e. with `index_select`.
+
+A/B on the dominant NEFF of each arm (`--before rank01_65233172 --after rank01_2bff75b9`):
+
+| | before | after |
+|---|---|---|
+| `total_time` | 380.7 ms | 235.3 ms (-38.2%) |
+| `gpsimd_engine_instruction_count` | 237,197 @ 1209 ns | **141,738 @ 1200 ns** (-40%) |
+| `software_dynamic` packets | 7,502,256 @ 21 B | 4,475,408 @ 31 B (-40.3%) |
+
+**`gpsimd_engine_instruction_count` is the cleanest single metric for this fix**: it falls 40% while
+ns/instruction is FLAT at ~1200, so the saving is purely count. Time (-38.2%) tracks descriptor
+count (-40.3%) essentially 1:1 -- in this graph, time IS descriptor count.
+
+**Tooling note.** `diagnose_neff.py --before/--after` prints the same five verdict labels for both
+arms and looks like boilerplate. It is not: the labels collide because both arms land in the same
+threshold bands, and the A/B code path COMPUTES the per-verdict evidence and then discards it
+(`for sev, label, ev, fix in classify(mb)` prints only `sev` and `label`, dropping `ev`). Tier 1
+prints that evidence. Until the skill is patched, re-run tier 1 on each pair separately to see the
+numbers, or the verdicts are unverifiable by eye.
+
 ### Off-cube: `--warp-region eager` is a FOURTH thing, not fullgraph=0
 
 | resize | warp | latency | max_diff | PSNR |

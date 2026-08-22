@@ -75,7 +75,7 @@ spec:
 
                 set +e
                 python -u repro_unrolling_trn2.py $BASE --iters 0 2>&1 \
-                  | tee "$R/halo${H}_compile.log" >/dev/null
+                  | tee "$R/halo${H}_compile.log"
                 set -e
                 for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
                 sleep 5
