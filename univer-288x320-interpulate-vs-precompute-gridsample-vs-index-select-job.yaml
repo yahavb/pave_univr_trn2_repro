@@ -1,14 +1,14 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: univer-288x320-baseline-vs-best
+  name: univer-288x320-interp-vs-precomp-grid-vs-idxsel
   namespace: default
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
-        app: univer-288x320-baseline-vs-best
+        app: univer-288x320-interp-vs-precomp-grid-vs-idxsel
     spec:
       restartPolicy: Never
       nodeSelector:
@@ -33,7 +33,7 @@ spec:
               TS=$(date -u +%Y%m%d_%H%M%S)
               H="${HEIGHT:-288}"; W="${WIDTH:-320}"
               ITERS="${ITERS:-5}"
-              RUN="exp_univer-288x320-baseline-vs-best_${TS}"
+              RUN="exp_univer-288x320-interpulate-vs-precompute-gridsample-vs-index-select_${TS}"
               RUNDIR="/var/mdl/univr/runs/$RUN"
               mkdir -p "$RUNDIR"
 
