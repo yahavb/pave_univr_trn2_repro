@@ -1,6 +1,6 @@
 # Session state
 
-HEAD `83ccc70`, `main`, pushed. Local `~/pave_univr_trn2_repro`.
+HEAD `22b2fe6`, `main`, pushed. Local `~/pave_univr_trn2_repro`.
 Origin repo for reference only: `~/pave-unrolling`.
 
 ## THE EXPERIMENT MATRIX (2026-08-21) -- three dimensions, measured
@@ -20,38 +20,95 @@ Three independent switches. They were confounded for most of this project; they 
 
 | # | resize | warp | fullgraph | latency | max_diff | PSNR | gate |
 |---|---|---|---|---|---|---|---|
-| 1 | interpolate | gridsample | 0 | not run | | | |
-| 2 | precomputed | gridsample | 0 | not run | | | |
+| 1 | interpolate | gridsample | 0 | **OOMKilled 9 h** | | | |
+| 2 | precomputed | gridsample | 0 | never reached | | | |
 | 3 | interpolate | index_select | 0 | 1102.6 ms | 22.38 LSB | 48.45 dB | FAIL |
 | 4 | precomputed | index_select | 0 | **393.8 ms** | **0.06 LSB** | **102.27 dB** | **PASS** |
-| 5 | interpolate | gridsample | 1 | **OOMKilled** | | | |
+| 5 | interpolate | gridsample | 1 | **OOMKilled 10 h** | | | |
 | 6 | precomputed | gridsample | 1 | never reached | | | |
 | 7 | interpolate | index_select | 1 | 1090.0 ms | 22.38 LSB | 48.45 dB | FAIL |
-| 8 | precomputed | index_select | 1 | **384.0 ms** | **0.06 LSB** | **102.27 dB** | **PASS** |
+| 8 | precomputed | index_select | 1 | **387.0 ms** | **0.06 LSB** | **102.27 dB** | **PASS** |
 
-Provenance: cells 3/4 = `univr-taps-ab-fg0-idxsel-nznz6`; cells 7/8 = `univr-taps-ab-fg1-bfxdr`;
-cells 5/6 = `univr-taps-ab-fg1-gridsample-l4q85`, **OOMKilled after 10 h at 1800Gi, still inside
-the FIRST arm's compile** -- it never printed `forward complete`. That reproduces the prediction in
-`repro_unrolling_trn2.py`'s own `--fullgraph` help (OOM at 169 min, 94 min at 1500Gi) at larger
-memory and longer runtime.
+Provenance: 3/4 `univr-taps-ab-fg0-idxsel-nznz6`; 7/8 `univr-taps-ab-fg1-bfxdr` (384.0 ms) and
+`univer-precomputed-index-select-fullgraph-qm26g` (387.0 ms, the profiled re-run -- agree to 0.8%);
+5/6 `univr-taps-ab-fg1-gridsample-l4q85`; 1/2 `univer-interpolate-gridsample-xg9r6`. Both gridsample
+pods died **inside the FIRST arm's compile at 1800Gi**, never printing `forward complete`, so cells
+2 and 6 were never reached.
 
-### The three factor effects, each now unconfounded
+### MEASURED: gridsample cannot be COMPILED at this tile size, at either fullgraph setting
+
+Cells 1 and 5 are the same verdict at both fullgraph values. `--fullgraph 0` does NOT rescue it:
+breaks fall where dynamo puts them, and the segments are still large enough to exhaust 1800Gi.
+
+**This corrects `repro_unrolling_trn2.py`'s own `--fullgraph` help**, which claims `0` "is what
+makes `--warp gridsample` usable". It is not. The only configuration in which gridsample ever ran is
+`--warp-region eager`, where `torch._dynamo.disable` keeps it OUT of the graph. So the eager region
+is not merely a profiling convenience -- **it is load-bearing, and the only way gridsample runs at
+all.** Fix that help text.
+
+Consequence: **there is no in-graph gridsample baseline and there never can be one.** Any
+before/after story must either hold the warp fixed (cell 7 -> 8) or accept the off-cube eager row.
+
+### The three factor effects
 
 * **resize is the whole story: ~2.8x AND the accuracy fix.** 1102.6 -> 393.8 (2.80x) at
-  fullgraph=0, 1090.0 -> 384.0 (2.84x) at fullgraph=1. Replicated, and `max_diff` 22.38 -> 0.06 LSB
+  fullgraph=0, 1090.0 -> 387.0 (2.82x) at fullgraph=1. Replicated, and `max_diff` 22.38 -> 0.06 LSB
   both times. Accuracy is bit-identical across all four measured cells, as expected -- neither the
   warp nor fullgraph touches the resize math.
-* **fullgraph is worth 1-3%.** 3 vs 7 = 1.1%; 4 vs 8 = 2.5%. fullgraph=1 wins, but it is not the
+* **fullgraph is worth 1-3%.** 3 vs 7 = 1.1%; 4 vs 8 = 1.7%. fullgraph=1 wins, but it is not the
   lever. **This retires the earlier impression from `654.8 -> 384.0`, which moved two factors at
   once** (fullgraph AND warp) and made fusion look like a 1.7x win.
-* **warp: unmeasurable at fullgraph=1, and that IS the verdict.** Fused gridsample does not
-  compile. A config that cannot fuse cannot scale to 32 tiles, whatever its per-tile number.
+* **warp: unmeasurable in-graph at either fullgraph, and that IS the verdict.** gridsample does not
+  compile. A config that cannot compile cannot scale to 32 tiles, whatever its per-tile number.
 
-**Cells 1-2 are not worth running.** They only pay if gridsample could win, and it cannot: it has
-to beat 384 ms, its closest datapoint is 654.8 ms, it issues 3.0-205 packets/px against
-index_select's 1.006 (the measured floor), and it cannot fuse.
+**WINNER: cell 8** -- `--resize precomputed --warp gather --fullgraph 1`, 387.0 ms / 0.06 LSB PASS.
 
-**WINNER: cell 8** -- `--resize precomputed --warp gather --fullgraph 1`.
+**The defensible improvement number is 2.8x** (cell 7 -> 8: one variable, same warp, same
+fullgraph, both gated). 1333.9 -> 387.0 = 3.4x is the end-to-end journey but moves three factors
+including the graph structure -- quote it as history, not as a measurement.
+
+### PROFILED at cell 8 (`univer-precomputed-index-select-fullgraph-qm26g`)
+
+NEFF `5b98e62ae7189a`, **306.5 ms** of the 387.0 ms wall, `MFU 0.563%` of a 37.1% ceiling.
+
+**The descriptor-starvation regime is GONE.** `diagnose_neff.py` does NOT fire
+`DESCRIPTOR-ISSUE BOUND`, because that test needs the busiest engine at >2x the DMA engine:
+
+| | before `009cee17` | cell 8 `5b98e62a` |
+|---|---|---|
+| gpsimd active | 67% | 48.8% |
+| DMA engine active | **11%** | **48.9%** |
+| ratio | **6.0x -- starved** | **1.0x -- not starved** |
+
+`rank_neffs.py` still labels it `SWDGE-heavy`; that label keys off dynamic-vs-static share, NOT the
+starvation ratio, so it reads as "unchanged" when the regime has in fact changed. Do not diagnose
+from the class name.
+
+What owns the time now:
+
+1. **`[HIGH]` PAYLOAD BELOW DMA SATURATION on `software_dynamic`** -- 26.1% of DMA time,
+   **3,774,832 packets at 154 B**, against a 2048 B floor: 13x short. (Before: 5,151,200 at 29 B.
+   Packets down 1.4x, payload up 5.3x, still short.) The whole-NEFF average of 43,896 B/transfer
+   HIDES this. This is the `index_select` warp, whose addresses come from `flow` at runtime and can
+   never be precomputed. **The fix is coalescing, not making addresses static.**
+2. **`[MED]` TRANSPOSE-HEAVY 13.5%** (`transpose_flops` 21.09G / `hardware_flops` 156.7G). Suspects
+   are the two permutes in `warp_gather`: `.permute(0,2,1)` building `src` and `.permute(0,3,1,2)`
+   in `tap()`.
+3. **`[MED]` SPILLING 14.6%** of SBUF traffic (5.3 GB). Their notes say spill is LINEAR in area with
+   no cliff, so this does not argue for smaller tiles.
+
+Tier-2 source attribution is NOT in these artifacts -- `grep -c 'src=' hotspots_*.txt` is 0, the
+stamps live in the ingested parquet. Run `analyze-job.yaml` with
+`RUN=exp_univer-precomputed-index_select-fullgraph_t9_20260821_215513`.
+
+### Two harness defects found by these runs
+
+* **`trap ... EXIT` does not survive OOMKilled.** That is SIGKILL; traps do not fire, so no run
+  folder and no logs. Both gridsample pods left nothing.
+* **Suppressing the compile phase blinded a 9 h run.** `... 2>&1 | tee "$R/compile.log" >/dev/null`
+  in the `univer-*` jobs sent everything to a file that died with the container. `kubectl logs`
+  returned two lines for nine hours of work. Let the compile phase stream to stdout -- for an
+  OOM-prone run it is the ONLY observability, precisely because the trap cannot fire.
 
 ### Off-cube: `--warp-region eager` is a FOURTH thing, not fullgraph=0
 

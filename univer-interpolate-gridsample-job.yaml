@@ -77,7 +77,7 @@ spec:
                 > "$R/PROVENANCE.txt"
 
               set +e
-              python -u repro_unrolling_trn2.py $BASE --iters 0 2>&1 | tee "$R/compile.log" >/dev/null
+              python -u repro_unrolling_trn2.py $BASE --iters 0 2>&1 | tee "$R/compile.log"
               set -e
               for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
               sleep 5
@@ -98,7 +98,7 @@ spec:
               NEURON_RT_INSPECT_SYSTEM_PROFILE=1 \
               NEURON_RT_INSPECT_DEVICE_PROFILE=1 \
               NEURON_RT_INSPECT_OUTPUT_DIR="$SYSTRACE" \
-              python -u repro_unrolling_trn2.py $BASE --iters 1 2>&1 | tee "$R/profiled.log" >/dev/null
+              python -u repro_unrolling_trn2.py $BASE --iters 1 2>&1 | tee "$R/profiled.log"
               set -e
               for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
               sleep 5
