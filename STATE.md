@@ -1,6 +1,6 @@
 # Session state
 
-HEAD `22b2fe6`, `main`, pushed. Local `~/pave_univr_trn2_repro`.
+HEAD `67f5caf`, `main`, pushed. Local `~/pave_univr_trn2_repro`.
 Origin repo for reference only: `~/pave-unrolling`.
 
 ## THE EXPERIMENT MATRIX (2026-08-21) -- three dimensions, measured
@@ -109,6 +109,57 @@ stamps live in the ingested parquet. Run `analyze-job.yaml` with
   in the `univer-*` jobs sent everything to a file that died with the container. `kubectl logs`
   returned two lines for nine hours of work. Let the compile phase stream to stdout -- for an
   OOM-prone run it is the ONLY observability, precisely because the trap cannot fire.
+
+### MEASURED 2026-08-22: the FULL 2x2 at 288x320 -- baseline to best is 7.11x, and the two fixes MULTIPLY
+
+`univer-matrix-288x320-g9dhd`, all four configs in one pod: `--tiles 1x1 --height 288 --width 320`,
+`fullgraph=0` throughout, 1 core, fp32, real weights, `--gate` against the stock CPU fp32 reference.
+
+| resize | warp | latency | max_diff | timed median clean? |
+|---|---|---|---|---|
+| interpolate | gridsample | **759.0 ms** | 52.65 LSB | yes, `+0`, spread 0.6 ms |
+| precomputed | gridsample | 466.0 ms | **0.00 LSB** | no, `+1`, max 479994.9 |
+| interpolate | index_select | 412.0 ms | 52.65 LSB | yes, `+0`, spread 0.6 ms |
+| precomputed | index_select | **106.8 ms** | **0.00 LSB** | no, `+1`, max 100342.6 |
+
+**Baseline to best: 759.0 -> 106.8 ms = 7.11x**, and accuracy 52.65 -> 0.00 LSB.
+
+Single-factor effects, each holding the other fixed:
+
+| effect | with the cheap partner | with the expensive partner |
+|---|---|---|
+| resize (interpolate -> precomputed) | **3.86x** (index_select) | 1.63x (gridsample) |
+| warp (gridsample -> index_select) | **4.36x** (precomputed) | 1.84x (interpolate) |
+
+**They multiply, cleanly: 1.84 x 3.86 = 7.10 and 1.63 x 4.36 = 7.11, against a measured 7.11x.**
+That is the whole story of this project in one line -- neither fix is worth much alone, because
+whichever descriptor source you leave behind keeps the DMA engine starved. Fix both and the
+starvation clears.
+
+It also explains why the production-tile number is only 2.82x: that comparison holds the warp at
+`index_select` and moves only the resize, so it measures 3.86x-in-kind at a larger tile. The 7.11x
+requires moving both, which is impossible at the production tile because gridsample does not
+compile there.
+
+Profile of the best config (`65e530de56ef67`, 76.2 ms, the dominant NEFF):
+
+| | baseline (interpolate+gridsample) | best (precomputed+index_select) |
+|---|---|---|
+| gpsimd, model-level | 71.1% | **34.6%** |
+| tensor, model-level | 2.4% | **20.1%** |
+| `sw_dyn_dma` | 10.2% | 8.0% |
+| `static_dma` | 1.0% | 5.7% |
+
+**On the dominant NEFF, tensor (45.2%) finally overtakes gpsimd (41.3%)** -- the first config in this
+project where compute leads instead of descriptor issue. All three heavy NEFFs are still classed
+`SWDGE-heavy`, so the remaining cost is the warp's irreducible runtime-address reads, but the
+regime has flipped.
+
+**Harness bug this run exposed: exit 141 = SIGPIPE.** All four configs completed and published, then
+the job died on its own last line, `ls -R "$RUNDIR" | head -40`: `head` closes the pipe, `ls -R`
+takes SIGPIPE, and `set -o pipefail` plus `set -e` turns that into a failed job. Replaced with
+`find "$RUNDIR" -maxdepth 3 | sort`. A `| head` on LARGE output under `pipefail` is a job-killer;
+inside `$(...)` on short output it is harmless, which is why earlier jobs survived the same idiom.
 
 ### MEASURED 2026-08-22: gridsample DOES compile at 288x320, and the resize fix wins far less there
 

@@ -129,7 +129,7 @@ spec:
                   "$(grep -aoE 'steady state: median [0-9.]+ ms' "$RUNDIR/$A/clean.log" 2>/dev/null | tail -1)" \
                   "$(grep -aoE 'max_diff +[0-9.eE+-]+ +\([0-9.]+ LSB\)' "$RUNDIR/$A/clean.log" 2>/dev/null | tail -1)"
               done
-              ls -R "$RUNDIR" | head -40
+              find "$RUNDIR" -maxdepth 3 | sort
           resources:
             claims:
               - name: neurons
