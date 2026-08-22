@@ -1,0 +1,189 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: univer-288x320-baseline-vs-best
+  namespace: default
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: univer-288x320-baseline-vs-best
+    spec:
+      restartPolicy: Never
+      nodeSelector:
+        node-type: trn3-dev1
+      resourceClaims:
+        - name: neurons
+          resourceClaimTemplateName: s-lnc1
+      containers:
+        - name: bench
+          image: 421672808698.dkr.ecr.us-east-1.amazonaws.com/concourse-release-0461d3b:latest
+          imagePullPolicy: IfNotPresent
+          command:
+            - /bin/bash
+            - "-ec"
+            - |
+              set -euo pipefail
+
+              cd /tmp
+              git clone -b "${BRANCH:-main}" https://yahavb:${GITHUB_TOKEN}@github.com/yahavb/pave_univr_trn2_repro.git REPRO
+              cd REPRO
+
+              TS=$(date -u +%Y%m%d_%H%M%S)
+              H="${HEIGHT:-288}"; W="${WIDTH:-320}"
+              ITERS="${ITERS:-5}"
+              RUN="exp_univer-288x320-baseline-vs-best_${TS}"
+              RUNDIR="/var/mdl/univr/runs/$RUN"
+              mkdir -p "$RUNDIR"
+
+              PROF=neuron-explorer
+              command -v "$PROF" >/dev/null 2>&1 || PROF=neuron-profile
+
+              printf '%s\n' \
+                "run       : $RUN" \
+                "provenance: $(git rev-parse --abbrev-ref HEAD)@$(git rev-parse HEAD)" \
+                "resolution: ${W}x${H}, --tiles 1x1, no halo, 1 core, fp32, real weights" \
+                "baseline  : resize=interpolate  warp=gridsample     fullgraph=0" \
+                "best      : resize=precomputed  warp=index_select   fullgraph=1" \
+                "note      : the script's flag for index_select is spelled --warp gather; the op is index_select, NOT a collective gather" \
+                "why 288x320: gridsample does not compile in-graph at the production tile (OOMKilled twice at 1800Gi), so this is the largest size where BOTH configs run and the profiles are comparable" \
+                "cc        : $(neuronx-cc --version 2>&1 | head -1 | awk '{print $NF}')" \
+                "ccflags   : ${NEURON_CC_FLAGS:-<unset>}" \
+                > "$RUNDIR/PROVENANCE.txt"
+
+              run_arm() {
+                local NAME="$1" WARP="$2" RZ="$3" FG="$4"
+                local O="/tmp/out_${NAME}"
+                rm -rf "$O"; mkdir -p "$O/pairs"
+                export TORCH_NEURONX_NEFF_CACHE_DIR="/tmp/nc_${NAME}"
+                rm -rf "$TORCH_NEURONX_NEFF_CACHE_DIR"; mkdir -p "$TORCH_NEURONX_NEFF_CACHE_DIR"
+
+                local BASE="--rs0 rs70.png --rs1 rs71.png --rs2 rs72.png
+                            --height $H --width $W --tiles 1x1 --weights pre_net_flow.pth
+                            --bar 3 --dtype fp32 --device neuron --cores 1
+                            --warp $WARP --fullgraph $FG --resize $RZ --gate"
+
+                printf '\n================ %s : resize=%s warp=%s fullgraph=%s ================\n' \
+                  "$NAME" "$RZ" "$WARP" "$FG"
+
+                set +e
+                python -u repro_unrolling_trn2.py $BASE --iters 0 2>&1 | tee "$O/compile.log"
+                local rc=${PIPESTATUS[0]}
+                set -e
+                printf '%s compile rc=%d\n' "$NAME" "$rc"
+                for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                sleep 5
+
+                if [ "$rc" = "0" ]; then
+                  local B0 A0
+                  B0=$(find "$TORCH_NEURONX_NEFF_CACHE_DIR" -name '*.neff' | wc -l)
+                  set +e
+                  python -u repro_unrolling_trn2.py $BASE --iters "$ITERS" \
+                      --save-ref "$O/frame_${NAME}.npy" 2>&1 | tee "$O/clean.log"
+                  set -e
+                  A0=$(find "$TORCH_NEURONX_NEFF_CACHE_DIR" -name '*.neff' | wc -l)
+                  printf '%s NEFFs %d -> %d during timed run (must be +0)\n' "$NAME" "$B0" "$A0"
+                  for i in $(seq 1 90); do pgrep -f repro_unrolling_trn2.py >/dev/null || break; sleep 2; done
+                  sleep 5
+
+                  local POUT="/tmp/perneff_${NAME}"
+                  rm -rf "$POUT"; mkdir -p "$POUT"
+                  mapfile -t NEFFS < <(find "$TORCH_NEURONX_NEFF_CACHE_DIR" -name '*.neff' | sort)
+                  local OK=0 neff hash
+                  for neff in "${NEFFS[@]}"; do
+                    hash=$(basename "$neff" .neff)
+                    timeout 900 "$PROF" capture --single-io -n "$neff" -s "$POUT/${hash}.ntff" \
+                      2>&1 | tee "$POUT/capture_${hash}.log" | tail -3
+                    [ -f "$POUT/${hash}.ntff" ] || continue
+                    timeout 300 "$PROF" view -n "$neff" -s "$POUT/${hash}.ntff" \
+                      --output-format summary-json > "$POUT/${hash}.json" 2>"$POUT/view_${hash}.log" || true
+                    [ -s "$POUT/${hash}.json" ] && OK=$((OK+1))
+                  done
+                  printf '%s captured+viewed OK: %d / %d\n' "$NAME" "$OK" "${#NEFFS[@]}"
+                  cp "$POUT"/*.log "$O/" 2>/dev/null || true
+                  python3 scripts/neuron/profile_all_neffs.py "$POUT" 2>&1 | tee "$O/perneff_breakdown.txt" || true
+                  python3 scripts/neuron/rank_neffs.py "$POUT" 2>&1 | tee "$O/neff_ranking.txt" || true
+
+                  local j=0 src_neff d
+                  for hash in $(python3 scripts/neuron/top_neffs.py "$POUT" 3 2>/dev/null || true); do
+                    j=$((j+1))
+                    src_neff=$(find "$TORCH_NEURONX_NEFF_CACHE_DIR" -name "${hash}.neff" | head -1)
+                    [ -n "$src_neff" ] && [ -f "$POUT/${hash}.ntff" ] || continue
+                    d="$O/pairs/$(printf 'rank%02d' $j)_${hash:0:8}"
+                    mkdir -p "$d"
+                    cp "$src_neff" "$d/" && cp "$POUT/${hash}.ntff" "$d/"
+                    [ -f "$POUT/${hash}.json" ] && cp "$POUT/${hash}.json" "$d/summary.json"
+                  done
+                fi
+
+                mkdir -p "$RUNDIR/$NAME"
+                cp -r "$O"/. "$RUNDIR/$NAME"/ 2>/dev/null || true
+                rm -rf "$TORCH_NEURONX_NEFF_CACHE_DIR"
+              }
+
+              run_arm baseline gridsample interpolate  0
+              run_arm best     gather     precomputed  1
+
+              for A in baseline best; do
+                printf '%-9s %s | %s\n' "$A" \
+                  "$(grep -aoE 'steady state: median [0-9.]+ ms' "$RUNDIR/$A/clean.log" 2>/dev/null | tail -1)" \
+                  "$(grep -aoE 'max_diff +[0-9.eE+-]+ +\([0-9.]+ LSB\)' "$RUNDIR/$A/clean.log" 2>/dev/null | tail -1)"
+              done
+              ls -R "$RUNDIR" | head -40
+          resources:
+            claims:
+              - name: neurons
+            requests:
+              cpu: 48
+              memory: 248Gi
+            limits:
+              cpu: 150
+              memory: 1800Gi
+          volumeMounts:
+            - name: dshm
+              mountPath: /dev/shm
+            - name: 621547421844-ap-southeast-4-pvc
+              mountPath: /var/mdl
+          env:
+            - name: PYTHONUNBUFFERED
+              value: "1"
+            - name: BRANCH
+              value: "main"
+            - name: HEIGHT
+              value: "288"
+            - name: WIDTH
+              value: "320"
+            - name: ITERS
+              value: "5"
+            - name: NEURON_LOGICAL_NC_CONFIG
+              value: "1"
+            - name: NEURON_RT_NUM_CORES
+              value: "8"
+            - name: NEURON_RT_VISIBLE_CORES
+              value: "0-7"
+            - name: NEURON_CC_FLAGS
+              value: "--lnc 1"
+            - name: XLA_IR_DEBUG
+              value: "1"
+            - name: XLA_HLO_DEBUG
+              value: "1"
+            - name: OMP_NUM_THREADS
+              value: "8"
+            - name: NEURON_RT_LOG_LEVEL
+              value: "ERROR"
+            - name: NEURON_CC_LOG_LEVEL
+              value: "ERROR"
+            - name: GITHUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-token
+                  key: GITHUB_TOKEN
+      volumes:
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 32Gi
+        - name: 621547421844-ap-southeast-4-pvc
+          persistentVolumeClaim:
+            claimName: 621547421844-ap-southeast-4-pvc
